@@ -1,0 +1,6 @@
+{
+  "name": "EVEN - Perencana Pribadi AI",
+  "description": "AI-powered personal planner yang mengubah tugas, durasi, dan tenggat menjadi jadwal realistis dengan kalender internal dan Google Calendar.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
