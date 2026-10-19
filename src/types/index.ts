@@ -15,6 +15,7 @@ export interface TaskScheduleSession {
   durationMinutes: number;
   status: 'SCHEDULED' | 'COMPLETED' | 'CANCELLED';
   syncStatus: SyncStatus;
+  googleCalendarEventId?: string;
 }
 
 export interface Task {
@@ -91,4 +92,23 @@ export interface AIPlanDraft {
   minimumSessionMinutes: number;
   preferredTimeOfDay: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY';
   reasoning: string;
+}
+
+export interface KeepChecklistItem {
+  id: string;
+  text: string;
+  checked: boolean;
+}
+
+export interface KeepNote {
+  id: string;
+  userId: string;
+  title: string;
+  content: string;
+  checklist?: KeepChecklistItem[];
+  color: 'default' | 'sand' | 'coral' | 'sage' | 'fog' | 'storm';
+  isPinned: boolean;
+  isArchived: boolean;
+  createdAt: string;
+  updatedAt: string;
 }

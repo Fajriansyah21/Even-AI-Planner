@@ -1,0 +1,100 @@
+{
+  "entities": {
+    "Task": {
+      "title": "Task",
+      "description": "Tugas perencanaan dengan durasi, tenggat, dan sesi terjadwal.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "ID pengguna pemilik tugas" },
+        "title": { "type": "string", "maxLength": 200, "description": "Judul tugas" },
+        "description": { "type": "string", "maxLength": 2000, "description": "Catatan tugas" },
+        "estimatedDurationMinutes": { "type": "number", "description": "Estimasi durasi pengerjaan dalam menit" },
+        "deadlineAt": { "type": "string", "description": "Tenggat waktu ISO timestamp" },
+        "priority": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "URGENT"], "description": "Prioritas tugas" },
+        "status": { "type": "string", "enum": ["UNSCHEDULED", "SCHEDULED", "IN_PROGRESS", "COMPLETED"], "description": "Status pengerjaan" },
+        "allowSplit": { "type": "boolean", "description": "Boleh dipecah beberapa sesi" },
+        "minimumSessionMinutes": { "type": "number", "description": "Durasi minimal per sesi jika dipecah" },
+        "preferredTimeOfDay": { "type": "string", "enum": ["MORNING", "AFTERNOON", "EVENING", "ANY"], "description": "Waktu preferensi" },
+        "createdAt": { "type": "string", "description": "Waktu pembuatan" },
+        "updatedAt": { "type": "string", "description": "Waktu pembaruan" }
+      },
+      "required": ["userId", "title", "estimatedDurationMinutes", "deadlineAt", "priority", "status", "allowSplit"]
+    },
+    "CalendarEvent": {
+      "title": "CalendarEvent",
+      "description": "Acara kalender dan rapat Google Calendar atau internal.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "ID pengguna pemilik" },
+        "provider": { "type": "string", "enum": ["google", "internal"], "description": "Penyedia kalender" },
+        "title": { "type": "string", "maxLength": 300, "description": "Judul acara" },
+        "description": { "type": "string", "maxLength": 3000, "description": "Deskripsi acara" },
+        "startAt": { "type": "string", "description": "Waktu mulai ISO" },
+        "endAt": { "type": "string", "description": "Waktu selesai ISO" },
+        "isAllDay": { "type": "boolean", "description": "Acara sepanjang hari" },
+        "location": { "type": "string", "maxLength": 500, "description": "Lokasi atau link meeting" },
+        "meetUrl": { "type": "string", "maxLength": 500, "description": "URL Google Meet" },
+        "isEditable": { "type": "boolean", "description": "Dapat diedit" },
+        "syncStatus": { "type": "string", "enum": ["synced", "pending", "failed", "needs_reconciliation"], "description": "Status sinkronisasi" },
+        "category": { "type": "string", "description": "Kategori acara" },
+        "createdAt": { "type": "string", "description": "Waktu pembuatan" }
+      },
+      "required": ["userId", "provider", "title", "startAt", "endAt", "isEditable", "syncStatus"]
+    },
+    "UserPreference": {
+      "title": "UserPreference",
+      "description": "Preferensi kerja dan kalender pengguna.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "ID pengguna" },
+        "displayName": { "type": "string", "maxLength": 100, "description": "Nama tampilan" },
+        "email": { "type": "string", "maxLength": 200, "description": "Alamat email" },
+        "timezone": { "type": "string", "description": "Zona waktu" },
+        "workStartHour": { "type": "number", "description": "Jam mulai kerja" },
+        "workEndHour": { "type": "number", "description": "Jam selesai kerja" },
+        "lunchStartHour": { "type": "number", "description": "Jam mulai istirahat" },
+        "lunchEndHour": { "type": "number", "description": "Jam selesai istirahat" },
+        "bufferMinutes": { "type": "number", "description": "Buffer jeda antar tugas" },
+        "googleCalendarConnected": { "type": "boolean", "description": "Status sambungan Google Calendar" },
+        "calendarSyncStatus": { "type": "string", "enum": ["synced", "pending", "failed", "needs_reconciliation"], "description": "Status sinkronisasi" },
+        "lastSyncedAt": { "type": "string", "description": "Waktu sinkronisasi terakhir" },
+        "updatedAt": { "type": "string", "description": "Waktu pembaruan" }
+      },
+      "required": ["userId", "displayName", "email", "timezone", "workStartHour", "workEndHour", "lunchStartHour", "lunchEndHour", "bufferMinutes"]
+    },
+    "KeepNote": {
+      "title": "KeepNote",
+      "description": "Catatan dan daftar periksa bergaya Google Keep yang terintegrasi dengan perencana.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "ID pengguna pemilik catatan" },
+        "title": { "type": "string", "maxLength": 200, "description": "Judul catatan" },
+        "content": { "type": "string", "maxLength": 5000, "description": "Isi catatan" },
+        "color": { "type": "string", "description": "Warna kartu catatan" },
+        "isPinned": { "type": "boolean", "description": "Apakah disematkan" },
+        "isArchived": { "type": "boolean", "description": "Apakah diarsipkan" },
+        "createdAt": { "type": "string", "description": "Waktu pembuatan" },
+        "updatedAt": { "type": "string", "description": "Waktu pembaruan" }
+      },
+      "required": ["userId", "title", "isPinned", "isArchived", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/preferences/{prefId}": {
+      "schema": "UserPreference",
+      "description": "Menyimpan pengaturan kerja dan integrasi kalender pengguna."
+    },
+    "/users/{userId}/tasks/{taskId}": {
+      "schema": "Task",
+      "description": "Koleksi tugas dan sesi terjadwal milik pengguna."
+    },
+    "/users/{userId}/events/{eventId}": {
+      "schema": "CalendarEvent",
+      "description": "Koleksi acara kalender pengguna."
+    },
+    "/users/{userId}/keep_notes/{noteId}": {
+      "schema": "KeepNote",
+      "description": "Koleksi catatan Google Keep pengguna untuk integrasi tugas."
+    }
+  }
+}

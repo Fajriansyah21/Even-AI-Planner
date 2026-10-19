@@ -1,0 +1,84 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Health-check / connection probe
+    match /test/connection {
+      allow read: if true;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Subcollections under /users/{userId}
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      // Preferences
+      match /preferences/{prefId} {
+        allow get, list: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(prefId)
+          && incoming().userId == userId
+          && incoming().displayName is string && incoming().displayName.size() <= 100
+          && incoming().email is string && incoming().email.size() <= 200;
+        allow delete: if isOwner(userId);
+      }
+
+      // Tasks
+      match /tasks/{taskId} {
+        allow get, list: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(taskId)
+          && incoming().userId == userId
+          && incoming().title is string && incoming().title.size() > 0 && incoming().title.size() <= 200
+          && incoming().estimatedDurationMinutes is number
+          && incoming().deadlineAt is string
+          && incoming().priority in ['LOW', 'MEDIUM', 'HIGH', 'URGENT']
+          && incoming().status in ['UNSCHEDULED', 'SCHEDULED', 'IN_PROGRESS', 'COMPLETED'];
+        allow delete: if isOwner(userId);
+      }
+
+      // Calendar Events
+      match /events/{eventId} {
+        allow get, list: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(eventId)
+          && incoming().userId == userId
+          && incoming().title is string && incoming().title.size() > 0 && incoming().title.size() <= 300
+          && incoming().startAt is string
+          && incoming().endAt is string;
+        allow delete: if isOwner(userId);
+      }
+
+      // Google Keep Notes
+      match /keep_notes/{noteId} {
+        allow get, list: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(noteId)
+          && incoming().userId == userId
+          && incoming().title is string && incoming().title.size() <= 200;
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}

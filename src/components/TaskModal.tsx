@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { X, Calendar, Clock, AlertCircle, Layers } from 'lucide-react';
 import { Task, Priority } from '../types';
 
@@ -9,53 +9,59 @@ interface TaskModalProps {
   onSave: (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'scheduledSessions'>) => void;
 }
 
+function getInitialState(task?: Task | null) {
+  if (task && task.deadlineAt) {
+    const d = new Date(task.deadlineAt);
+    const localFormatted = !isNaN(d.getTime())
+      ? new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
+      : '';
+
+    return {
+      title: task.title || '',
+      description: task.description || '',
+      estimatedDurationMinutes: task.estimatedDurationMinutes || 60,
+      deadlineAt: localFormatted,
+      priority: task.priority || ('MEDIUM' as Priority),
+      allowSplit: Boolean(task.allowSplit),
+      minimumSessionMinutes: task.minimumSessionMinutes || 30,
+      preferredTimeOfDay: task.preferredTimeOfDay || ('ANY' as const),
+    };
+  }
+
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  tomorrow.setHours(17, 0, 0, 0);
+  const localFormatted = new Date(tomorrow.getTime() - tomorrow.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+
+  return {
+    title: '',
+    description: '',
+    estimatedDurationMinutes: 60,
+    deadlineAt: localFormatted,
+    priority: 'MEDIUM' as Priority,
+    allowSplit: false,
+    minimumSessionMinutes: 30,
+    preferredTimeOfDay: 'ANY' as const,
+  };
+}
+
 export const TaskModal: React.FC<TaskModalProps> = ({
   isOpen,
   taskToEdit,
   onClose,
   onSave,
 }) => {
-  const [title, setTitle] = useState('');
-  const [description, setDescription] = useState('');
-  const [estimatedDurationMinutes, setEstimatedDurationMinutes] = useState(60);
-  const [deadlineAt, setDeadlineAt] = useState('');
-  const [priority, setPriority] = useState<Priority>('MEDIUM');
-  const [allowSplit, setAllowSplit] = useState(false);
-  const [minimumSessionMinutes, setMinimumSessionMinutes] = useState(30);
-  const [preferredTimeOfDay, setPreferredTimeOfDay] = useState<'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY'>('ANY');
+  const initialState = getInitialState(taskToEdit);
+
+  const [title, setTitle] = useState(initialState.title);
+  const [description, setDescription] = useState(initialState.description);
+  const [estimatedDurationMinutes, setEstimatedDurationMinutes] = useState(initialState.estimatedDurationMinutes);
+  const [deadlineAt, setDeadlineAt] = useState(initialState.deadlineAt);
+  const [priority, setPriority] = useState<Priority>(initialState.priority);
+  const [allowSplit, setAllowSplit] = useState(initialState.allowSplit);
+  const [minimumSessionMinutes, setMinimumSessionMinutes] = useState(initialState.minimumSessionMinutes);
+  const [preferredTimeOfDay, setPreferredTimeOfDay] = useState<'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY'>(initialState.preferredTimeOfDay);
   const [errorMsg, setErrorMsg] = useState('');
-
-  useEffect(() => {
-    if (taskToEdit) {
-      setTitle(taskToEdit.title);
-      setDescription(taskToEdit.description || '');
-      setEstimatedDurationMinutes(taskToEdit.estimatedDurationMinutes);
-      // Format ISO string to local input format "YYYY-MM-DDTHH:mm"
-      const d = new Date(taskToEdit.deadlineAt);
-      const localFormatted = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-      setDeadlineAt(localFormatted);
-      setPriority(taskToEdit.priority);
-      setAllowSplit(taskToEdit.allowSplit);
-      setMinimumSessionMinutes(taskToEdit.minimumSessionMinutes || 30);
-      setPreferredTimeOfDay(taskToEdit.preferredTimeOfDay || 'ANY');
-    } else {
-      // Default: tomorrow at 17:00
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      tomorrow.setHours(17, 0, 0, 0);
-      const localFormatted = new Date(tomorrow.getTime() - tomorrow.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-
-      setTitle('');
-      setDescription('');
-      setEstimatedDurationMinutes(60);
-      setDeadlineAt(localFormatted);
-      setPriority('MEDIUM');
-      setAllowSplit(false);
-      setMinimumSessionMinutes(30);
-      setPreferredTimeOfDay('ANY');
-    }
-    setErrorMsg('');
-  }, [taskToEdit, isOpen]);
 
   if (!isOpen) return null;
 
@@ -109,7 +115,7 @@ export const TaskModal: React.FC<TaskModalProps> = ({
       >
         <div className="px-6 py-4 flex items-center justify-between border-b border-[#D9E3EF]">
           <h2 className="text-base font-bold text-[#172B42]">
-            {taskToEdit ? 'Ubah Rincian Tugas' : 'Tambah Tugas Baru'}
+            {taskToEdit && taskToEdit.id ? 'Ubah Rincian Tugas' : 'Tambah Tugas Baru'}
           </h2>
           <button
             onClick={onClose}
@@ -266,7 +272,7 @@ export const TaskModal: React.FC<TaskModalProps> = ({
               type="submit"
               className="px-5 py-2.5 text-xs font-semibold text-white bg-[#2457A7] hover:bg-[#1E4889] rounded-xl transition-colors shadow-xs"
             >
-              {taskToEdit ? 'Simpan Perubahan' : 'Buat Tugas'}
+              {taskToEdit && taskToEdit.id ? 'Simpan Perubahan' : 'Buat Tugas'}
             </button>
           </div>
         </form>

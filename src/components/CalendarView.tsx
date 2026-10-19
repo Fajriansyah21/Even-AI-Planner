@@ -405,7 +405,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                 <div className="py-10 text-center text-[#53657A]">
                   <CalendarIcon className="w-8 h-8 mx-auto text-[#8DBCEB] mb-2 opacity-60" />
                   <p className="text-xs font-medium text-[#172B42]">Tidak ada agenda atau tugas hari ini.</p>
-                  <p className="text-[11px] mt-1">Gunakan tombol "+ Tugas Baru" atau minta AI merencanakan hari Anda.</p>
+                  <p className="text-[11px] mt-1">Gunakan tombol &ldquo;+ Tugas Baru&rdquo; atau minta AI merencanakan hari Anda.</p>
                 </div>
               ) : (
                 <div className="space-y-2.5">

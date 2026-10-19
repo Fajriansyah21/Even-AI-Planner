@@ -166,7 +166,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                   }}
                   className="text-left text-[11px] px-3 py-1.5 rounded-lg bg-slate-50 hover:bg-[#EAF3FC] border border-[#D9E3EF] text-[#53657A] hover:text-[#2457A7] transition-colors"
                 >
-                  "{s}"
+                  {`"${s}"`}
                 </button>
               ))}
             </div>

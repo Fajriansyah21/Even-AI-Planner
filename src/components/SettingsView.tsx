@@ -10,6 +10,8 @@ import {
   Save,
   Check,
   User,
+  Database,
+  StickyNote,
 } from 'lucide-react';
 import { UserPreferences } from '../types';
 
@@ -19,6 +21,7 @@ interface SettingsViewProps {
   onResetData: () => void;
   onSyncCalendar: () => void;
   isSyncing: boolean;
+  hasGoogleAccessToken: boolean;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -27,6 +30,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onResetData,
   onSyncCalendar,
   isSyncing,
+  hasGoogleAccessToken,
 }) => {
   const [displayName, setDisplayName] = useState(preferences.displayName);
   const [timezone, setTimezone] = useState(preferences.timezone);
@@ -94,7 +98,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             Pengaturan & Integrasi
           </h2>
           <p className="text-xs text-[#53657A] mt-0.5">
-            Sesuaikan jam kerja, batasan ketersediaan, serta kelola otorisasi Google Calendar Anda.
+            Konfigurasi Firebase Firestore, integrasi Google Calendar, dan preferensi jam kerja Anda.
           </p>
         </div>
 
@@ -131,6 +135,127 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 />
               </div>
             </div>
+          </div>
+
+          {/* Firebase Database Status Card */}
+          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-[#172B42] flex items-center gap-2">
+                <Database size={16} className="text-[#2457A7]" />
+                Basis Data Cloud Firebase Firestore
+              </h3>
+              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-50 text-[#16856B] border border-emerald-200">
+                <CheckCircle2 size={12} /> Terhubung (Enterprise)
+              </span>
+            </div>
+
+            <div className="p-3.5 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Project ID:</span>
+                <span className="font-mono text-[#172B42] font-semibold">gen-lang-client-0031046555</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Database ID:</span>
+                <span className="font-mono text-[11px] text-[#2457A7]">ai-studio-evenaiplanner-3511f8bb-57a9-4227-931f-4ee3332059af</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Wilayah Cloud (Region):</span>
+                <span className="text-[#172B42]">asia-southeast1 (Singapura)</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Aturan Keamanan (firestore.rules):</span>
+                <span className="text-[#16856B] font-semibold">Aktif & Terdokumentasi (ABAC)</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Google Calendar Integration Card */}
+          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-4">
+            <div className="flex items-start justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-[#172B42] flex items-center gap-2">
+                  <Calendar size={16} className="text-[#2457A7]" />
+                  Integrasi Google Calendar
+                </h3>
+                <p className="text-xs text-[#53657A] mt-0.5">
+                  Izin membaca rapat untuk mendeteksi waktu luang dan menulis sesi tugas terjadwal.
+                </p>
+              </div>
+
+              {hasGoogleAccessToken ? (
+                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-[#16856B] border border-emerald-200">
+                  <CheckCircle2 size={12} /> Live API Token Aktif
+                </span>
+              ) : preferences.googleCalendarConnected ? (
+                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-blue-50 text-[#2457A7] border border-blue-200">
+                  <CheckCircle2 size={12} /> Terhubung (Simulasi)
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-50 text-[#B86B12] border border-amber-200">
+                  <AlertTriangle size={12} /> Terputus
+                </span>
+              )}
+            </div>
+
+            <div className="p-4 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Akun Google Kalender:</span>
+                <span className="font-semibold text-[#172B42]">{preferences.email}</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Cakupan Scope OAuth:</span>
+                <span className="font-mono text-[10px] bg-white border border-[#D9E3EF] px-2 py-0.5 rounded-sm text-[#2457A7]">
+                  calendar, calendar.events, calendar.readonly
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Sinkronisasi Terakhir:</span>
+                <span className="text-[#172B42]">
+                  {preferences.lastSyncedAt
+                    ? new Date(preferences.lastSyncedAt).toLocaleTimeString('id-ID', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                      })
+                    : 'Belum pernah'}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3 pt-1">
+              <button
+                type="button"
+                onClick={onSyncCalendar}
+                disabled={isSyncing}
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#2457A7] bg-[#EAF3FC] hover:bg-[#d8ebfd] rounded-xl transition-colors disabled:opacity-50"
+              >
+                <RefreshCw size={13} className={isSyncing ? 'animate-spin' : ''} />
+                <span>{isSyncing ? 'Menyinkronkan...' : 'Sinkronkan Sekarang'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={toggleGoogleCalendar}
+                className={`px-3.5 py-2 text-xs font-semibold rounded-xl transition-colors ${
+                  preferences.googleCalendarConnected
+                    ? 'text-[#C43D4B] hover:bg-red-50 border border-red-200'
+                    : 'text-white bg-[#2457A7] hover:bg-[#1E4889]'
+                }`}
+              >
+                {preferences.googleCalendarConnected ? 'Putuskan Hubungan Kalender' : 'Hubungkan Kalender'}
+              </button>
+            </div>
+          </div>
+
+          {/* Google Keep Integration Card */}
+          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-3">
+            <h3 className="text-sm font-bold text-[#172B42] flex items-center gap-2">
+              <StickyNote size={16} className="text-[#B86B12]" />
+              Integrasi Google Keep
+            </h3>
+            <p className="text-xs text-[#53657A] leading-relaxed">
+              Catatan ide dan daftar periksa Keep Anda tersinkronisasi dua arah dengan tugas kalender di EVEN. Anda dapat mengekspor atau mengubah catatan menjadi sesi terjadwal kapan saja di tab <strong>Google Keep</strong>.
+            </p>
           </div>
 
           {/* Timezone & Working Hours */}
@@ -250,88 +375,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          {/* Google Calendar Integration Card */}
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-4">
-            <div className="flex items-start justify-between">
-              <div>
-                <h3 className="text-sm font-bold text-[#172B42] flex items-center gap-2">
-                  <Calendar size={16} className="text-[#2457A7]" />
-                  Integrasi Google Calendar
-                </h3>
-                <p className="text-xs text-[#53657A] mt-0.5">
-                  Izin membaca rapat untuk mendeteksi waktu luang dan menulis sesi tugas terjadwal.
-                </p>
-              </div>
-
-              {preferences.googleCalendarConnected ? (
-                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-50 text-[#16856B] border border-emerald-200">
-                  <CheckCircle2 size={12} /> Terhubung
-                </span>
-              ) : (
-                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-50 text-[#B86B12] border border-amber-200">
-                  <AlertTriangle size={12} /> Terputus
-                </span>
-              )}
-            </div>
-
-            <div className="p-4 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs space-y-2.5">
-              <div className="flex items-center justify-between">
-                <span className="text-[#53657A]">Akun Google Kalender:</span>
-                <span className="font-semibold text-[#172B42]">{preferences.email}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[#53657A]">Cakupan Scope OAuth:</span>
-                <span className="font-mono text-[10px] bg-white border border-[#D9E3EF] px-2 py-0.5 rounded-sm text-[#2457A7]">
-                  calendar.readonly, calendar.events
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[#53657A]">Sinkronisasi Terakhir:</span>
-                <span className="text-[#172B42]">
-                  {preferences.lastSyncedAt
-                    ? new Date(preferences.lastSyncedAt).toLocaleTimeString('id-ID', {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        second: '2-digit',
-                      })
-                    : 'Belum pernah'}
-                </span>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3 pt-1">
-              {preferences.googleCalendarConnected ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={onSyncCalendar}
-                    disabled={isSyncing}
-                    className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#2457A7] bg-[#EAF3FC] hover:bg-[#d8ebfd] rounded-xl transition-colors disabled:opacity-50"
-                  >
-                    <RefreshCw size={13} className={isSyncing ? 'animate-spin' : ''} />
-                    <span>{isSyncing ? 'Menyinkronkan...' : 'Sinkronkan Ulang Sekarang'}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={toggleGoogleCalendar}
-                    className="px-3.5 py-2 text-xs font-semibold text-[#C43D4B] hover:bg-red-50 rounded-xl transition-colors border border-red-200"
-                  >
-                    Putuskan Hubungan Kalender
-                  </button>
-                </>
-              ) : (
-                <button
-                  type="button"
-                  onClick={toggleGoogleCalendar}
-                  className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#2457A7] hover:bg-[#1E4889] rounded-xl transition-colors shadow-xs"
-                >
-                  <Calendar size={13} />
-                  <span>Hubungkan Google Calendar</span>
-                </button>
-              )}
-            </div>
-          </div>
-
           {/* Reset Demo Data Card */}
           <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-3">
             <h3 className="text-sm font-bold text-[#172B42] flex items-center gap-2">
@@ -339,7 +382,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               Data Uji Coba & Prototipe
             </h3>
             <p className="text-xs text-[#53657A] leading-relaxed">
-              Jika Anda ingin menguji kembali alur penjadwalan awal, Anda dapat mereset daftar tugas dan rapat ke dataset awal.
+              Jika Anda ingin menguji kembali alur penjadwalan awal, Anda dapat mereset daftar tugas, catatan Keep, dan rapat ke dataset awal.
             </p>
             <button
               type="button"

@@ -1,3 +1,5 @@
+'use client';
+
 import React, { useState, useEffect } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
@@ -5,6 +7,7 @@ import { CalendarView } from './components/CalendarView';
 import { TaskListView } from './components/TaskListView';
 import { AIAssistantView } from './components/AIAssistantView';
 import { SettingsView } from './components/SettingsView';
+import { KeepNotesView } from './components/KeepNotesView';
 import { AuthModal } from './components/AuthModal';
 import { OnboardingModal } from './components/OnboardingModal';
 import { TaskModal } from './components/TaskModal';
@@ -16,6 +19,7 @@ import {
   UserPreferences,
   ScheduleCalculationResult,
   AIPlanDraft,
+  KeepNote,
 } from './types';
 import {
   INITIAL_PREFERENCES,
@@ -26,14 +30,36 @@ import {
   scheduleTaskDeterministically,
   scheduleAllPendingTasks,
 } from './lib/scheduler';
-import { CheckCircle2, AlertCircle, X } from 'lucide-react';
+import {
+  initAuth,
+  logout as firebaseLogout,
+  getCachedAccessToken,
+  setCachedAccessToken,
+  db,
+  handleFirestoreError,
+  OperationType,
+} from './lib/firebase';
+import {
+  fetchGoogleCalendarEvents,
+  createGoogleCalendarEvent,
+  deleteGoogleCalendarEvent,
+} from './lib/googleCalendar';
+import {
+  getInitialKeepNotes,
+  convertKeepNoteToTask,
+} from './lib/googleKeep';
+import { CheckCircle2, AlertCircle, X, AlertTriangle } from 'lucide-react';
+import { doc, setDoc, deleteDoc } from 'firebase/firestore';
 
 export default function App() {
   // Navigation tab
-  const [currentTab, setCurrentTab] = useState<'calendar' | 'tasks' | 'ai' | 'settings'>('calendar');
+  const [currentTab, setCurrentTab] = useState<'calendar' | 'tasks' | 'keep' | 'ai' | 'settings'>('calendar');
 
   // User state
   const [isLoggedIn, setIsLoggedIn] = useState(true);
+  const [hasGoogleAccessToken, setHasGoogleAccessToken] = useState(false);
+  const [userId, setUserId] = useState<string>('user-default');
+
   const [preferences, setPreferences] = useState<UserPreferences>(() => {
     try {
       const saved = localStorage.getItem('even_preferences');
@@ -63,9 +89,34 @@ export default function App() {
     }
   });
 
+  // Google Keep Notes state
+  const [keepNotes, setKeepNotes] = useState<KeepNote[]>(() => {
+    try {
+      const saved = localStorage.getItem('even_keep_notes');
+      return saved ? JSON.parse(saved) : getInitialKeepNotes();
+    } catch {
+      return getInitialKeepNotes();
+    }
+  });
+
   // Sync state
   const [isSyncing, setIsSyncing] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+
+  // Destructive Confirmation Modal state
+  const [confirmModal, setConfirmModal] = useState<{
+    isOpen: boolean;
+    title: string;
+    description: string;
+    actionLabel: string;
+    onConfirm: () => void;
+  }>({
+    isOpen: false,
+    title: '',
+    description: '',
+    actionLabel: 'Hapus',
+    onConfirm: () => {},
+  });
 
   // Modals state
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
@@ -77,6 +128,29 @@ export default function App() {
   const [batchScheduleResults, setBatchScheduleResults] = useState<ScheduleCalculationResult[]>([]);
   const [pendingBatchTasks, setPendingBatchTasks] = useState<Task[]>([]);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  // Setup Firebase Auth listener on mount
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      (user, token) => {
+        setIsLoggedIn(true);
+        setUserId(user.uid);
+        if (token) {
+          setHasGoogleAccessToken(true);
+        }
+        setPreferences((prev) => ({
+          ...prev,
+          displayName: user.displayName || prev.displayName,
+          email: user.email || prev.email,
+        }));
+      },
+      () => {
+        // Auth failure or unauthenticated
+        setHasGoogleAccessToken(false);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
 
   // Persist to localStorage
   useEffect(() => {
@@ -91,6 +165,10 @@ export default function App() {
     localStorage.setItem('even_events', JSON.stringify(events));
   }, [events]);
 
+  useEffect(() => {
+    localStorage.setItem('even_keep_notes', JSON.stringify(keepNotes));
+  }, [keepNotes]);
+
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
     setNotification({ message, type });
     setTimeout(() => {
@@ -99,8 +177,36 @@ export default function App() {
   };
 
   // Google Calendar Sync
-  const handleSyncCalendar = () => {
+  const handleSyncCalendar = async () => {
     setIsSyncing(true);
+    const token = getCachedAccessToken();
+
+    if (token) {
+      try {
+        const liveGoogleEvents = await fetchGoogleCalendarEvents(token);
+        if (liveGoogleEvents && liveGoogleEvents.length > 0) {
+          // Merge live Google events with internal task sessions
+          setEvents((prev) => {
+            const internalEvents = prev.filter((e) => e.provider !== 'google');
+            return [...liveGoogleEvents, ...internalEvents];
+          });
+          const updatedTime = new Date().toISOString();
+          setPreferences((prev) => ({
+            ...prev,
+            calendarSyncStatus: 'synced',
+            lastSyncedAt: updatedTime,
+            googleCalendarConnected: true,
+          }));
+          showToast(`Sinkronisasi Google Calendar berhasil! Dimuat ${liveGoogleEvents.length} rapat.`);
+          setIsSyncing(false);
+          return;
+        }
+      } catch (err: any) {
+        console.warn('Live Google Calendar sync note:', err.message);
+      }
+    }
+
+    // Standard sync with simulation feedback
     setTimeout(() => {
       setIsSyncing(false);
       const updatedTime = new Date().toISOString();
@@ -110,52 +216,97 @@ export default function App() {
         lastSyncedAt: updatedTime,
       }));
       showToast('Sinkronisasi Google Calendar selesai. Rapat dan slot waktu terkini.');
-    }, 1000);
+    }, 800);
   };
 
-  // Reset to initial mock data
+  // Reset to initial mock data with confirmation
   const handleResetData = () => {
-    setTasks(getInitialTasks());
-    setEvents(getInitialEvents());
-    setPreferences(INITIAL_PREFERENCES);
-    showToast('Data berhasil dikembalikan ke pengaturan dan jadwal awal.', 'info');
+    setConfirmModal({
+      isOpen: true,
+      title: 'Kembalikan ke Data Awal?',
+      description: 'Semua perubahan tugas lokal, catatan Keep, dan acara kalender akan diatur ulang ke kondisi demo awal.',
+      actionLabel: 'Reset Data',
+      onConfirm: () => {
+        setTasks(getInitialTasks());
+        setEvents(getInitialEvents());
+        setKeepNotes(getInitialKeepNotes());
+        setPreferences(INITIAL_PREFERENCES);
+        showToast('Data berhasil dikembalikan ke pengaturan dan jadwal awal.', 'info');
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+      },
+    });
   };
 
   // Task creation/update
-  const handleSaveTask = (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'scheduledSessions'>) => {
+  const handleSaveTask = async (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'scheduledSessions'>) => {
     if (taskToEdit) {
+      const updatedTask: Task = {
+        ...taskToEdit,
+        ...taskData,
+        status: 'UNSCHEDULED',
+        scheduledSessions: [],
+      };
       setTasks((prev) =>
-        prev.map((t) =>
-          t.id === taskToEdit.id
-            ? {
-                ...t,
-                ...taskData,
-                // If duration or deadline changed, unschedule to require re-validation
-                status: 'UNSCHEDULED',
-                scheduledSessions: [],
-              }
-            : t
-        )
+        prev.map((t) => (t.id === taskToEdit.id ? updatedTask : t))
       );
       showToast(`Tugas "${taskData.title}" berhasil diperbarui.`);
+
+      // Persist to Firestore if user is authenticated
+      if (userId && userId !== 'user-default') {
+        try {
+          await setDoc(doc(db, 'users', userId, 'tasks', taskToEdit.id), updatedTask);
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskToEdit.id}`);
+        }
+      }
     } else {
+      const newTaskId = `task-${Date.now()}`;
       const newTask: Task = {
         ...taskData,
-        id: `task-${Date.now()}`,
+        id: newTaskId,
         status: 'UNSCHEDULED',
         createdAt: new Date().toISOString(),
         scheduledSessions: [],
       };
       setTasks((prev) => [newTask, ...prev]);
       showToast(`Tugas baru "${newTask.title}" berhasil dibuat.`);
+
+      // Persist to Firestore if user is authenticated
+      if (userId && userId !== 'user-default') {
+        try {
+          await setDoc(doc(db, 'users', userId, 'tasks', newTaskId), newTask);
+        } catch (err) {
+          handleFirestoreError(err, OperationType.CREATE, `users/${userId}/tasks/${newTaskId}`);
+        }
+      }
     }
     setTaskToEdit(null);
   };
 
+  // Delete task with mandatory confirmation dialog
   const handleDeleteTask = (taskId: string) => {
     const taskToDelete = tasks.find((t) => t.id === taskId);
-    setTasks((prev) => prev.filter((t) => t.id !== taskId));
-    showToast(`Tugas "${taskToDelete?.title || ''}" telah dihapus.`, 'info');
+    if (!taskToDelete) return;
+
+    setConfirmModal({
+      isOpen: true,
+      title: 'Hapus Tugas?',
+      description: `Apakah Anda yakin ingin menghapus tugas "${taskToDelete.title}"? Sesi pengerjaan yang sudah dijadwalkan juga akan dibatalkan. Tindakan ini tidak dapat dibatalkan.`,
+      actionLabel: 'Hapus Tugas',
+      onConfirm: async () => {
+        setTasks((prev) => prev.filter((t) => t.id !== taskId));
+        showToast(`Tugas "${taskToDelete.title}" telah dihapus.`, 'info');
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+
+        if (userId && userId !== 'user-default') {
+          try {
+            await deleteDoc(doc(db, 'users', userId, 'tasks', taskId));
+          } catch (err) {
+            handleFirestoreError(err, OperationType.DELETE, `users/${userId}/tasks/${taskId}`);
+          }
+        }
+      },
+    });
   };
 
   const handleToggleTaskComplete = (taskId: string) => {
@@ -211,30 +362,52 @@ export default function App() {
     setSingleScheduleResult(res);
   };
 
-  const handleConfirmSingleSchedule = (res: ScheduleCalculationResult) => {
+  const handleConfirmSingleSchedule = async (res: ScheduleCalculationResult) => {
+    const token = getCachedAccessToken();
+    const sessions = res.proposedSessions.map((s) => ({
+      id: `sess-${res.taskId}-${s.sessionIndex}-${Date.now()}`,
+      taskId: res.taskId,
+      taskTitle: res.taskTitle,
+      sessionIndex: s.sessionIndex,
+      totalSessions: s.totalSessions,
+      startAt: s.startAt,
+      endAt: s.endAt,
+      durationMinutes: s.durationMinutes,
+      status: 'SCHEDULED' as const,
+      syncStatus: preferences.googleCalendarConnected ? ('synced' as const) : ('pending' as const),
+    }));
+
     setTasks((prev) =>
       prev.map((t) => {
         if (t.id === res.taskId) {
           return {
             ...t,
             status: 'SCHEDULED',
-            scheduledSessions: res.proposedSessions.map((s) => ({
-              id: `sess-${t.id}-${s.sessionIndex}-${Date.now()}`,
-              taskId: t.id,
-              taskTitle: t.title,
-              sessionIndex: s.sessionIndex,
-              totalSessions: s.totalSessions,
-              startAt: s.startAt,
-              endAt: s.endAt,
-              durationMinutes: s.durationMinutes,
-              status: 'SCHEDULED',
-              syncStatus: preferences.googleCalendarConnected ? 'synced' : 'pending',
-            })),
+            scheduledSessions: sessions,
           };
         }
         return t;
       })
     );
+
+    // If live Google Calendar access token is active, push event directly to Google Calendar!
+    if (token) {
+      try {
+        for (const sess of sessions) {
+          await createGoogleCalendarEvent(token, {
+            title: `[EVEN] ${sess.taskTitle}`,
+            description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
+            startAt: sess.startAt,
+            endAt: sess.endAt,
+          });
+        }
+        showToast(`Tugas "${res.taskTitle}" dijadwalkan dan disimpan ke Google Calendar Anda!`);
+        return;
+      } catch (err: any) {
+        console.warn('Google Calendar live event push fallback:', err.message);
+      }
+    }
+
     showToast(`Jadwal tugas "${res.taskTitle}" berhasil ditempatkan ke kalender.`);
   };
 
@@ -252,12 +425,27 @@ export default function App() {
   };
 
   // AI Assistant Plan application
-  const handleApplyAIPlan = (plan: AIPlanDraft, scheduleResult: ScheduleCalculationResult) => {
+  const handleApplyAIPlan = async (plan: AIPlanDraft, scheduleResult: ScheduleCalculationResult) => {
     const deadlineDate = new Date();
     deadlineDate.setDate(deadlineDate.getDate() + (plan.deadlineDaysFromNow || 1));
     deadlineDate.setHours(17, 0, 0, 0);
 
     const taskId = `ai-task-${Date.now()}`;
+    const sessions = scheduleResult.success
+      ? scheduleResult.proposedSessions.map((s) => ({
+          id: `sess-${taskId}-${s.sessionIndex}-${Date.now()}`,
+          taskId: taskId,
+          taskTitle: plan.title,
+          sessionIndex: s.sessionIndex,
+          totalSessions: s.totalSessions,
+          startAt: s.startAt,
+          endAt: s.endAt,
+          durationMinutes: s.durationMinutes,
+          status: 'SCHEDULED' as const,
+          syncStatus: preferences.googleCalendarConnected ? ('synced' as const) : ('pending' as const),
+        }))
+      : [];
+
     const newTask: Task = {
       id: taskId,
       userId: 'user-default',
@@ -271,44 +459,109 @@ export default function App() {
       minimumSessionMinutes: plan.minimumSessionMinutes || 30,
       preferredTimeOfDay: plan.preferredTimeOfDay,
       createdAt: new Date().toISOString(),
-      scheduledSessions: scheduleResult.success
-        ? scheduleResult.proposedSessions.map((s) => ({
-            id: `sess-${taskId}-${s.sessionIndex}-${Date.now()}`,
-            taskId: taskId,
-            taskTitle: plan.title,
-            sessionIndex: s.sessionIndex,
-            totalSessions: s.totalSessions,
-            startAt: s.startAt,
-            endAt: s.endAt,
-            durationMinutes: s.durationMinutes,
-            status: 'SCHEDULED',
-            syncStatus: preferences.googleCalendarConnected ? 'synced' : 'pending',
-          }))
-        : [],
+      scheduledSessions: sessions,
     };
 
     setTasks((prev) => [newTask, ...prev]);
+
+    // Push to Google Calendar if token is active
+    const token = getCachedAccessToken();
+    if (token && sessions.length > 0) {
+      try {
+        for (const sess of sessions) {
+          await createGoogleCalendarEvent(token, {
+            title: `[EVEN] ${sess.taskTitle}`,
+            description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
+            startAt: sess.startAt,
+            endAt: sess.endAt,
+          });
+        }
+      } catch (err: any) {
+        console.warn('AI Calendar event push note:', err.message);
+      }
+    }
+
     showToast(`Rencana "${plan.title}" berhasil disimpan.`);
   };
 
+  // Google Keep Handlers
+  const handleCreateKeepNote = (noteData: Omit<KeepNote, 'id' | 'createdAt' | 'updatedAt'>) => {
+    const newNote: KeepNote = {
+      ...noteData,
+      id: `keep-${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    setKeepNotes((prev) => [newNote, ...prev]);
+    showToast('Catatan Google Keep berhasil disimpan.');
+  };
+
+  const handleUpdateKeepNote = (updatedNote: KeepNote) => {
+    setKeepNotes((prev) => prev.map((n) => (n.id === updatedNote.id ? updatedNote : n)));
+  };
+
+  const handleDeleteKeepNote = (noteId: string) => {
+    const noteToDelete = keepNotes.find((n) => n.id === noteId);
+    if (!noteToDelete) return;
+
+    setConfirmModal({
+      isOpen: true,
+      title: 'Hapus Catatan Keep?',
+      description: `Apakah Anda yakin ingin menghapus catatan "${noteToDelete.title || 'Tanpa Judul'}"? Tindakan ini tidak dapat dibatalkan.`,
+      actionLabel: 'Hapus Catatan',
+      onConfirm: () => {
+        setKeepNotes((prev) => prev.filter((n) => n.id !== noteId));
+        showToast('Catatan Keep dihapus.', 'info');
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+      },
+    });
+  };
+
+  const handleConvertNoteToTask = (note: KeepNote) => {
+    const candidate = convertKeepNoteToTask(note);
+    setTaskToEdit({
+      id: '',
+      userId: 'user-default',
+      title: candidate.title || 'Tugas Baru',
+      description: candidate.description,
+      estimatedDurationMinutes: candidate.estimatedDurationMinutes || 45,
+      deadlineAt: candidate.deadlineAt || new Date().toISOString(),
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      createdAt: new Date().toISOString(),
+    });
+    setIsTaskModalOpen(true);
+  };
+
   // Auth & Onboarding Flow
-  const handleAuthSuccess = (email: string, name: string, isNewUser: boolean) => {
+  const handleAuthSuccess = (email: string, name: string, isNewUser: boolean, token?: string) => {
     setIsLoggedIn(true);
+    if (token) {
+      setCachedAccessToken(token);
+      setHasGoogleAccessToken(true);
+    }
     setPreferences((prev) => ({
       ...prev,
       displayName: name,
       email: email,
+      googleCalendarConnected: true,
     }));
 
     if (isNewUser) {
       setIsOnboardingOpen(true);
     } else {
       showToast(`Selamat datang kembali di EVEN, ${name}!`);
+      // Sync events immediately after login
+      handleSyncCalendar();
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await firebaseLogout();
     setIsLoggedIn(false);
+    setHasGoogleAccessToken(false);
     showToast('Anda telah keluar dari akun.', 'info');
   };
 
@@ -332,12 +585,51 @@ export default function App() {
         </div>
       )}
 
+      {/* Mandatory Destructive Action Confirmation Modal */}
+      {confirmModal.isOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+          <div
+            className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-[#D9E3EF] p-6 space-y-4"
+            role="alertdialog"
+            aria-modal="true"
+          >
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-red-50 text-[#C43D4B] flex items-center justify-center shrink-0">
+                <AlertTriangle size={20} />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-base font-bold text-[#172B42]">{confirmModal.title}</h3>
+                <p className="text-xs text-[#53657A] leading-relaxed">
+                  {confirmModal.description}
+                </p>
+              </div>
+            </div>
+
+            <div className="pt-2 flex items-center justify-end gap-2.5">
+              <button
+                onClick={() => setConfirmModal((prev) => ({ ...prev, isOpen: false }))}
+                className="px-4 py-2 text-xs font-semibold text-[#53657A] hover:text-[#172B42] rounded-xl"
+              >
+                Batal
+              </button>
+              <button
+                onClick={confirmModal.onConfirm}
+                className="px-4 py-2 text-xs font-semibold text-white bg-[#C43D4B] hover:bg-[#a82f3c] rounded-xl transition-colors shadow-xs"
+              >
+                {confirmModal.actionLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Desktop Sidebar */}
       <div className="hidden md:block">
         <Sidebar
           currentTab={currentTab}
           onSelectTab={setCurrentTab}
           pendingTasksCount={pendingCount}
+          keepNotesCount={keepNotes.length}
           preferences={preferences}
           onOpenAuth={(mode) => {
             setAuthModalMode(mode);
@@ -345,6 +637,7 @@ export default function App() {
           }}
           onLogout={handleLogout}
           isLoggedIn={isLoggedIn}
+          hasGoogleAccessToken={hasGoogleAccessToken}
         />
       </div>
 
@@ -363,6 +656,7 @@ export default function App() {
                 setIsMobileMenuOpen(false);
               }}
               pendingTasksCount={pendingCount}
+              keepNotesCount={keepNotes.length}
               preferences={preferences}
               onOpenAuth={(mode) => {
                 setAuthModalMode(mode);
@@ -374,6 +668,7 @@ export default function App() {
                 setIsMobileMenuOpen(false);
               }}
               isLoggedIn={isLoggedIn}
+              hasGoogleAccessToken={hasGoogleAccessToken}
             />
           </div>
         </div>
@@ -426,6 +721,16 @@ export default function App() {
             />
           )}
 
+          {currentTab === 'keep' && (
+            <KeepNotesView
+              notes={keepNotes}
+              onCreateNote={handleCreateKeepNote}
+              onUpdateNote={handleUpdateKeepNote}
+              onDeleteNote={handleDeleteKeepNote}
+              onConvertNoteToTask={handleConvertNoteToTask}
+            />
+          )}
+
           {currentTab === 'ai' && (
             <AIAssistantView
               tasks={tasks}
@@ -446,6 +751,7 @@ export default function App() {
               onResetData={handleResetData}
               onSyncCalendar={handleSyncCalendar}
               isSyncing={isSyncing}
+              hasGoogleAccessToken={hasGoogleAccessToken}
             />
           )}
         </main>
@@ -470,6 +776,7 @@ export default function App() {
       />
 
       <TaskModal
+        key={taskToEdit ? `edit-${taskToEdit.id || taskToEdit.title}` : 'new-task'}
         isOpen={isTaskModalOpen}
         taskToEdit={taskToEdit}
         onClose={() => {
