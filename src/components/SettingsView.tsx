@@ -22,6 +22,8 @@ interface SettingsViewProps {
   onSyncCalendar: () => void;
   isSyncing: boolean;
   hasGoogleAccessToken: boolean;
+  onConnectCalendar: () => void;
+  onDisconnectCalendar: () => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -31,6 +33,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onSyncCalendar,
   isSyncing,
   hasGoogleAccessToken,
+  onConnectCalendar,
+  onDisconnectCalendar,
 }) => {
   const [displayName, setDisplayName] = useState(preferences.displayName);
   const [timezone, setTimezone] = useState(preferences.timezone);
@@ -235,7 +239,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
               <button
                 type="button"
-                onClick={toggleGoogleCalendar}
+                onClick={() => {
+                  if (preferences.googleCalendarConnected) {
+                    onDisconnectCalendar();
+                  } else {
+                    onConnectCalendar();
+                  }
+                }}
                 className={`px-3.5 py-2 text-xs font-semibold rounded-xl transition-colors ${
                   preferences.googleCalendarConnected
                     ? 'text-[#C43D4B] hover:bg-red-50 border border-red-200'

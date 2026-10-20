@@ -10,9 +10,9 @@ export const INITIAL_PREFERENCES: UserPreferences = {
   lunchEndHour: 13,
   bufferMinutes: 15,
   workDays: [1, 2, 3, 4, 5], // Senin - Jumat
-  googleCalendarConnected: true,
-  calendarSyncStatus: 'synced',
-  lastSyncedAt: new Date().toISOString(),
+  googleCalendarConnected: false,
+  calendarSyncStatus: 'pending',
+  lastSyncedAt: null,
   allowAutoSplit: true
 };
 

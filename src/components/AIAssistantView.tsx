@@ -7,21 +7,27 @@ import {
   Layers,
   CheckCircle2,
   AlertCircle,
-  HelpCircle,
   Check,
   ArrowRight,
   ShieldAlert,
+  Lock,
+  Loader2,
+  Info,
+  RotateCcw,
 } from 'lucide-react';
 import { Task, CalendarEvent, UserPreferences, AIPlanDraft, ScheduleCalculationResult } from '../types';
 import { scheduleTaskDeterministically } from '../lib/scheduler';
+import { formatUserErrorMessage } from '../lib/geminiErrorHandling';
 
 interface AIAssistantViewProps {
   tasks: Task[];
   events: CalendarEvent[];
   preferences: UserPreferences;
-  onApplyAIPlan: (plan: AIPlanDraft, scheduleResult: ScheduleCalculationResult) => void;
+  onApplyAIPlan: (plan: AIPlanDraft, scheduleResult: ScheduleCalculationResult) => Promise<boolean | void> | void;
   onNavigateToCalendar: () => void;
 }
+
+type LoadingPhase = 'idle' | 'interpreting' | 'checking_slots' | 'saving_calendar';
 
 export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   tasks,
@@ -31,51 +37,109 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   onNavigateToCalendar,
 }) => {
   const [promptInput, setPromptInput] = useState('');
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [lastSubmittedPrompt, setLastSubmittedPrompt] = useState('');
+  const [loadingPhase, setLoadingPhase] = useState<LoadingPhase>('idle');
   const [proposedPlan, setProposedPlan] = useState<AIPlanDraft | null>(null);
   const [scheduleTestResult, setScheduleTestResult] = useState<ScheduleCalculationResult | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
+  const [warningMessage, setWarningMessage] = useState('');
   const [appliedSuccess, setAppliedSuccess] = useState(false);
 
+  const isAnalyzing = loadingPhase === 'interpreting' || loadingPhase === 'checking_slots';
+  const isSaving = loadingPhase === 'saving_calendar';
+
   const samplePrompts = [
-    'Tolong jadwalkan persiapan materi sprint durasi 90 menit sebelum besok sore, bagi 2 sesi jika padat.',
-    'Saya perlu membaca ringkasan kontrak hukum 45 menit besok pagi sebelum jam makan siang.',
-    'Jadwalkan riset benchmark kompetitor 120 menit dengan prioritas tinggi sebelum lusa.',
+    'Kelas dari jam 7 malam sampai jam 10 malam',
+    'Malam ini jam 9 belajar materi React 45 menit',
+    'Jadwalkan persiapan materi sprint durasi 90 menit sebelum besok sore, bagi 2 sesi jika padat.',
+    'Membaca ringkasan kontrak hukum 45 menit besok pagi sebelum makan siang.',
   ];
 
   const handlePlanSubmit = async (text: string) => {
-    if (!text.trim()) return;
+    const trimmed = text.trim();
+    if (!trimmed || isAnalyzing || isSaving) return;
 
-    setIsAnalyzing(true);
+    // Preserve text in input field and record as last submitted prompt
+    setPromptInput(text);
+    setLastSubmittedPrompt(trimmed);
+
+    setLoadingPhase('interpreting');
     setErrorMessage('');
+    setWarningMessage('');
     setProposedPlan(null);
     setScheduleTestResult(null);
     setAppliedSuccess(false);
 
+    const abortController = new AbortController();
+    const clientTimeoutId = setTimeout(() => {
+      abortController.abort();
+    }, 20000); // 20-second client timeout
+
     try {
+      const now = new Date();
+      const userTimezone = preferences.timezone
+        ? preferences.timezone.split(' ')[0]
+        : 'Asia/Jakarta';
+
+      const userLocalTimeStr = now.toLocaleDateString('id-ID', {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+
       const response = await fetch('/api/gemini/plan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: abortController.signal,
         body: JSON.stringify({
-          userPrompt: text,
-          currentDateTime: new Date().toISOString(),
+          userPrompt: trimmed,
+          currentDateTime: now.toISOString(),
+          userLocalTimeStr,
+          userTimezone,
+          workHours: {
+            workStartHour: preferences.workStartHour,
+            workEndHour: preferences.workEndHour,
+          },
         }),
       });
 
-      const data = await response.json();
+      clearTimeout(clientTimeoutId);
 
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Gagal memproses permintaan dengan AI.');
+      let data: any = null;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error('Gagal mengurai respons dari server.');
+      }
+
+      if (!response.ok || !data?.success) {
+        const friendlyMessage = formatUserErrorMessage(data?.errorCode, response.status, data?.error);
+        throw new Error(friendlyMessage);
+      }
+
+      if (data.warning) {
+        setWarningMessage(data.warning);
       }
 
       const plan: AIPlanDraft = data.plan;
       setProposedPlan(plan);
 
-      // Immediately run deterministic scheduler as pre-flight check!
-      const deadlineDate = new Date();
-      deadlineDate.setDate(deadlineDate.getDate() + (plan.deadlineDaysFromNow || 1));
-      deadlineDate.setHours(17, 0, 0, 0);
+      // Phase 2: Memeriksa waktu kosong via scheduler
+      setLoadingPhase('checking_slots');
 
+      // Construct deadline date
+      let deadlineDate = new Date();
+      if (plan.deadlineAt) {
+        deadlineDate = new Date(plan.deadlineAt);
+      } else {
+        deadlineDate.setDate(deadlineDate.getDate() + (plan.deadlineDaysFromNow || 1));
+        deadlineDate.setHours(plan.preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
+      }
+
+      // Pre-flight check via deterministic scheduler
       const pseudoTask: Task = {
         id: `ai-draft-${Date.now()}`,
         userId: 'user-default',
@@ -88,22 +152,54 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         allowSplit: plan.allowSplit,
         minimumSessionMinutes: plan.minimumSessionMinutes || 30,
         preferredTimeOfDay: plan.preferredTimeOfDay,
+        timeConstraintType: plan.timeConstraintType,
+        requestedStartAt: plan.requestedStartAt,
+        requestedEndAt: plan.requestedEndAt,
+        preferredWindow: plan.preferredWindow,
+        timezone: plan.timezone || userTimezone,
         createdAt: new Date().toISOString(),
       };
 
       const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
       setScheduleTestResult(schedRes);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Terjadi kesalahan saat berkomunikasi dengan server.');
+      if (err.name === 'AbortError') {
+        setErrorMessage('Permintaan dibatalkan karena melebihi batas waktu (timeout 20 detik). Silakan coba lagi.');
+      } else {
+        const safeMessage = formatUserErrorMessage(undefined, undefined, err?.message);
+        setErrorMessage(safeMessage);
+      }
     } finally {
-      setIsAnalyzing(false);
+      clearTimeout(clientTimeoutId);
+      setLoadingPhase('idle');
     }
   };
 
-  const handleConfirmAndApply = () => {
-    if (!proposedPlan || !scheduleTestResult) return;
-    onApplyAIPlan(proposedPlan, scheduleTestResult);
-    setAppliedSuccess(true);
+  const handleConfirmAndApply = async () => {
+    if (!proposedPlan || !scheduleTestResult || isSaving) return;
+
+    setLoadingPhase('saving_calendar');
+    try {
+      await onApplyAIPlan(proposedPlan, scheduleTestResult);
+      setAppliedSuccess(true);
+    } catch (err: any) {
+      setErrorMessage(`Gagal menyimpan: ${err.message}`);
+    } finally {
+      setLoadingPhase('idle');
+    }
+  };
+
+  const getPhaseText = (): string => {
+    switch (loadingPhase) {
+      case 'interpreting':
+        return 'Menafsirkan permintaan...';
+      case 'checking_slots':
+        return 'Memeriksa waktu kosong...';
+      case 'saving_calendar':
+        return 'Menyimpan ke Google Calendar...';
+      default:
+        return '';
+    }
   };
 
   return (
@@ -118,22 +214,23 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             Ubah Niat Kerja Menjadi Jadwal Nyata
           </h2>
           <p className="text-xs text-[#53657A] leading-relaxed max-w-xl">
-            Tuliskan apa yang ingin Anda kerjakan dengan bahasa sehari-hari. AI menafsirkan waktu dan tenggat, lalu scheduler deterministik memeriksa ketersediaan slot bebas konflik di Google Calendar.
+            Tuliskan apa yang ingin Anda kerjakan dengan bahasa sehari-hari. AI menafsirkan waktu, jenis komitmen (tetap atau fleksibel), lalu scheduler deterministik menguji slot bebas konflik di kalender Anda.
           </p>
         </div>
 
         {/* Input Card */}
         <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-4">
           <label className="block text-xs font-semibold text-[#172B42]">
-            Apa yang ingin Anda selesaikan?
+            Apa yang ingin Anda jadwalkan?
           </label>
           <div className="relative">
             <textarea
+              rows={3}
               value={promptInput}
               onChange={(e) => setPromptInput(e.target.value)}
-              placeholder="Contoh: Jadwalkan riset kompetitor 90 menit sebelum lusa sore, boleh dibagi 2 sesi..."
-              rows={3}
-              className="w-full p-3.5 pr-12 rounded-xl border border-[#D9E3EF] bg-[#F8FAFC] focus:bg-white text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7] resize-none"
+              placeholder="Contoh: Kelas dari jam 7 malam sampai jam 10 malam, atau: Tolong jadwalkan pengerjaan tugas 60 menit besok malam..."
+              disabled={isAnalyzing || isSaving}
+              className="w-full p-3.5 pr-12 text-sm rounded-xl border border-[#D9E3EF] text-[#172B42] placeholder:text-[#53657A]/60 focus:ring-2 focus:ring-[#2457A7] focus:outline-hidden resize-none transition-all disabled:opacity-60"
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
@@ -143,138 +240,226 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             />
             <button
               onClick={() => handlePlanSubmit(promptInput)}
-              disabled={isAnalyzing || !promptInput.trim()}
-              className="absolute right-3 bottom-3 p-2 rounded-xl bg-[#2457A7] hover:bg-[#1E4889] text-white disabled:opacity-40 transition-colors"
-              title="Kirim permintaan perencanaan"
+              disabled={!promptInput.trim() || isAnalyzing || isSaving}
+              className="absolute right-3 bottom-3.5 p-2 rounded-lg bg-[#2457A7] text-white hover:bg-[#1E4889] disabled:opacity-40 disabled:hover:bg-[#2457A7] transition-colors"
+              title="Kirim Instruksi"
             >
-              <Send size={15} />
+              {isAnalyzing ? (
+                <Loader2 size={16} className="animate-spin" />
+              ) : (
+                <Send size={16} />
+              )}
             </button>
           </div>
 
-          {/* Prompt chips */}
-          <div className="space-y-1.5 pt-1">
-            <span className="text-[11px] text-[#53657A] font-medium block">
-              Contoh permintaan yang dapat dicoba:
+          {/* Phase loading indicator */}
+          {loadingPhase !== 'idle' && (
+            <div className="flex items-center gap-2 px-3 py-2 bg-[#EAF3FC] text-[#2457A7] text-xs font-medium rounded-xl animate-in fade-in">
+              <Loader2 size={14} className="animate-spin" />
+              <span>{getPhaseText()}</span>
+            </div>
+          )}
+
+          {/* Sample Prompts */}
+          <div className="space-y-2">
+            <span className="text-[11px] font-semibold text-[#53657A] uppercase tracking-wider">
+              Contoh Permintaan Waktu Nyata:
             </span>
-            <div className="flex flex-wrap gap-1.5">
-              {samplePrompts.map((s, idx) => (
+            <div className="flex flex-wrap gap-2">
+              {samplePrompts.map((sample, idx) => (
                 <button
                   key={idx}
                   onClick={() => {
-                    setPromptInput(s);
-                    handlePlanSubmit(s);
+                    setPromptInput(sample);
+                    handlePlanSubmit(sample);
                   }}
-                  className="text-left text-[11px] px-3 py-1.5 rounded-lg bg-slate-50 hover:bg-[#EAF3FC] border border-[#D9E3EF] text-[#53657A] hover:text-[#2457A7] transition-colors"
+                  disabled={isAnalyzing || isSaving}
+                  className="text-left text-xs px-3 py-1.5 rounded-lg bg-[#F8FAFC] border border-[#D9E3EF] text-[#172B42] hover:border-[#2457A7] hover:bg-white transition-all disabled:opacity-50"
                 >
-                  {`"${s}"`}
+                  &ldquo;{sample}&rdquo;
                 </button>
               ))}
             </div>
           </div>
         </div>
 
-        {/* Loading indicator */}
-        {isAnalyzing && (
-          <div className="p-8 bg-white border border-[#D9E3EF] rounded-2xl shadow-xs text-center space-y-3 animate-pulse">
-            <Sparkles className="w-8 h-8 text-[#2457A7] mx-auto animate-spin" />
-            <h4 className="text-sm font-bold text-[#172B42]">
-              Sedang menganalisis niat dan komitmen kalender...
-            </h4>
-            <p className="text-xs text-[#53657A]">
-              AI menafsirkan durasi dan kendala, kemudian mesin scheduler memvalidasi jam kerja dan rapat.
-            </p>
-          </div>
-        )}
-
-        {/* Error Feedback */}
+        {/* Error Notification */}
         {errorMessage && (
-          <div className="p-4 bg-red-50 border border-[#C43D4B]/30 rounded-2xl flex items-start gap-3 text-xs text-[#C43D4B]">
-            <AlertCircle size={18} className="shrink-0 mt-0.5" />
-            <div>
-              <span className="font-semibold block">Gagal Merencanakan:</span>
-              <p className="mt-0.5 leading-relaxed">{errorMessage}</p>
+          <div className="p-4 bg-red-50 border border-[#C43D4B]/30 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-[#C43D4B] animate-in fade-in">
+            <div className="flex items-start gap-3">
+              <AlertCircle size={18} className="shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <span className="font-bold">Gagal Memproses Permintaan</span>
+                <p className="leading-relaxed text-[#172B42]">{errorMessage}</p>
+              </div>
             </div>
+            {lastSubmittedPrompt && (
+              <button
+                type="button"
+                onClick={() => handlePlanSubmit(lastSubmittedPrompt)}
+                disabled={isAnalyzing || isSaving}
+                className="shrink-0 self-start sm:self-center flex items-center gap-1.5 px-3 py-1.5 bg-white border border-[#C43D4B]/40 hover:border-[#C43D4B] text-[#C43D4B] font-semibold rounded-xl text-xs hover:bg-red-50 transition-colors shadow-2xs disabled:opacity-40"
+              >
+                <RotateCcw size={13} />
+                <span>Coba Lagi</span>
+              </button>
+            )}
           </div>
         )}
 
-        {/* Results Card */}
-        {proposedPlan && scheduleTestResult && !isAnalyzing && (
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-6 shadow-xs space-y-5">
-            {/* Header info */}
+        {/* Warning Notification (e.g. Rule engine fallback) */}
+        {warningMessage && (
+          <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2.5 text-xs text-amber-800">
+            <Info size={16} className="shrink-0 mt-0.5 text-amber-600" />
+            <p className="leading-relaxed">{warningMessage}</p>
+          </div>
+        )}
+
+        {/* AI Proposal & Deterministic Validation Result */}
+        {proposedPlan && scheduleTestResult && (
+          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-5 animate-in fade-in slide-in-from-bottom-2">
             <div className="flex items-start justify-between border-b border-[#D9E3EF] pb-4">
               <div>
-                <span className="text-[10px] font-semibold bg-[#EAF3FC] text-[#2457A7] px-2 py-0.5 rounded-full">
-                  Usulan Rencana Terverifikasi
-                </span>
-                <h3 className="text-lg font-bold text-[#172B42] mt-1.5">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold uppercase tracking-wider text-[#2457A7] bg-[#EAF3FC] px-2.5 py-0.5 rounded-full">
+                    Hasil Analisis AI
+                  </span>
+                  {proposedPlan.timeConstraintType === 'fixed_event' ? (
+                    <span className="flex items-center gap-1 text-[11px] font-semibold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-md">
+                      <Lock size={11} /> Komitmen Waktu Tetap (Fixed Event)
+                    </span>
+                  ) : proposedPlan.timeConstraintType === 'preferred_window' ? (
+                    <span className="text-[11px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-md">
+                      Jendela Waktu Preferensi
+                    </span>
+                  ) : (
+                    <span className="text-[11px] font-semibold text-slate-700 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-md">
+                      Fleksibel (Hanya Tenggat)
+                    </span>
+                  )}
+                </div>
+                <h3 className="text-base font-bold text-[#172B42] mt-1.5">
                   {proposedPlan.title}
                 </h3>
-                {proposedPlan.description && (
-                  <p className="text-xs text-[#53657A] mt-1">{proposedPlan.description}</p>
-                )}
               </div>
+              <span
+                className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${
+                  proposedPlan.priority === 'URGENT'
+                    ? 'bg-rose-100 text-rose-700'
+                    : proposedPlan.priority === 'HIGH'
+                    ? 'bg-amber-100 text-amber-700'
+                    : 'bg-slate-100 text-[#53657A]'
+                }`}
+              >
+                {proposedPlan.priority}
+              </span>
+            </div>
 
-              <div className="text-right">
-                <span className="text-xs font-mono font-bold text-[#2457A7]">
-                  {proposedPlan.estimatedDurationMinutes} menit
+            {/* Plan Metrics */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="p-3 bg-[#F8FAFC] rounded-xl border border-[#D9E3EF]/60 space-y-1">
+                <span className="text-[11px] text-[#53657A] flex items-center gap-1">
+                  <Clock size={12} /> Durasi
                 </span>
-                <span className="block text-[10px] text-[#53657A]">
-                  Prioritas {proposedPlan.priority}
+                <span className="text-xs font-bold text-[#172B42]">
+                  {proposedPlan.estimatedDurationMinutes} Menit
+                </span>
+              </div>
+              <div className="p-3 bg-[#F8FAFC] rounded-xl border border-[#D9E3EF]/60 space-y-1">
+                <span className="text-[11px] text-[#53657A] flex items-center gap-1">
+                  <Calendar size={12} /> Target / Tenggat
+                </span>
+                <span className="text-xs font-bold text-[#172B42]">
+                  {proposedPlan.requestedStartAt
+                    ? new Date(proposedPlan.requestedStartAt).toLocaleTimeString('id-ID', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })
+                    : proposedPlan.deadlineDaysFromNow === 0
+                    ? 'Hari ini'
+                    : proposedPlan.deadlineDaysFromNow === 1
+                    ? 'Besok'
+                    : `${proposedPlan.deadlineDaysFromNow} hari`}
+                </span>
+              </div>
+              <div className="p-3 bg-[#F8FAFC] rounded-xl border border-[#D9E3EF]/60 space-y-1">
+                <span className="text-[11px] text-[#53657A] flex items-center gap-1">
+                  <Layers size={12} /> Pembagian Sesi
+                </span>
+                <span className="text-xs font-bold text-[#172B42]">
+                  {proposedPlan.allowSplit
+                    ? `Boleh (${proposedPlan.minimumSessionMinutes}m min)`
+                    : 'Satu sesi utuh'}
+                </span>
+              </div>
+              <div className="p-3 bg-[#F8FAFC] rounded-xl border border-[#D9E3EF]/60 space-y-1">
+                <span className="text-[11px] text-[#53657A] flex items-center gap-1">
+                  <Sparkles size={12} /> Waktu Pilihan
+                </span>
+                <span className="text-xs font-bold text-[#172B42]">
+                  {proposedPlan.preferredTimeOfDay === 'MORNING'
+                    ? 'Pagi Hari'
+                    : proposedPlan.preferredTimeOfDay === 'AFTERNOON'
+                    ? 'Siang/Sore'
+                    : proposedPlan.preferredTimeOfDay === 'EVENING'
+                    ? 'Malam Hari'
+                    : 'Kapan saja'}
                 </span>
               </div>
             </div>
 
-            {/* AI Reasoning explanation */}
-            <div className="p-3.5 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs space-y-1">
-              <span className="font-semibold text-[#172B42] flex items-center gap-1.5">
-                <Sparkles size={14} className="text-[#2457A7]" />
-                Penjelasan AI:
+            {/* AI Reasoning */}
+            <div className="p-3.5 bg-[#EAF3FC]/50 border border-[#8DBCEB]/30 rounded-xl space-y-1">
+              <span className="text-[11px] font-bold text-[#2457A7] uppercase tracking-wider">
+                Pertimbangan Logis AI:
               </span>
-              <p className="text-[#53657A] leading-relaxed">
+              <p className="text-xs text-[#172B42] leading-relaxed">
                 {proposedPlan.reasoning}
               </p>
             </div>
 
-            {/* Deterministic Scheduler Result Section */}
-            <div className="p-4 rounded-xl border space-y-2.5">
+            {/* Deterministic Pre-Flight Result */}
+            <div
+              className={`p-4 rounded-xl border space-y-3 ${
+                scheduleTestResult.success
+                  ? 'bg-emerald-50/60 border-[#16856B]/30'
+                  : 'bg-amber-50/60 border-[#B86B12]/30'
+              }`}
+            >
               {scheduleTestResult.success ? (
                 <>
                   <div className="flex items-center gap-2 text-xs font-bold text-[#16856B]">
                     <CheckCircle2 size={16} />
-                    <span>Slot Kalender Berhasil Ditemukan Tanpa Bentrok!</span>
+                    <span>Slot Kalender Ditemukan & Bebas Konflik</span>
                   </div>
                   <p className="text-xs text-[#53657A] leading-relaxed">
                     {scheduleTestResult.explanation}
                   </p>
-
-                  <div className="pt-2 space-y-1.5">
-                    <span className="text-[11px] font-semibold text-[#172B42] block">
-                      Rencana Penempatan Sesi:
-                    </span>
+                  <div className="space-y-1.5 pt-1">
                     {scheduleTestResult.proposedSessions.map((sess, idx) => (
                       <div
                         key={idx}
-                        className="p-2.5 bg-[#EAF3FC]/60 border border-[#8DBCEB]/50 rounded-xl flex items-center justify-between text-xs text-[#172B42]"
+                        className="flex items-center justify-between text-xs bg-white px-3 py-2 rounded-lg border border-[#D9E3EF]"
                       >
-                        <span className="font-medium">
+                        <span className="font-medium text-[#172B42]">
+                          Sesi {sess.sessionIndex} ({sess.durationMinutes} menit)
+                        </span>
+                        <span className="font-semibold text-[#2457A7]">
                           {new Date(sess.startAt).toLocaleDateString('id-ID', {
-                            weekday: 'long',
+                            weekday: 'short',
                             day: 'numeric',
                             month: 'short',
                           })}{' '}
-                          • Pukul{' '}
+                          •{' '}
                           {new Date(sess.startAt).toLocaleTimeString('id-ID', {
                             hour: '2-digit',
                             minute: '2-digit',
                           })}{' '}
-                          —{' '}
+                          -{' '}
                           {new Date(sess.endAt).toLocaleTimeString('id-ID', {
                             hour: '2-digit',
                             minute: '2-digit',
                           })}
-                        </span>
-                        <span className="font-mono text-[11px] text-[#2457A7] font-semibold">
-                          {sess.durationMinutes} menit
                         </span>
                       </div>
                     ))}
@@ -284,7 +469,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                 <>
                   <div className="flex items-center gap-2 text-xs font-bold text-[#B86B12]">
                     <ShieldAlert size={16} />
-                    <span>Jadwal Tidak Muat Sebelum Tenggat</span>
+                    <span>Tidak Dapat Menempatkan Jadwal</span>
                   </div>
                   <p className="text-xs text-[#53657A] leading-relaxed">
                     {scheduleTestResult.explanation}
@@ -319,7 +504,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                     setProposedPlan(null);
                     setScheduleTestResult(null);
                   }}
-                  className="px-4 py-2 text-xs font-semibold text-[#53657A] hover:text-[#172B42]"
+                  disabled={isSaving}
+                  className="px-4 py-2 text-xs font-semibold text-[#53657A] hover:text-[#172B42] disabled:opacity-50"
                 >
                   Batal
                 </button>
@@ -327,10 +513,20 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                 {scheduleTestResult.success && (
                   <button
                     onClick={handleConfirmAndApply}
-                    className="flex items-center gap-1.5 px-5 py-2.5 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs"
+                    disabled={isSaving}
+                    className="flex items-center gap-1.5 px-5 py-2.5 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs disabled:opacity-60"
                   >
-                    <Check size={14} />
-                    <span>Terapkan ke Jadwal & Kalender</span>
+                    {isSaving ? (
+                      <>
+                        <Loader2 size={14} className="animate-spin" />
+                        <span>Menyimpan ke Google Calendar...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Check size={14} />
+                        <span>Terapkan ke Jadwal & Kalender</span>
+                      </>
+                    )}
                   </button>
                 )}
               </div>

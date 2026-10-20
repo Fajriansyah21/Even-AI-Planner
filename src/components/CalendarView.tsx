@@ -98,8 +98,8 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
     }
   });
 
-  // Hours to render on weekly grid (08:00 to 19:00)
-  const gridHours = Array.from({ length: 12 }, (_, i) => i + 8);
+  // Hours to render on weekly grid (07:00 to 23:00) so evening commitments are visible
+  const gridHours = Array.from({ length: 17 }, (_, i) => i + 7);
 
   const getEventsForDay = (day: Date) => {
     return events.filter((e) => {

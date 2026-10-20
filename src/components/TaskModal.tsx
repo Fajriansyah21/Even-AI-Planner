@@ -25,6 +25,9 @@ function getInitialState(task?: Task | null) {
       allowSplit: Boolean(task.allowSplit),
       minimumSessionMinutes: task.minimumSessionMinutes || 30,
       preferredTimeOfDay: task.preferredTimeOfDay || ('ANY' as const),
+      timeConstraintType: task.timeConstraintType || 'deadline_only',
+      requestedStartAt: task.requestedStartAt || '',
+      requestedEndAt: task.requestedEndAt || '',
     };
   }
 
@@ -42,6 +45,9 @@ function getInitialState(task?: Task | null) {
     allowSplit: false,
     minimumSessionMinutes: 30,
     preferredTimeOfDay: 'ANY' as const,
+    timeConstraintType: 'deadline_only' as const,
+    requestedStartAt: '',
+    requestedEndAt: '',
   };
 }
 
@@ -61,6 +67,9 @@ export const TaskModal: React.FC<TaskModalProps> = ({
   const [allowSplit, setAllowSplit] = useState(initialState.allowSplit);
   const [minimumSessionMinutes, setMinimumSessionMinutes] = useState(initialState.minimumSessionMinutes);
   const [preferredTimeOfDay, setPreferredTimeOfDay] = useState<'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY'>(initialState.preferredTimeOfDay);
+  const [timeConstraintType, setTimeConstraintType] = useState(initialState.timeConstraintType);
+  const [requestedStartAt, setRequestedStartAt] = useState(initialState.requestedStartAt);
+  const [requestedEndAt, setRequestedEndAt] = useState(initialState.requestedEndAt);
   const [errorMsg, setErrorMsg] = useState('');
 
   if (!isOpen) return null;
@@ -101,6 +110,9 @@ export const TaskModal: React.FC<TaskModalProps> = ({
       allowSplit,
       minimumSessionMinutes: allowSplit ? Number(minimumSessionMinutes) : undefined,
       preferredTimeOfDay,
+      timeConstraintType,
+      requestedStartAt: requestedStartAt || undefined,
+      requestedEndAt: requestedEndAt || undefined,
     });
 
     onClose();
@@ -219,8 +231,9 @@ export const TaskModal: React.FC<TaskModalProps> = ({
                 className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
               >
                 <option value="ANY">Kapan saja dalam jam kerja</option>
-                <option value="MORNING">Pagi hari (sebelum siang)</option>
-                <option value="AFTERNOON">Sore hari (setelah siang)</option>
+                <option value="MORNING">Pagi hari (08:00 - 12:00)</option>
+                <option value="AFTERNOON">Sore hari (13:00 - 18:00)</option>
+                <option value="EVENING">Malam hari (19:00 - 23:00)</option>
               </select>
             </div>
           </div>

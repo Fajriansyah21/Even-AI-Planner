@@ -18,6 +18,16 @@ export interface TaskScheduleSession {
   googleCalendarEventId?: string;
 }
 
+export type TimeConstraintType = 'fixed_event' | 'preferred_window' | 'deadline_only';
+
+export interface PreferredTimeWindow {
+  startHour: number;      // e.g. 19 for 7 PM
+  startMinute?: number;    // e.g. 0
+  endHour: number;        // e.g. 22 for 10 PM
+  endMinute?: number;      // e.g. 0
+  label?: string;         // e.g. 'Malam (19:00 - 22:00)'
+}
+
 export interface Task {
   id: string;
   userId: string;
@@ -30,6 +40,11 @@ export interface Task {
   allowSplit: boolean;
   minimumSessionMinutes?: number;
   preferredTimeOfDay?: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY';
+  timeConstraintType?: TimeConstraintType;
+  requestedStartAt?: string; // ISO string for fixed event
+  requestedEndAt?: string;   // ISO string for fixed event
+  preferredWindow?: PreferredTimeWindow;
+  timezone?: string;
   createdAt: string;
   scheduledSessions?: TaskScheduleSession[];
 }
@@ -86,11 +101,17 @@ export interface AIPlanDraft {
   title: string;
   description?: string;
   estimatedDurationMinutes: number;
+  timeConstraintType: TimeConstraintType; // 'fixed_event' | 'preferred_window' | 'deadline_only'
+  requestedStartAt?: string;             // ISO date string for fixed event
+  requestedEndAt?: string;               // ISO date string for fixed event
+  preferredWindow?: PreferredTimeWindow; // Custom window e.g. 19:00 - 22:00
+  preferredTimeOfDay: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY';
+  deadlineAt?: string;                   // ISO date string
   deadlineDaysFromNow: number;
+  timezone: string;                      // e.g. 'Asia/Jakarta'
   priority: Priority;
   allowSplit: boolean;
   minimumSessionMinutes: number;
-  preferredTimeOfDay: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY';
   reasoning: string;
 }
 

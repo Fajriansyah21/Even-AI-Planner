@@ -20,6 +20,7 @@ import {
   ScheduleCalculationResult,
   AIPlanDraft,
   KeepNote,
+  TaskScheduleSession,
 } from './types';
 import {
   INITIAL_PREFERENCES,
@@ -32,6 +33,7 @@ import {
 } from './lib/scheduler';
 import {
   initAuth,
+  googleSignIn,
   logout as firebaseLogout,
   getCachedAccessToken,
   setCachedAccessToken,
@@ -129,8 +131,33 @@ export default function App() {
   const [pendingBatchTasks, setPendingBatchTasks] = useState<Task[]>([]);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
-  // Setup Firebase Auth listener on mount
+  // Setup Firebase Auth listener & browser extension error filter on mount
   useEffect(() => {
+    const handleGlobalError = (event: ErrorEvent) => {
+      if (
+        event.message?.includes('Could not establish connection') ||
+        event.filename?.includes('chrome-extension://')
+      ) {
+        event.preventDefault?.();
+        event.stopImmediatePropagation?.();
+      }
+    };
+
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason?.message || String(event.reason || '');
+      if (
+        reason.includes('Could not establish connection') ||
+        reason.includes('Receiving end does not exist') ||
+        event.reason?.stack?.includes('chrome-extension://')
+      ) {
+        event.preventDefault?.();
+        event.stopImmediatePropagation?.();
+      }
+    };
+
+    window.addEventListener('error', handleGlobalError);
+    window.addEventListener('unhandledrejection', handleUnhandledRejection);
+
     const unsubscribe = initAuth(
       (user, token) => {
         setIsLoggedIn(true);
@@ -149,7 +176,11 @@ export default function App() {
         setHasGoogleAccessToken(false);
       }
     );
-    return () => unsubscribe();
+    return () => {
+      window.removeEventListener('error', handleGlobalError);
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+      unsubscribe();
+    };
   }, []);
 
   // Persist to localStorage
@@ -176,47 +207,87 @@ export default function App() {
     }, 3500);
   };
 
+  // Google Calendar Connection Handlers
+  const handleConnectCalendar = async () => {
+    try {
+      const res = await googleSignIn();
+      if (res && res.accessToken) {
+        setCachedAccessToken(res.accessToken);
+        setHasGoogleAccessToken(true);
+        setPreferences((prev) => ({
+          ...prev,
+          googleCalendarConnected: true,
+          email: res.user.email || prev.email,
+          displayName: res.user.displayName || prev.displayName,
+        }));
+        showToast('Google Calendar berhasil dihubungkan!', 'success');
+        // Immediately sync live events
+        await handleSyncCalendar();
+      }
+    } catch (err: any) {
+      showToast(`Gagal menghubungkan Google Calendar: ${err.message}`, 'error');
+    }
+  };
+
+  const handleDisconnectCalendar = () => {
+    setCachedAccessToken(null);
+    setHasGoogleAccessToken(false);
+    setPreferences((prev) => ({
+      ...prev,
+      googleCalendarConnected: false,
+      calendarSyncStatus: 'pending',
+    }));
+    showToast('Hubungan Google Calendar telah diputuskan.', 'info');
+  };
+
   // Google Calendar Sync
   const handleSyncCalendar = async () => {
     setIsSyncing(true);
     const token = getCachedAccessToken();
 
-    if (token) {
-      try {
-        const liveGoogleEvents = await fetchGoogleCalendarEvents(token);
-        if (liveGoogleEvents && liveGoogleEvents.length > 0) {
-          // Merge live Google events with internal task sessions
-          setEvents((prev) => {
-            const internalEvents = prev.filter((e) => e.provider !== 'google');
-            return [...liveGoogleEvents, ...internalEvents];
-          });
-          const updatedTime = new Date().toISOString();
-          setPreferences((prev) => ({
-            ...prev,
-            calendarSyncStatus: 'synced',
-            lastSyncedAt: updatedTime,
-            googleCalendarConnected: true,
-          }));
-          showToast(`Sinkronisasi Google Calendar berhasil! Dimuat ${liveGoogleEvents.length} rapat.`);
-          setIsSyncing(false);
-          return;
-        }
-      } catch (err: any) {
-        console.warn('Live Google Calendar sync note:', err.message);
-      }
+    if (!token) {
+      setIsSyncing(false);
+      setPreferences((prev) => ({
+        ...prev,
+        calendarSyncStatus: 'needs_reconciliation',
+        googleCalendarConnected: false,
+      }));
+      showToast('Token Google Calendar tidak aktif. Silakan klik Hubungkan Kalender di Pengaturan.', 'error');
+      return;
     }
 
-    // Standard sync with simulation feedback
-    setTimeout(() => {
-      setIsSyncing(false);
+    try {
+      const liveGoogleEvents = await fetchGoogleCalendarEvents(token);
+      // Merge live Google events with internal task sessions
+      setEvents((prev) => {
+        const internalEvents = prev.filter((e) => e.provider !== 'google');
+        return [...liveGoogleEvents, ...internalEvents];
+      });
       const updatedTime = new Date().toISOString();
       setPreferences((prev) => ({
         ...prev,
         calendarSyncStatus: 'synced',
         lastSyncedAt: updatedTime,
+        googleCalendarConnected: true,
       }));
-      showToast('Sinkronisasi Google Calendar selesai. Rapat dan slot waktu terkini.');
-    }, 800);
+
+      if (liveGoogleEvents.length === 0) {
+        showToast('Sinkronisasi selesai: 0 agenda ditemukan di Google Calendar.', 'info');
+      } else {
+        showToast(`Sinkronisasi Google Calendar berhasil! Dimuat ${liveGoogleEvents.length} agenda.`);
+      }
+    } catch (err: any) {
+      console.error('Calendar sync error:', err.message);
+      const isAuthError = err.message.includes('401') || err.message.includes('403') || err.message.includes('Token');
+      setPreferences((prev) => ({
+        ...prev,
+        calendarSyncStatus: 'failed',
+        googleCalendarConnected: isAuthError ? false : prev.googleCalendarConnected,
+      }));
+      showToast(`Gagal menyinkronkan Google Calendar: ${err.message}`, 'error');
+    } finally {
+      setIsSyncing(false);
+    }
   };
 
   // Reset to initial mock data with confirmation
@@ -364,8 +435,9 @@ export default function App() {
 
   const handleConfirmSingleSchedule = async (res: ScheduleCalculationResult) => {
     const token = getCachedAccessToken();
-    const sessions = res.proposedSessions.map((s) => ({
-      id: `sess-${res.taskId}-${s.sessionIndex}-${Date.now()}`,
+    const sessionIdBase = `sess-${res.taskId}-${Date.now()}`;
+    const initialSessions = res.proposedSessions.map((s) => ({
+      id: `${sessionIdBase}-${s.sessionIndex}`,
       taskId: res.taskId,
       taskTitle: res.taskTitle,
       sessionIndex: s.sessionIndex,
@@ -374,8 +446,68 @@ export default function App() {
       endAt: s.endAt,
       durationMinutes: s.durationMinutes,
       status: 'SCHEDULED' as const,
-      syncStatus: preferences.googleCalendarConnected ? ('synced' as const) : ('pending' as const),
+      syncStatus: 'pending' as const,
     }));
+
+    if (!token) {
+      // Save locally only without pretending Google Calendar sync succeeded
+      setTasks((prev) =>
+        prev.map((t) => {
+          if (t.id === res.taskId) {
+            return {
+              ...t,
+              status: 'SCHEDULED',
+              scheduledSessions: initialSessions,
+            };
+          }
+          return t;
+        })
+      );
+      showToast(`Jadwal tugas "${res.taskTitle}" berhasil ditempatkan ke kalender lokal (Google Calendar belum terhubung).`, 'info');
+      setSingleScheduleResult(null);
+      return;
+    }
+
+    // Live Google Calendar push
+    let successCount = 0;
+    const updatedSessions: TaskScheduleSession[] = [];
+    const newCalendarEvents: CalendarEvent[] = [];
+
+    for (const sess of initialSessions) {
+      try {
+        const created = await createGoogleCalendarEvent(token, {
+          title: `[EVEN] ${sess.taskTitle}`,
+          description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
+          startAt: sess.startAt,
+          endAt: sess.endAt,
+        });
+
+        const syncedSess = {
+          ...sess,
+          syncStatus: 'synced' as const,
+          googleCalendarEventId: created.id,
+        };
+        updatedSessions.push(syncedSess);
+        newCalendarEvents.push({
+          id: `gcal-${created.id}`,
+          provider: 'google',
+          title: `[EVEN] ${sess.taskTitle}`,
+          description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions}`,
+          startAt: sess.startAt,
+          endAt: sess.endAt,
+          isEditable: false,
+          syncStatus: 'synced',
+          category: 'focus',
+        });
+        successCount++;
+      } catch (err: any) {
+        console.error('Single schedule Google push error:', err.message);
+        updatedSessions.push({
+          ...sess,
+          syncStatus: 'failed' as const,
+        });
+      }
+    }
 
     setTasks((prev) =>
       prev.map((t) => {
@@ -383,32 +515,26 @@ export default function App() {
           return {
             ...t,
             status: 'SCHEDULED',
-            scheduledSessions: sessions,
+            scheduledSessions: updatedSessions,
           };
         }
         return t;
       })
     );
 
-    // If live Google Calendar access token is active, push event directly to Google Calendar!
-    if (token) {
-      try {
-        for (const sess of sessions) {
-          await createGoogleCalendarEvent(token, {
-            title: `[EVEN] ${sess.taskTitle}`,
-            description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
-            startAt: sess.startAt,
-            endAt: sess.endAt,
-          });
-        }
-        showToast(`Tugas "${res.taskTitle}" dijadwalkan dan disimpan ke Google Calendar Anda!`);
-        return;
-      } catch (err: any) {
-        console.warn('Google Calendar live event push fallback:', err.message);
-      }
+    if (newCalendarEvents.length > 0) {
+      setEvents((prev) => [...prev, ...newCalendarEvents]);
     }
 
-    showToast(`Jadwal tugas "${res.taskTitle}" berhasil ditempatkan ke kalender.`);
+    if (successCount === initialSessions.length) {
+      showToast(`Tugas "${res.taskTitle}" dijadwalkan dan disimpan ke Google Calendar Anda!`, 'success');
+    } else if (successCount > 0) {
+      showToast(`Tugas "${res.taskTitle}": ${successCount} dari ${initialSessions.length} sesi tersimpan ke Google Calendar, sebagian gagal.`, 'info');
+    } else {
+      showToast(`Jadwal disimpan secara lokal, namun gagal terkirim ke Google Calendar.`, 'error');
+    }
+
+    setSingleScheduleResult(null);
   };
 
   // Schedule All Tasks
@@ -426,25 +552,102 @@ export default function App() {
 
   // AI Assistant Plan application
   const handleApplyAIPlan = async (plan: AIPlanDraft, scheduleResult: ScheduleCalculationResult) => {
-    const deadlineDate = new Date();
-    deadlineDate.setDate(deadlineDate.getDate() + (plan.deadlineDaysFromNow || 1));
-    deadlineDate.setHours(17, 0, 0, 0);
+    let deadlineIso = plan.deadlineAt;
+    if (!deadlineIso) {
+      const deadlineDate = new Date();
+      deadlineDate.setDate(deadlineDate.getDate() + (plan.deadlineDaysFromNow || 1));
+      deadlineDate.setHours(plan.preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
+      deadlineIso = deadlineDate.toISOString();
+    }
 
     const taskId = `ai-task-${Date.now()}`;
-    const sessions = scheduleResult.success
-      ? scheduleResult.proposedSessions.map((s) => ({
-          id: `sess-${taskId}-${s.sessionIndex}-${Date.now()}`,
-          taskId: taskId,
-          taskTitle: plan.title,
-          sessionIndex: s.sessionIndex,
-          totalSessions: s.totalSessions,
-          startAt: s.startAt,
-          endAt: s.endAt,
-          durationMinutes: s.durationMinutes,
-          status: 'SCHEDULED' as const,
-          syncStatus: preferences.googleCalendarConnected ? ('synced' as const) : ('pending' as const),
-        }))
-      : [];
+    const token = getCachedAccessToken();
+    const proposedSessions = scheduleResult.success ? scheduleResult.proposedSessions : [];
+
+    const initialSessions = proposedSessions.map((s) => ({
+      id: `sess-${taskId}-${s.sessionIndex}-${Date.now()}`,
+      taskId: taskId,
+      taskTitle: plan.title,
+      sessionIndex: s.sessionIndex,
+      totalSessions: s.totalSessions,
+      startAt: s.startAt,
+      endAt: s.endAt,
+      durationMinutes: s.durationMinutes,
+      status: 'SCHEDULED' as const,
+      syncStatus: 'pending' as const,
+    }));
+
+    if (!token || initialSessions.length === 0) {
+      const newTask: Task = {
+        id: taskId,
+        userId: 'user-default',
+        title: plan.title,
+        description: plan.description,
+        estimatedDurationMinutes: plan.estimatedDurationMinutes,
+        deadlineAt: deadlineIso,
+        priority: plan.priority,
+        status: scheduleResult.success ? 'SCHEDULED' : 'UNSCHEDULED',
+        allowSplit: plan.allowSplit,
+        minimumSessionMinutes: plan.minimumSessionMinutes || 30,
+        preferredTimeOfDay: plan.preferredTimeOfDay,
+        timeConstraintType: plan.timeConstraintType,
+        requestedStartAt: plan.requestedStartAt,
+        requestedEndAt: plan.requestedEndAt,
+        preferredWindow: plan.preferredWindow,
+        timezone: plan.timezone,
+        createdAt: new Date().toISOString(),
+        scheduledSessions: initialSessions,
+      };
+
+      setTasks((prev) => [newTask, ...prev]);
+      if (initialSessions.length > 0) {
+        showToast(`Rencana "${plan.title}" dijadwalkan secara internal (Google Calendar belum terhubung).`, 'info');
+      } else {
+        showToast(`Tugas "${plan.title}" disimpan sebagai tugas belum terjadwal.`);
+      }
+      return;
+    }
+
+    // Google Calendar active write
+    let successCount = 0;
+    const updatedSessions: TaskScheduleSession[] = [];
+    const newCalendarEvents: CalendarEvent[] = [];
+
+    for (const sess of initialSessions) {
+      try {
+        const created = await createGoogleCalendarEvent(token, {
+          title: `[EVEN] ${sess.taskTitle}`,
+          description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
+          startAt: sess.startAt,
+          endAt: sess.endAt,
+        });
+
+        updatedSessions.push({
+          ...sess,
+          syncStatus: 'synced' as const,
+          googleCalendarEventId: created.id,
+        });
+
+        newCalendarEvents.push({
+          id: `gcal-${created.id}`,
+          provider: 'google',
+          title: `[EVEN] ${sess.taskTitle}`,
+          description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
+          startAt: sess.startAt,
+          endAt: sess.endAt,
+          isEditable: false,
+          syncStatus: 'synced',
+          category: 'focus',
+        });
+        successCount++;
+      } catch (err: any) {
+        console.error('AI Calendar event push error:', err.message);
+        updatedSessions.push({
+          ...sess,
+          syncStatus: 'failed' as const,
+        });
+      }
+    }
 
     const newTask: Task = {
       id: taskId,
@@ -452,36 +655,34 @@ export default function App() {
       title: plan.title,
       description: plan.description,
       estimatedDurationMinutes: plan.estimatedDurationMinutes,
-      deadlineAt: deadlineDate.toISOString(),
+      deadlineAt: deadlineIso,
       priority: plan.priority,
       status: scheduleResult.success ? 'SCHEDULED' : 'UNSCHEDULED',
       allowSplit: plan.allowSplit,
       minimumSessionMinutes: plan.minimumSessionMinutes || 30,
       preferredTimeOfDay: plan.preferredTimeOfDay,
+      timeConstraintType: plan.timeConstraintType,
+      requestedStartAt: plan.requestedStartAt,
+      requestedEndAt: plan.requestedEndAt,
+      preferredWindow: plan.preferredWindow,
+      timezone: plan.timezone,
       createdAt: new Date().toISOString(),
-      scheduledSessions: sessions,
+      scheduledSessions: updatedSessions,
     };
 
     setTasks((prev) => [newTask, ...prev]);
 
-    // Push to Google Calendar if token is active
-    const token = getCachedAccessToken();
-    if (token && sessions.length > 0) {
-      try {
-        for (const sess of sessions) {
-          await createGoogleCalendarEvent(token, {
-            title: `[EVEN] ${sess.taskTitle}`,
-            description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
-            startAt: sess.startAt,
-            endAt: sess.endAt,
-          });
-        }
-      } catch (err: any) {
-        console.warn('AI Calendar event push note:', err.message);
-      }
+    if (newCalendarEvents.length > 0) {
+      setEvents((prev) => [...prev, ...newCalendarEvents]);
     }
 
-    showToast(`Rencana "${plan.title}" berhasil disimpan.`);
+    if (successCount === initialSessions.length) {
+      showToast(`Rencana "${plan.title}" berhasil disimpan dan disinkronkan ke Google Calendar!`, 'success');
+    } else if (successCount > 0) {
+      showToast(`Rencana "${plan.title}": ${successCount} dari ${initialSessions.length} sesi berhasil disimpan ke Google Calendar, beberapa sesi gagal.`, 'info');
+    } else {
+      showToast(`Rencana "${plan.title}" disimpan lokal, namun gagal disinkronkan ke Google Calendar.`, 'error');
+    }
   };
 
   // Google Keep Handlers
@@ -752,6 +953,8 @@ export default function App() {
               onSyncCalendar={handleSyncCalendar}
               isSyncing={isSyncing}
               hasGoogleAccessToken={hasGoogleAccessToken}
+              onConnectCalendar={handleConnectCalendar}
+              onDisconnectCalendar={handleDisconnectCalendar}
             />
           )}
         </main>
