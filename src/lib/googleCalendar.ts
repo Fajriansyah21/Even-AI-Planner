@@ -20,7 +20,6 @@ function sanitizeErrorMessage(status: number, rawText: string): string {
   try {
     const parsed = JSON.parse(rawText);
     const message = parsed?.error?.message || `HTTP ${status}`;
-    // Strip anything resembling bearer tokens or email addresses
     return message
       .replace(/ya29\.[a-zA-Z0-9_-]+/g, '[REDACTED_TOKEN]')
       .replace(/Bearer\s+[^\s]+/gi, 'Bearer [REDACTED]')
@@ -35,12 +34,22 @@ function sanitizeErrorMessage(status: number, rawText: string): string {
  */
 function normalizeDateBoundary(dateStr: string, isEnd = false): string {
   if (dateStr.includes('T')) return dateStr;
-  // If end date for all-day event in Google Calendar, it's exclusive (midnight of next day)
-  // We represent it as 23:59:59 of current day or exact ISO string
   if (isEnd) {
     return `${dateStr}T23:59:59.000Z`;
   }
   return `${dateStr}T00:00:00.000Z`;
+}
+
+/**
+ * Adds one day to YYYY-MM-DD string to satisfy Google Calendar exclusive end-date requirement for all-day events.
+ */
+function addOneDayToDateString(dateStr: string): string {
+  const [y, m, d] = dateStr.split('-').map((v) => parseInt(v, 10));
+  const dt = new Date(Date.UTC(y, m - 1, d + 1));
+  const newY = dt.getUTCFullYear();
+  const newM = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const newD = String(dt.getUTCDate()).padStart(2, '0');
+  return `${newY}-${newM}-${newD}`;
 }
 
 /**
@@ -61,7 +70,7 @@ export async function fetchGoogleCalendarEvents(
   let pageToken: string | undefined = undefined;
   const allEvents: CalendarEvent[] = [];
   let pageCount = 0;
-  const MAX_PAGES = 10; // safety ceiling to prevent infinite loops
+  const MAX_PAGES = 10;
 
   do {
     pageCount++;
@@ -129,7 +138,7 @@ export async function fetchGoogleCalendarEvents(
 }
 
 /**
- * Creates a scheduled event directly on Google Calendar
+ * Creates a scheduled event directly on Google Calendar and verifies returned event ID.
  */
 export async function createGoogleCalendarEvent(
   accessToken: string,
@@ -158,7 +167,11 @@ export async function createGoogleCalendarEvent(
 
   if (event.isAllDay) {
     const startDateOnly = event.startAt.split('T')[0];
-    const endDateOnly = event.endAt.split('T')[0];
+    let endDateOnly = event.endAt.split('T')[0];
+    // Google Calendar API requires exclusive end date for all-day events
+    if (startDateOnly === endDateOnly) {
+      endDateOnly = addOneDayToDateString(startDateOnly);
+    }
     payload.start = { date: startDateOnly };
     payload.end = { date: endDateOnly };
   } else {
@@ -183,6 +196,10 @@ export async function createGoogleCalendarEvent(
   }
 
   const created = await res.json();
+  if (!created || !created.id || typeof created.id !== 'string') {
+    throw new Error('Google Calendar tidak mengembalikan ID acara yang valid.');
+  }
+
   return {
     id: created.id,
     htmlLink: created.htmlLink,

@@ -82,10 +82,22 @@ export interface UserPreferences {
   allowAutoSplit: boolean;
 }
 
+export type ScheduleFailureCode =
+  | 'DEADLINE_PASSED'
+  | 'CALENDAR_NOT_CONNECTED'
+  | 'CALENDAR_READ_FAILED'
+  | 'TIME_CONFLICT'
+  | 'NO_SLOT_BEFORE_DEADLINE'
+  | 'PREFERRED_WINDOW_FULL'
+  | 'INVALID_TIME_RANGE'
+  | 'CALENDAR_WRITE_FAILED'
+  | 'SYNC_PENDING';
+
 export interface ScheduleCalculationResult {
   success: boolean;
   taskId: string;
   taskTitle: string;
+  failureCode?: ScheduleFailureCode;
   proposedSessions: {
     startAt: string;
     endAt: string;
@@ -95,6 +107,13 @@ export interface ScheduleCalculationResult {
   }[];
   explanation: string;
   warning?: string;
+  diagnostics?: {
+    freeTimeCalculatedMinutes?: number;
+    totalSlotsEvaluated?: number;
+    calendarEventsCount?: number;
+    conflictingEvents?: string[];
+    [key: string]: unknown;
+  };
 }
 
 export interface AIPlanDraft {

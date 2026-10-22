@@ -1,6 +1,11 @@
-import React, { useState } from 'react';
-import { X, Calendar, Clock, AlertCircle, Layers } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, Calendar, Clock, AlertCircle, Layers, Sparkles, UserCheck } from 'lucide-react';
 import { Task, Priority } from '../types';
+import {
+  normalizeTimezone,
+  createIsoFromLocalZoned,
+  getZonedDateTimeParts,
+} from '../lib/timezone';
 
 interface TaskModalProps {
   isOpen: boolean;
@@ -8,47 +13,63 @@ interface TaskModalProps {
   onClose: () => void;
   onSave: (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'scheduledSessions'>) => void;
   userId?: string | null;
+  userTimezone?: string;
 }
 
-function getInitialState(task?: Task | null) {
-  if (task && task.deadlineAt) {
-    const d = new Date(task.deadlineAt);
-    const localFormatted = !isNaN(d.getTime())
-      ? new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16)
-      : '';
+function getInitialFormState(taskToEdit: Task | null | undefined, tz: string) {
+  const nowParts = getZonedDateTimeParts(new Date(), tz);
+  const todayStr = `${nowParts.year}-${String(nowParts.month).padStart(2, '0')}-${String(nowParts.day).padStart(2, '0')}`;
+
+  if (taskToEdit) {
+    const isFixed = taskToEdit.timeConstraintType === 'fixed_event' && Boolean(taskToEdit.requestedStartAt) && Boolean(taskToEdit.requestedEndAt);
+    let mDate = todayStr;
+    let mStart = '19:00';
+    let mEnd = '22:00';
+    let dLine = '';
+
+    if (isFixed && taskToEdit.requestedStartAt && taskToEdit.requestedEndAt) {
+      const sParts = getZonedDateTimeParts(new Date(taskToEdit.requestedStartAt), tz);
+      const eParts = getZonedDateTimeParts(new Date(taskToEdit.requestedEndAt), tz);
+      mDate = `${sParts.year}-${String(sParts.month).padStart(2, '0')}-${String(sParts.day).padStart(2, '0')}`;
+      mStart = `${String(sParts.hour).padStart(2, '0')}:${String(sParts.minute).padStart(2, '0')}`;
+      mEnd = `${String(eParts.hour).padStart(2, '0')}:${String(eParts.minute).padStart(2, '0')}`;
+    } else if (taskToEdit.deadlineAt) {
+      const dParts = getZonedDateTimeParts(new Date(taskToEdit.deadlineAt), tz);
+      dLine = `${dParts.year}-${String(dParts.month).padStart(2, '0')}-${String(dParts.day).padStart(2, '0')}T${String(dParts.hour).padStart(2, '0')}:${String(dParts.minute).padStart(2, '0')}`;
+    }
 
     return {
-      title: task.title || '',
-      description: task.description || '',
-      estimatedDurationMinutes: task.estimatedDurationMinutes || 60,
-      deadlineAt: localFormatted,
-      priority: task.priority || ('MEDIUM' as Priority),
-      allowSplit: Boolean(task.allowSplit),
-      minimumSessionMinutes: task.minimumSessionMinutes || 30,
-      preferredTimeOfDay: task.preferredTimeOfDay || ('ANY' as const),
-      timeConstraintType: task.timeConstraintType || 'deadline_only',
-      requestedStartAt: task.requestedStartAt || '',
-      requestedEndAt: task.requestedEndAt || '',
+      scheduleMode: isFixed ? ('manual' as const) : ('ai' as const),
+      title: taskToEdit.title || '',
+      description: taskToEdit.description || '',
+      priority: taskToEdit.priority || ('MEDIUM' as Priority),
+      manualDate: mDate,
+      manualStartTime: mStart,
+      manualEndTime: mEnd,
+      estimatedDurationMinutes: taskToEdit.estimatedDurationMinutes || 60,
+      deadlineAt: dLine,
+      preferredTimeOfDay: taskToEdit.preferredTimeOfDay || ('ANY' as const),
+      allowSplit: Boolean(taskToEdit.allowSplit),
+      minimumSessionMinutes: taskToEdit.minimumSessionMinutes || 30,
     };
   }
 
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  tomorrow.setHours(17, 0, 0, 0);
-  const localFormatted = new Date(tomorrow.getTime() - tomorrow.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const tomorrowParts = getZonedDateTimeParts(new Date(Date.now() + 86400000), tz);
+  const defaultDeadline = `${tomorrowParts.year}-${String(tomorrowParts.month).padStart(2, '0')}-${String(tomorrowParts.day).padStart(2, '0')}T17:00`;
 
   return {
+    scheduleMode: 'ai' as const,
     title: '',
     description: '',
-    estimatedDurationMinutes: 60,
-    deadlineAt: localFormatted,
     priority: 'MEDIUM' as Priority,
+    manualDate: todayStr,
+    manualStartTime: '19:00',
+    manualEndTime: '22:00',
+    estimatedDurationMinutes: 60,
+    deadlineAt: defaultDeadline,
+    preferredTimeOfDay: 'ANY' as const,
     allowSplit: false,
     minimumSessionMinutes: 30,
-    preferredTimeOfDay: 'ANY' as const,
-    timeConstraintType: 'deadline_only' as const,
-    requestedStartAt: '',
-    requestedEndAt: '',
   };
 }
 
@@ -58,43 +79,122 @@ export const TaskModal: React.FC<TaskModalProps> = ({
   onClose,
   onSave,
   userId,
+  userTimezone = 'Asia/Jakarta',
 }) => {
-  const initialState = getInitialState(taskToEdit);
+  const tz = normalizeTimezone(userTimezone);
+  const initial = getInitialFormState(taskToEdit, tz);
 
-  const [title, setTitle] = useState(initialState.title);
-  const [description, setDescription] = useState(initialState.description);
-  const [estimatedDurationMinutes, setEstimatedDurationMinutes] = useState(initialState.estimatedDurationMinutes);
-  const [deadlineAt, setDeadlineAt] = useState(initialState.deadlineAt);
-  const [priority, setPriority] = useState<Priority>(initialState.priority);
-  const [allowSplit, setAllowSplit] = useState(initialState.allowSplit);
-  const [minimumSessionMinutes, setMinimumSessionMinutes] = useState(initialState.minimumSessionMinutes);
-  const [preferredTimeOfDay, setPreferredTimeOfDay] = useState<'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY'>(initialState.preferredTimeOfDay);
-  const [timeConstraintType, setTimeConstraintType] = useState(initialState.timeConstraintType);
-  const [requestedStartAt, setRequestedStartAt] = useState(initialState.requestedStartAt);
-  const [requestedEndAt, setRequestedEndAt] = useState(initialState.requestedEndAt);
+  // Tab mode: 'manual' (Tentukan waktu sendiri) vs 'ai' (Bantu pilih waktu dengan AI)
+  const [scheduleMode, setScheduleMode] = useState<'manual' | 'ai'>(initial.scheduleMode);
+
+  // Shared fields
+  const [title, setTitle] = useState(initial.title);
+  const [description, setDescription] = useState(initial.description);
+  const [priority, setPriority] = useState<Priority>(initial.priority);
+
+  // Manual mode fields
+  const [manualDate, setManualDate] = useState(initial.manualDate);
+  const [manualStartTime, setManualStartTime] = useState(initial.manualStartTime);
+  const [manualEndTime, setManualEndTime] = useState(initial.manualEndTime);
+
+  // AI mode fields
+  const [estimatedDurationMinutes, setEstimatedDurationMinutes] = useState(initial.estimatedDurationMinutes);
+  const [deadlineAt, setDeadlineAt] = useState(initial.deadlineAt);
+  const [preferredTimeOfDay, setPreferredTimeOfDay] = useState<'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY'>(initial.preferredTimeOfDay);
+  const [allowSplit, setAllowSplit] = useState(initial.allowSplit);
+  const [minimumSessionMinutes, setMinimumSessionMinutes] = useState(initial.minimumSessionMinutes);
+
   const [errorMsg, setErrorMsg] = useState('');
 
   if (!isOpen) return null;
 
+  // Auto-calculated manual duration
+  const calcManualDuration = (): number => {
+    if (!manualStartTime || !manualEndTime) return 0;
+    const [sH, sM] = manualStartTime.split(':').map((x) => parseInt(x, 10));
+    const [eH, eM] = manualEndTime.split(':').map((x) => parseInt(x, 10));
+    const startM = sH * 60 + sM;
+    const endM = eH * 60 + eM;
+    return endM - startM;
+  };
+
+  const manualDurationMinutes = calcManualDuration();
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setErrorMsg('');
+
     if (!title.trim()) {
       setErrorMsg('Judul tugas wajib diisi.');
       return;
     }
+
+    if (scheduleMode === 'manual') {
+      if (!manualDate) {
+        setErrorMsg('Tanggal pelaksanaan wajib ditentukan.');
+        return;
+      }
+      if (!manualStartTime || !manualEndTime) {
+        setErrorMsg('Jam mulai dan jam selesai wajib ditentukan.');
+        return;
+      }
+      if (manualDurationMinutes <= 0) {
+        setErrorMsg('Jam selesai harus lebih akhir dari jam mulai.');
+        return;
+      }
+
+      const [y, m, d] = manualDate.split('-').map((v) => parseInt(v, 10));
+      const [sH, sM] = manualStartTime.split(':').map((v) => parseInt(v, 10));
+      const [eH, eM] = manualEndTime.split(':').map((v) => parseInt(v, 10));
+
+      const startIso = createIsoFromLocalZoned(y, m, d, sH, sM, 0, tz);
+      const endIso = createIsoFromLocalZoned(y, m, d, eH, eM, 0, tz);
+
+      onSave({
+        userId: userId || 'user-default',
+        title: title.trim(),
+        description: description.trim() || '',
+        estimatedDurationMinutes: manualDurationMinutes,
+        deadlineAt: endIso, // in manual mode, deadline equals end time
+        priority,
+        allowSplit: false, // fixed manual events cannot be split
+        preferredTimeOfDay: sH >= 18 ? 'EVENING' : sH >= 12 ? 'AFTERNOON' : 'MORNING',
+        timeConstraintType: 'fixed_event',
+        requestedStartAt: startIso,
+        requestedEndAt: endIso,
+        timezone: tz,
+      });
+
+      onClose();
+      return;
+    }
+
+    // AI Mode validation
     if (estimatedDurationMinutes <= 0) {
       setErrorMsg('Durasi estimasi harus lebih dari 0 menit.');
       return;
     }
-    if (!deadlineAt) {
-      setErrorMsg('Tenggat waktu (deadline) wajib ditentukan.');
-      return;
-    }
 
-    const deadlineDate = new Date(deadlineAt);
-    if (isNaN(deadlineDate.getTime())) {
-      setErrorMsg('Format tanggal tenggat tidak valid.');
-      return;
+    let deadlineIso = '';
+    if (deadlineAt) {
+      const dParts = deadlineAt.split('T');
+      if (dParts.length === 2) {
+        const [y, m, d] = dParts[0].split('-').map((v) => parseInt(v, 10));
+        const [h, min] = dParts[1].split(':').map((v) => parseInt(v, 10));
+        deadlineIso = createIsoFromLocalZoned(y, m, d, h, min, 0, tz);
+      } else {
+        const parsedD = new Date(deadlineAt);
+        if (isNaN(parsedD.getTime())) {
+          setErrorMsg('Format tanggal tenggat tidak valid.');
+          return;
+        }
+        deadlineIso = parsedD.toISOString();
+      }
+    } else {
+      // Optional deadline: 7 days default
+      const defaultD = new Date(Date.now() + 7 * 86400000);
+      const defParts = getZonedDateTimeParts(defaultD, tz);
+      deadlineIso = createIsoFromLocalZoned(defParts.year, defParts.month, defParts.day, 23, 59, 59, tz);
     }
 
     if (allowSplit && minimumSessionMinutes > estimatedDurationMinutes) {
@@ -107,14 +207,13 @@ export const TaskModal: React.FC<TaskModalProps> = ({
       title: title.trim(),
       description: description.trim() || '',
       estimatedDurationMinutes: Number(estimatedDurationMinutes),
-      deadlineAt: deadlineDate.toISOString(),
+      deadlineAt: deadlineIso,
       priority,
       allowSplit,
       minimumSessionMinutes: allowSplit ? Number(minimumSessionMinutes) : undefined,
       preferredTimeOfDay,
-      timeConstraintType,
-      requestedStartAt: requestedStartAt || undefined,
-      requestedEndAt: requestedEndAt || undefined,
+      timeConstraintType: preferredTimeOfDay !== 'ANY' ? 'preferred_window' : 'deadline_only',
+      timezone: tz,
     });
 
     onClose();
@@ -139,7 +238,37 @@ export const TaskModal: React.FC<TaskModalProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
+        {/* Mode Selector Tabs */}
+        <div className="px-6 pt-4 pb-2">
+          <div className="grid grid-cols-2 p-1 bg-[#F1F5F9] rounded-xl border border-[#D9E3EF]">
+            <button
+              type="button"
+              onClick={() => setScheduleMode('manual')}
+              className={`flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-lg transition-all ${
+                scheduleMode === 'manual'
+                  ? 'bg-white text-[#2457A7] shadow-xs'
+                  : 'text-[#53657A] hover:text-[#172B42]'
+              }`}
+            >
+              <Clock size={14} />
+              <span>Tentukan Waktu Sendiri (Manual)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setScheduleMode('ai')}
+              className={`flex items-center justify-center gap-1.5 py-2 text-xs font-semibold rounded-lg transition-all ${
+                scheduleMode === 'ai'
+                  ? 'bg-white text-[#2457A7] shadow-xs'
+                  : 'text-[#53657A] hover:text-[#172B42]'
+              }`}
+            >
+              <Sparkles size={14} />
+              <span>Bantu Pilih Waktu dengan AI</span>
+            </button>
+          </div>
+        </div>
+
+        <form onSubmit={handleSubmit} className="p-6 pt-2 space-y-4 max-h-[75vh] overflow-y-auto">
           {errorMsg && (
             <div className="p-3 bg-red-50 border border-[#C43D4B]/30 rounded-xl flex items-center gap-2 text-xs text-[#C43D4B]">
               <AlertCircle size={16} className="shrink-0" />
@@ -149,13 +278,13 @@ export const TaskModal: React.FC<TaskModalProps> = ({
 
           <div>
             <label className="block text-xs font-semibold text-[#172B42] mb-1">
-              Judul Tugas <span className="text-[#C43D4B]">*</span>
+              Judul Tugas / Acara <span className="text-[#C43D4B]">*</span>
             </label>
             <input
               type="text"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="Contoh: Menyiapkan laporan sprint mingguan"
+              placeholder={scheduleMode === 'manual' ? 'Contoh: Kelas React Lanjutan' : 'Contoh: Menyiapkan laporan sprint mingguan'}
               className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
               autoFocus
             />
@@ -168,112 +297,176 @@ export const TaskModal: React.FC<TaskModalProps> = ({
             <textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Catatan tambahan, link referensi, atau instruksi pengerjaan..."
+              placeholder="Catatan tambahan, link referensi, atau instruksi..."
               rows={2}
               className="w-full px-3.5 py-2 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7] resize-none"
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                Estimasi Durasi (Menit) <span className="text-[#C43D4B]">*</span>
-              </label>
-              <div className="relative">
-                <input
-                  type="number"
-                  min={15}
-                  max={480}
-                  step={15}
-                  value={estimatedDurationMinutes}
-                  onChange={(e) => setEstimatedDurationMinutes(Number(e.target.value))}
-                  className="w-full pl-3.5 pr-8 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
-                />
-                <span className="absolute right-3 top-2.5 text-xs text-[#53657A]">mnt</span>
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                Prioritas
-              </label>
-              <select
-                value={priority}
-                onChange={(e) => setPriority(e.target.value as Priority)}
-                className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
-              >
-                <option value="LOW">Rendah</option>
-                <option value="MEDIUM">Sedang</option>
-                <option value="HIGH">Tinggi</option>
-                <option value="URGENT">Mendesak</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                Tenggat Waktu (Deadline) <span className="text-[#C43D4B]">*</span>
-              </label>
-              <input
-                type="datetime-local"
-                value={deadlineAt}
-                onChange={(e) => setDeadlineAt(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                Preferensi Waktu Hari
-              </label>
-              <select
-                value={preferredTimeOfDay}
-                onChange={(e) => setPreferredTimeOfDay(e.target.value as any)}
-                className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
-              >
-                <option value="ANY">Kapan saja dalam jam kerja</option>
-                <option value="MORNING">Pagi hari (08:00 - 12:00)</option>
-                <option value="AFTERNOON">Sore hari (13:00 - 18:00)</option>
-                <option value="EVENING">Malam hari (19:00 - 23:00)</option>
-              </select>
-            </div>
-          </div>
-
-          {/* Split Session Preferences */}
-          <div className="p-3.5 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl space-y-2.5">
-            <label className="flex items-center justify-between cursor-pointer">
-              <span className="text-xs font-semibold text-[#172B42] flex items-center gap-1.5">
-                <Layers size={14} className="text-[#2457A7]" />
-                Boleh dipecah menjadi beberapa sesi (Split)
-              </span>
-              <input
-                type="checkbox"
-                checked={allowSplit}
-                onChange={(e) => setAllowSplit(e.target.checked)}
-                className="w-4 h-4 text-[#2457A7] rounded-sm focus:ring-[#2457A7]"
-              />
+          <div>
+            <label className="block text-xs font-semibold text-[#172B42] mb-1">
+              Prioritas
             </label>
-
-            {allowSplit && (
-              <div className="pt-2 border-t border-[#D9E3EF]/70 flex items-center justify-between">
-                <span className="text-xs text-[#53657A]">Durasi sesi minimum:</span>
-                <select
-                  value={minimumSessionMinutes}
-                  onChange={(e) => setMinimumSessionMinutes(Number(e.target.value))}
-                  className="px-2.5 py-1 rounded-lg border border-[#D9E3EF] text-xs bg-white text-[#172B42]"
-                >
-                  <option value={15}>15 menit</option>
-                  <option value={30}>30 menit</option>
-                  <option value={45}>45 menit</option>
-                  <option value={60}>60 menit</option>
-                </select>
-              </div>
-            )}
-            <p className="text-[11px] text-[#53657A]">
-              Jika waktu luang sebelum tenggat tidak mencukupi untuk satu blok penuh, EVEN akan membagi tugas menjadi beberapa sesi aman.
-            </p>
+            <select
+              value={priority}
+              onChange={(e) => setPriority(e.target.value as Priority)}
+              className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
+            >
+              <option value="LOW">Rendah</option>
+              <option value="MEDIUM">Sedang</option>
+              <option value="HIGH">Tinggi</option>
+              <option value="URGENT">Mendesak</option>
+            </select>
           </div>
+
+          {/* MANUAL MODE FIELDS */}
+          {scheduleMode === 'manual' && (
+            <div className="p-4 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl space-y-3">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-[#2457A7]">
+                <Clock size={14} />
+                <span>Penjadwalan Waktu Tetap (Eksplisit)</span>
+              </div>
+              <p className="text-[11px] text-[#53657A]">
+                Waktu yang Anda tentukan di sini akan dikunci tepat pada kalender tanpa digeser oleh perencana AI.
+              </p>
+
+              <div>
+                <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                  Tanggal Pelaksanaan <span className="text-[#C43D4B]">*</span>
+                </label>
+                <input
+                  type="date"
+                  value={manualDate}
+                  onChange={(e) => setManualDate(e.target.value)}
+                  className="w-full px-3.5 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                    Jam Mulai <span className="text-[#C43D4B]">*</span>
+                  </label>
+                  <input
+                    type="time"
+                    value={manualStartTime}
+                    onChange={(e) => setManualStartTime(e.target.value)}
+                    className="w-full px-3.5 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                    Jam Selesai <span className="text-[#C43D4B]">*</span>
+                  </label>
+                  <input
+                    type="time"
+                    value={manualEndTime}
+                    onChange={(e) => setManualEndTime(e.target.value)}
+                    className="w-full px-3.5 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
+                  />
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-[#D9E3EF] flex items-center justify-between text-xs">
+                <span className="text-[#53657A]">Durasi Terhitung Otomatis:</span>
+                <span className={`font-mono font-bold ${manualDurationMinutes > 0 ? 'text-[#2457A7]' : 'text-[#C43D4B]'}`}>
+                  {manualDurationMinutes > 0 ? `${manualDurationMinutes} menit (${(manualDurationMinutes / 60).toFixed(1)} jam)` : 'Waktu tidak valid'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* AI MODE FIELDS */}
+          {scheduleMode === 'ai' && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                    Estimasi Durasi (Menit) <span className="text-[#C43D4B]">*</span>
+                  </label>
+                  <div className="relative">
+                    <input
+                      type="number"
+                      min={15}
+                      max={480}
+                      step={15}
+                      value={estimatedDurationMinutes}
+                      onChange={(e) => setEstimatedDurationMinutes(Number(e.target.value))}
+                      className="w-full pl-3.5 pr-8 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
+                    />
+                    <span className="absolute right-3 top-2.5 text-xs text-[#53657A]">mnt</span>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                    Preferensi Waktu Hari
+                  </label>
+                  <select
+                    value={preferredTimeOfDay}
+                    onChange={(e) => setPreferredTimeOfDay(e.target.value as any)}
+                    className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
+                  >
+                    <option value="ANY">Kapan saja dalam jam kerja</option>
+                    <option value="MORNING">Pagi hari (08:00 - 12:00)</option>
+                    <option value="AFTERNOON">Sore hari (13:00 - 18:00)</option>
+                    <option value="EVENING">Malam hari (19:00 - 23:00)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                  Tenggat Waktu (Deadline) <span className="text-[#53657A] font-normal">(Opsional)</span>
+                </label>
+                <input
+                  type="datetime-local"
+                  value={deadlineAt}
+                  onChange={(e) => setDeadlineAt(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
+                />
+                <span className="text-[11px] text-[#53657A] mt-1 block">
+                  Bila dikosongkan, AI akan mencari slot luang terdekat dalam 7 hari ke depan.
+                </span>
+              </div>
+
+              {/* Split Session Preferences */}
+              <div className="p-3.5 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl space-y-2.5">
+                <label className="flex items-center justify-between cursor-pointer">
+                  <span className="text-xs font-semibold text-[#172B42] flex items-center gap-1.5">
+                    <Layers size={14} className="text-[#2457A7]" />
+                    Boleh dipecah menjadi beberapa sesi (Split)
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={allowSplit}
+                    onChange={(e) => setAllowSplit(e.target.checked)}
+                    className="w-4 h-4 text-[#2457A7] rounded-sm focus:ring-[#2457A7]"
+                  />
+                </label>
+
+                {allowSplit && (
+                  <div className="pt-2 border-t border-[#D9E3EF]/70 flex items-center justify-between">
+                    <span className="text-xs text-[#53657A]">Durasi sesi minimum:</span>
+                    <select
+                      value={minimumSessionMinutes}
+                      onChange={(e) => setMinimumSessionMinutes(Number(e.target.value))}
+                      className="px-2.5 py-1 rounded-lg border border-[#D9E3EF] text-xs bg-white text-[#172B42]"
+                    >
+                      <option value={15}>15 menit</option>
+                      <option value={30}>30 menit</option>
+                      <option value={45}>45 menit</option>
+                      <option value={60}>60 menit</option>
+                    </select>
+                  </div>
+                )}
+                <p className="text-[11px] text-[#53657A]">
+                  Jika waktu luang sebelum tenggat tidak mencukupi untuk satu blok penuh, EVEN akan membagi tugas menjadi beberapa sesi aman.
+                </p>
+              </div>
+            </div>
+          )}
 
           <div className="pt-3 border-t border-[#D9E3EF] flex items-center justify-end gap-2.5">
             <button
@@ -287,7 +480,7 @@ export const TaskModal: React.FC<TaskModalProps> = ({
               type="submit"
               className="px-5 py-2.5 text-xs font-semibold text-white bg-[#2457A7] hover:bg-[#1E4889] rounded-xl transition-colors shadow-xs"
             >
-              {taskToEdit && taskToEdit.id ? 'Simpan Perubahan' : 'Buat Tugas'}
+              {taskToEdit && taskToEdit.id ? 'Simpan Perubahan' : scheduleMode === 'manual' ? 'Simpan Jadwal Waktu Tetap' : 'Buat Tugas AI'}
             </button>
           </div>
         </form>

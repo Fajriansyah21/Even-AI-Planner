@@ -1085,6 +1085,7 @@ export default function App() {
         }}
         onSave={handleSaveTask}
         userId={userId}
+        userTimezone={preferences.timezone}
       />
 
       <ScheduleResultModal

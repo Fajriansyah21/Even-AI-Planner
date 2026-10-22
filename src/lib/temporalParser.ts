@@ -1,3 +1,9 @@
+import {
+  normalizeTimezone,
+  getZonedDateTimeParts,
+  createIsoFromLocalZoned,
+} from './timezone';
+
 export interface ParseContext {
   userPrompt: string;
   currentDateTime?: string;
@@ -9,40 +15,119 @@ export interface ParseContext {
   };
 }
 
+const MONTH_NAMES_INDONESIAN: Record<string, number> = {
+  jan: 1,
+  januari: 1,
+  feb: 2,
+  februari: 2,
+  mar: 3,
+  maret: 3,
+  apr: 4,
+  april: 4,
+  mei: 5,
+  jun: 6,
+  juni: 6,
+  jul: 7,
+  juli: 7,
+  agu: 8,
+  agus: 8,
+  agustus: 8,
+  ags: 8,
+  agt: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  okt: 10,
+  oktober: 10,
+  nov: 11,
+  november: 11,
+  des: 12,
+  desember: 12,
+};
+
 /**
  * Intelligent deterministic Indonesian temporal rule parser.
  * Works both as high-precision standalone parser and as a post-validator for LLM outputs.
+ * Completely timezone-safe across host architectures.
  */
 export function parseIndonesianTemporalRules(ctx: ParseContext) {
   const prompt = ctx.userPrompt.trim().toLowerCase();
-  const tz = ctx.userTimezone || 'Asia/Jakarta';
-  
-  // Base reference date
+  const tz = normalizeTimezone(ctx.userTimezone || 'Asia/Jakarta');
+
+  // Base reference date parsed into user's timezone components
   const baseDate = ctx.currentDateTime ? new Date(ctx.currentDateTime) : new Date();
-  
-  // Determine target date offset: 'hari ini' / 'malam ini' = 0; 'besok' = 1; 'lusa' = 2; etc.
-  let dayOffset = 0;
-  if (prompt.includes('besok lusa')) {
-    dayOffset = 2;
-  } else if (prompt.includes('lusa')) {
-    dayOffset = 2;
-  } else if (prompt.includes('besok')) {
-    dayOffset = 1;
-  } else if (prompt.includes('3 hari lagi')) {
-    dayOffset = 3;
-  } else if (prompt.includes('minggu depan')) {
-    dayOffset = 7;
+  const baseParts = getZonedDateTimeParts(baseDate, tz);
+
+  // 1. Detect explicit date in prompt (e.g. "Kamis 22 Okt", "22 Oktober 2026", "22/10/2026")
+  let targetYear = baseParts.year;
+  let targetMonth = baseParts.month;
+  let targetDay = baseParts.day;
+  let explicitDateFound = false;
+
+  // Regex pattern for "22 Okt", "22 Oktober", "22 Oktober 2026"
+  const explicitMonthMatch = prompt.match(
+    /\b(\d{1,2})\s+(jan(?:uari)?|feb(?:ruari)?|mar(?:et)?|apr(?:il)?|mei|jun(?:i)?|jul(?:i)?|agu(?:stus)?|ags|agt|sep(?:tember)?|okt(?:ober)?|nov(?:ember)?|des(?:ember)?)(?:\s+(\d{4}))?\b/i
+  );
+
+  if (explicitMonthMatch) {
+    const dayVal = parseInt(explicitMonthMatch[1], 10);
+    const monthStr = explicitMonthMatch[2].toLowerCase();
+    const yearVal = explicitMonthMatch[3] ? parseInt(explicitMonthMatch[3], 10) : baseParts.year;
+    const monthNum = MONTH_NAMES_INDONESIAN[monthStr];
+
+    if (monthNum && dayVal >= 1 && dayVal <= 31) {
+      targetDay = dayVal;
+      targetMonth = monthNum;
+      targetYear = yearVal;
+      explicitDateFound = true;
+    }
   }
 
-  // Calculate target date
-  const targetDate = new Date(baseDate);
-  targetDate.setDate(targetDate.getDate() + dayOffset);
-  
+  // Regex for numeric date: DD/MM/YYYY or DD-MM-YYYY
+  if (!explicitDateFound) {
+    const numDateMatch = prompt.match(/\b(\d{1,2})[-/](\d{1,2})(?:[-/](\d{4}))?\b/);
+    if (numDateMatch) {
+      const dayVal = parseInt(numDateMatch[1], 10);
+      const monthVal = parseInt(numDateMatch[2], 10);
+      const yearVal = numDateMatch[3] ? parseInt(numDateMatch[3], 10) : baseParts.year;
+      if (dayVal >= 1 && dayVal <= 31 && monthVal >= 1 && monthVal <= 12) {
+        targetDay = dayVal;
+        targetMonth = monthVal;
+        targetYear = yearVal;
+        explicitDateFound = true;
+      }
+    }
+  }
+
+  // Relative day offset if no explicit date was found
+  let dayOffset = 0;
+  if (!explicitDateFound) {
+    if (prompt.includes('besok lusa')) {
+      dayOffset = 2;
+    } else if (prompt.includes('lusa')) {
+      dayOffset = 2;
+    } else if (prompt.includes('besok')) {
+      dayOffset = 1;
+    } else if (prompt.includes('3 hari lagi')) {
+      dayOffset = 3;
+    } else if (prompt.includes('minggu depan')) {
+      dayOffset = 7;
+    }
+
+    if (dayOffset > 0) {
+      // Calculate new target day using UTC constructor to avoid local machine timezone distortion
+      const refUtc = new Date(Date.UTC(baseParts.year, baseParts.month - 1, baseParts.day + dayOffset));
+      targetYear = refUtc.getUTCFullYear();
+      targetMonth = refUtc.getUTCMonth() + 1;
+      targetDay = refUtc.getUTCDate();
+    }
+  }
+
   // Check if it's explicitly a fixed commitment/event:
   // e.g. "kelas", "kuliah", "webinar", "rapat", "meeting", "janji", "jadwal", or has range "dari jam X sampai Y"
   const isCommitmentKeyword = /\b(kelas|kuliah|webinar|rapat|meeting|janji|jadwal|workshop|seminar|konsultasi|kursus)\b/i.test(prompt);
-  
-  // 1. Detect start-end range: e.g. "jam 7 malam sampai jam 10 malam", "jam 7 sampai 10 malam", "19.00 - 22.00", "pukul 19:00-22:00"
+
+  // 2. Detect start-end range: e.g. "jam 7 malam sampai jam 10 malam", "jam 7 sampai 10 malam", "19.00 - 22.00", "pukul 19:00-22:00"
   let fixedStartHour: number | null = null;
   let fixedStartMin: number = 0;
   let fixedEndHour: number | null = null;
@@ -66,12 +151,12 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
       const sPeriod = wordRangeMatch[3];
       let eH = parseInt(wordRangeMatch[4], 10);
       const eM = wordRangeMatch[5] ? parseInt(wordRangeMatch[5], 10) : 0;
-      const ePeriod = wordRangeMatch[6] || sPeriod; // If second has 'malam', apply to first if appropriate
-      
+      const ePeriod = wordRangeMatch[6] || sPeriod;
+
       const overallIsNight = ePeriod === 'malam' || sPeriod === 'malam' || prompt.includes('malam');
       const overallIsAfternoon = ePeriod === 'sore' || sPeriod === 'sore' || prompt.includes('sore');
       const overallIsNoon = ePeriod === 'siang' || sPeriod === 'siang' || prompt.includes('siang');
-      
+
       if (overallIsNight) {
         if (sH < 12) sH += 12;
         if (eH < 12) eH += 12;
@@ -90,31 +175,29 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     }
   }
 
-  // 2. Detect single specific time e.g. "malam ini jam 9", "jam 9 malam", "pukul 21.00", "jam 20.30"
+  // 3. Detect single specific time e.g. "malam ini jam 9", "jam 9 malam", "pukul 21.00", "jam 20.30"
   if (fixedStartHour === null) {
-    // Pattern: "jam 9 malam", "jam sembilan malam", "pukul 21.00"
     const singleTimeMatch = prompt.match(/(?:jam|pukul)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i);
     if (singleTimeMatch) {
       let h = parseInt(singleTimeMatch[1], 10);
       const m = singleTimeMatch[2] ? parseInt(singleTimeMatch[2], 10) : 0;
       const period = singleTimeMatch[3];
-      
+
       const isNight = period === 'malam' || prompt.includes('malam');
       const isAfternoon = period === 'sore' || prompt.includes('sore');
       const isNoon = period === 'siang' || prompt.includes('siang');
-      
+
       if (isNight && h < 12) {
-        h += 12; // e.g. 9 malam -> 21
+        h += 12;
       } else if (isAfternoon && h <= 6) {
-        h += 12; // e.g. 3 sore -> 15
+        h += 12;
       } else if (isNoon && h >= 1 && h <= 3) {
-        h += 12; // e.g. 1 siang -> 13
+        h += 12;
       }
-      
+
       fixedStartHour = h;
       fixedStartMin = m;
     } else {
-      // Check word number e.g. "jam sembilan malam"
       if (prompt.includes('sembilan malam') || prompt.includes('9 malam')) {
         fixedStartHour = 21;
         fixedStartMin = 0;
@@ -146,6 +229,9 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     const endTotal = fixedEndHour * 60 + fixedEndMin;
     if (endTotal > startTotal) {
       duration = endTotal - startTotal;
+    } else {
+      // Cross-midnight: wraps around 24 hours (e.g. 23:00 to 01:30 = 150 minutes)
+      duration = (24 * 60 - startTotal) + endTotal;
     }
   }
 
@@ -153,14 +239,10 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   if (fixedStartHour !== null && fixedEndHour === null) {
     const startTotal = fixedStartHour * 60 + fixedStartMin;
     const endTotal = startTotal + duration;
-    fixedEndHour = Math.floor(endTotal / 60);
+    fixedEndHour = Math.floor(endTotal / 60) % 24;
     fixedEndMin = endTotal % 60;
   }
 
-  // Decide timeConstraintType:
-  // If user mentioned an exact start-end or commitment keyword ("kelas", "rapat", "jam 7-10 malam"), it's 'fixed_event'.
-  // If user mentioned a window ("malam ini", "besok sore") without exact start-end, it's 'preferred_window'.
-  // Otherwise 'deadline_only'.
   let timeConstraintType: 'fixed_event' | 'preferred_window' | 'deadline_only' = 'deadline_only';
   let requestedStartAt: string | undefined = undefined;
   let requestedEndAt: string | undefined = undefined;
@@ -169,25 +251,72 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
 
   if (fixedStartHour !== null && (isCommitmentKeyword || colonRangeMatch || prompt.includes('sampai') || prompt.includes('–') || prompt.includes('-'))) {
     timeConstraintType = 'fixed_event';
-    const sDate = new Date(targetDate);
-    sDate.setHours(fixedStartHour, fixedStartMin, 0, 0);
-    const eDate = new Date(targetDate);
-    eDate.setHours(fixedEndHour || fixedStartHour + 1, fixedEndMin, 0, 0);
-    
-    requestedStartAt = sDate.toISOString();
-    requestedEndAt = eDate.toISOString();
-    duration = Math.max(15, Math.round((eDate.getTime() - sDate.getTime()) / 60000));
-    
+
+    requestedStartAt = createIsoFromLocalZoned(
+      targetYear,
+      targetMonth,
+      targetDay,
+      fixedStartHour,
+      fixedStartMin,
+      0,
+      tz
+    );
+
+    const actualEndH = fixedEndHour !== null ? fixedEndHour : (fixedStartHour + 1) % 24;
+    const isCrossMidnight = actualEndH < fixedStartHour || (actualEndH === fixedStartHour && fixedEndMin < fixedStartMin);
+
+    let endYear = targetYear;
+    let endMonth = targetMonth;
+    let endDay = targetDay;
+
+    if (isCrossMidnight) {
+      // Advance to next day safely in calendar date
+      const nextDayUtc = new Date(Date.UTC(targetYear, targetMonth - 1, targetDay + 1));
+      endYear = nextDayUtc.getUTCFullYear();
+      endMonth = nextDayUtc.getUTCMonth() + 1;
+      endDay = nextDayUtc.getUTCDate();
+    }
+
+    requestedEndAt = createIsoFromLocalZoned(
+      endYear,
+      endMonth,
+      endDay,
+      actualEndH,
+      fixedEndMin,
+      0,
+      tz
+    );
+
+    const diffMs = new Date(requestedEndAt).getTime() - new Date(requestedStartAt).getTime();
+    duration = Math.max(15, Math.round(diffMs / 60000));
     preferredTimeOfDay = fixedStartHour >= 18 ? 'EVENING' : fixedStartHour >= 12 ? 'AFTERNOON' : 'MORNING';
   } else if (fixedStartHour !== null) {
     // Single time specified like "malam ini jam 9" or "jam 21.00"
     if (isCommitmentKeyword) {
       timeConstraintType = 'fixed_event';
-      const sDate = new Date(targetDate);
-      sDate.setHours(fixedStartHour, fixedStartMin, 0, 0);
-      const eDate = new Date(sDate.getTime() + duration * 60000);
-      requestedStartAt = sDate.toISOString();
-      requestedEndAt = eDate.toISOString();
+      requestedStartAt = createIsoFromLocalZoned(
+        targetYear,
+        targetMonth,
+        targetDay,
+        fixedStartHour,
+        fixedStartMin,
+        0,
+        tz
+      );
+
+      const endTotal = fixedStartHour * 60 + fixedStartMin + duration;
+      const calcEndHour = Math.floor(endTotal / 60);
+      const calcEndMin = endTotal % 60;
+
+      requestedEndAt = createIsoFromLocalZoned(
+        targetYear,
+        targetMonth,
+        targetDay,
+        calcEndHour,
+        calcEndMin,
+        0,
+        tz
+      );
       preferredTimeOfDay = fixedStartHour >= 18 ? 'EVENING' : fixedStartHour >= 12 ? 'AFTERNOON' : 'MORNING';
     } else {
       timeConstraintType = 'preferred_window';
@@ -219,13 +348,21 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     preferredTimeOfDay = 'MORNING';
   }
 
-  // Deadline calculation
-  const deadlineDate = new Date(targetDate);
+  // Deadline calculation in user's timezone
+  let deadlineAt: string;
   if (timeConstraintType === 'fixed_event' && requestedEndAt) {
-    deadlineDate.setTime(new Date(requestedEndAt).getTime());
+    deadlineAt = requestedEndAt;
   } else {
-    // Default deadline at 18:00 on the target day or 23:00 if night
-    deadlineDate.setHours(preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
+    const deadlineHour = preferredTimeOfDay === 'EVENING' ? 23 : 18;
+    deadlineAt = createIsoFromLocalZoned(
+      targetYear,
+      targetMonth,
+      targetDay,
+      deadlineHour,
+      0,
+      0,
+      tz
+    );
   }
 
   // Priority
@@ -238,22 +375,22 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     priority = 'LOW';
   }
 
-  // Splitting: fixed event cannot be split!
+  // Splitting: fixed events CANNOT be split!
   const allowSplit = timeConstraintType !== 'fixed_event' && (prompt.includes('bagi') || prompt.includes('sesi') || prompt.includes('cicil'));
   const minSession = 30;
 
-  // Title generation
+  // Title formatting
   let title = ctx.userPrompt.trim();
   if (title.length > 50) {
     title = title.slice(0, 47) + '...';
   }
 
-  // Reasoning in Indonesian
+  // Reasoning in formal Indonesian
   let reasoning = '';
   if (timeConstraintType === 'fixed_event') {
     reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, '0') : '00'}:${String(fixedStartMin).padStart(2, '0')} - ${fixedEndHour ? String(fixedEndHour).padStart(2, '0') : '00'}:${String(fixedEndMin).padStart(2, '0')}) sehingga dijaga tanpa digeser.`;
   } else if (preferredWindow) {
-    reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu santai atau fokus malam Anda.`;
+    reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu fokus pilihan Anda.`;
   } else {
     reasoning = `AI menetapkan estimasi durasi ${duration} menit dengan tenggat waktu ${dayOffset === 0 ? 'hari ini' : `${dayOffset} hari ke depan`}.`;
   }
@@ -267,7 +404,7 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     requestedEndAt,
     preferredWindow,
     preferredTimeOfDay,
-    deadlineAt: deadlineDate.toISOString(),
+    deadlineAt,
     deadlineDaysFromNow: Math.max(1, dayOffset),
     timezone: tz,
     priority,
