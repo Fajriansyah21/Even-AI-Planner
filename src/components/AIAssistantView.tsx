@@ -73,7 +73,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     const abortController = new AbortController();
     const clientTimeoutId = setTimeout(() => {
       abortController.abort();
-    }, 20000); // 20-second client timeout
+    }, 25000); // 25-second client timeout
 
     try {
       const now = new Date();

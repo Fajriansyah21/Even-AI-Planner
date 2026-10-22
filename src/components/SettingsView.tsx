@@ -85,15 +85,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setTimeout(() => setSaveSuccess(false), 2500);
   };
 
-  const toggleGoogleCalendar = () => {
-    const nextState = !preferences.googleCalendarConnected;
-    onUpdatePreferences({
-      googleCalendarConnected: nextState,
-      calendarSyncStatus: nextState ? 'synced' : 'pending',
-      lastSyncedAt: nextState ? new Date().toISOString() : null,
-    });
-  };
-
   return (
     <div className="flex-1 flex flex-col h-full bg-[#F8FAFC] overflow-y-auto p-4 sm:p-6">
       <div className="max-w-3xl mx-auto w-full space-y-6">
@@ -188,15 +179,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
               {hasGoogleAccessToken ? (
                 <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-[#16856B] border border-emerald-200">
-                  <CheckCircle2 size={12} /> Live API Token Aktif
-                </span>
-              ) : preferences.googleCalendarConnected ? (
-                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-blue-50 text-[#2457A7] border border-blue-200">
-                  <CheckCircle2 size={12} /> Terhubung (Simulasi)
+                  <CheckCircle2 size={12} /> Terhubung (Live OAuth)
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-50 text-[#B86B12] border border-amber-200">
-                  <AlertTriangle size={12} /> Terputus
+                  <AlertTriangle size={12} /> Belum Terhubung
                 </span>
               )}
             </div>
@@ -230,7 +217,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <button
                 type="button"
                 onClick={onSyncCalendar}
-                disabled={isSyncing}
+                disabled={isSyncing || !hasGoogleAccessToken}
                 className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#2457A7] bg-[#EAF3FC] hover:bg-[#d8ebfd] rounded-xl transition-colors disabled:opacity-50"
               >
                 <RefreshCw size={13} className={isSyncing ? 'animate-spin' : ''} />
@@ -240,19 +227,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <button
                 type="button"
                 onClick={() => {
-                  if (preferences.googleCalendarConnected) {
+                  if (hasGoogleAccessToken) {
                     onDisconnectCalendar();
                   } else {
                     onConnectCalendar();
                   }
                 }}
                 className={`px-3.5 py-2 text-xs font-semibold rounded-xl transition-colors ${
-                  preferences.googleCalendarConnected
+                  hasGoogleAccessToken
                     ? 'text-[#C43D4B] hover:bg-red-50 border border-red-200'
                     : 'text-white bg-[#2457A7] hover:bg-[#1E4889]'
                 }`}
               >
-                {preferences.googleCalendarConnected ? 'Putuskan Hubungan Kalender' : 'Hubungkan Kalender'}
+                {hasGoogleAccessToken ? 'Putuskan Hubungan Kalender' : 'Hubungkan Kalender'}
               </button>
             </div>
           </div>

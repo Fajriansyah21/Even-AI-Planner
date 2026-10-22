@@ -42,8 +42,9 @@ export function scheduleTaskDeterministically(
   // 1. HARD CONSTRAINT: FIXED COMMITMENT (fixed_event)
   // -------------------------------------------------------------
   const isFixedEvent =
-    task.timeConstraintType === 'fixed_event' ||
-    (Boolean(task.requestedStartAt) && Boolean(task.requestedEndAt));
+    task.timeConstraintType === 'fixed_event' &&
+    Boolean(task.requestedStartAt) &&
+    Boolean(task.requestedEndAt);
 
   if (isFixedEvent && task.requestedStartAt && task.requestedEndAt) {
     const fixedStart = new Date(task.requestedStartAt);
@@ -353,6 +354,21 @@ export function scheduleTaskDeterministically(
         };
       }
     }
+  }
+
+  // If task has explicit evening preference or preferred window, do NOT silently fall back to standard daytime work hours!
+  if (hasEveningPref || task.timeConstraintType === 'preferred_window') {
+    const windowName = task.preferredWindow?.label || 'malam (19:00 - 23:00)';
+    return {
+      success: false,
+      taskId: task.id,
+      taskTitle: task.title,
+      proposedSessions: [],
+      explanation: `Tidak ditemukan slot waktu luang yang mencukupi (${durationNeeded} menit) di jendela waktu ${windowName} sebelum tenggat waktu (${formatIndonesianDate(deadline)}, ${formatTime(deadline)}). Jadwal pada jendela waktu tersebut penuh atau terhalang agenda lain.`,
+      warning: task.allowSplit
+        ? 'Pertimbangkan untuk memperpanjang batas tenggat atau mengurangi durasi tugas.'
+        : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau memperpanjang tenggat waktu.',
+    };
   }
 
   // Phase B: Standard Work Hours Search

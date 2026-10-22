@@ -40,6 +40,7 @@ import {
   db,
   handleFirestoreError,
   OperationType,
+  sanitizeForFirestore,
 } from './lib/firebase';
 import {
   fetchGoogleCalendarEvents,
@@ -57,10 +58,10 @@ export default function App() {
   // Navigation tab
   const [currentTab, setCurrentTab] = useState<'calendar' | 'tasks' | 'keep' | 'ai' | 'settings'>('calendar');
 
-  // User state
-  const [isLoggedIn, setIsLoggedIn] = useState(true);
+  // User state - starts unauthenticated until verified
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [hasGoogleAccessToken, setHasGoogleAccessToken] = useState(false);
-  const [userId, setUserId] = useState<string>('user-default');
+  const [userId, setUserId] = useState<string | null>(null);
 
   const [preferences, setPreferences] = useState<UserPreferences>(() => {
     try {
@@ -164,16 +165,25 @@ export default function App() {
         setUserId(user.uid);
         if (token) {
           setHasGoogleAccessToken(true);
+        } else {
+          setHasGoogleAccessToken(false);
         }
         setPreferences((prev) => ({
           ...prev,
           displayName: user.displayName || prev.displayName,
           email: user.email || prev.email,
+          googleCalendarConnected: Boolean(token),
         }));
       },
       () => {
-        // Auth failure or unauthenticated
+        // Unauthenticated or user signed out
+        setIsLoggedIn(false);
+        setUserId(null);
         setHasGoogleAccessToken(false);
+        setPreferences((prev) => ({
+          ...prev,
+          googleCalendarConnected: false,
+        }));
       }
     );
     return () => {
@@ -207,13 +217,14 @@ export default function App() {
     }, 3500);
   };
 
-  // Google Calendar Connection Handlers
   const handleConnectCalendar = async () => {
     try {
       const res = await googleSignIn();
       if (res && res.accessToken) {
         setCachedAccessToken(res.accessToken);
         setHasGoogleAccessToken(true);
+        setIsLoggedIn(true);
+        setUserId(res.user.uid);
         setPreferences((prev) => ({
           ...prev,
           googleCalendarConnected: true,
@@ -225,7 +236,11 @@ export default function App() {
         await handleSyncCalendar();
       }
     } catch (err: any) {
-      showToast(`Gagal menghubungkan Google Calendar: ${err.message}`, 'error');
+      if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
+        showToast('Penghubungan Google Calendar dibatalkan.', 'info');
+      } else {
+        showToast(`Gagal menghubungkan Google Calendar: ${err.message}`, 'error');
+      }
     }
   };
 
@@ -310,10 +325,12 @@ export default function App() {
 
   // Task creation/update
   const handleSaveTask = async (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'scheduledSessions'>) => {
+    const currentUserId = userId || 'user-default';
     if (taskToEdit) {
       const updatedTask: Task = {
         ...taskToEdit,
         ...taskData,
+        userId: currentUserId,
         status: 'UNSCHEDULED',
         scheduledSessions: [],
       };
@@ -325,7 +342,7 @@ export default function App() {
       // Persist to Firestore if user is authenticated
       if (userId && userId !== 'user-default') {
         try {
-          await setDoc(doc(db, 'users', userId, 'tasks', taskToEdit.id), updatedTask);
+          await setDoc(doc(db, 'users', userId, 'tasks', taskToEdit.id), sanitizeForFirestore(updatedTask));
         } catch (err) {
           handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskToEdit.id}`);
         }
@@ -335,6 +352,7 @@ export default function App() {
       const newTask: Task = {
         ...taskData,
         id: newTaskId,
+        userId: currentUserId,
         status: 'UNSCHEDULED',
         createdAt: new Date().toISOString(),
         scheduledSessions: [],
@@ -345,7 +363,7 @@ export default function App() {
       // Persist to Firestore if user is authenticated
       if (userId && userId !== 'user-default') {
         try {
-          await setDoc(doc(db, 'users', userId, 'tasks', newTaskId), newTask);
+          await setDoc(doc(db, 'users', userId, 'tasks', newTaskId), sanitizeForFirestore(newTask));
         } catch (err) {
           handleFirestoreError(err, OperationType.CREATE, `users/${userId}/tasks/${newTaskId}`);
         }
@@ -380,27 +398,39 @@ export default function App() {
     });
   };
 
-  const handleToggleTaskComplete = (taskId: string) => {
+  const handleToggleTaskComplete = async (taskId: string) => {
+    let changedTask: Task | null = null;
     setTasks((prev) =>
       prev.map((t) => {
         if (t.id === taskId) {
           const isDone = t.status === 'COMPLETED';
           const nextStatus = isDone ? 'UNSCHEDULED' : 'COMPLETED';
-          return {
+          changedTask = {
             ...t,
+            userId: userId || t.userId || 'user-default',
             status: nextStatus,
             scheduledSessions: t.scheduledSessions?.map((s) => ({
               ...s,
               status: isDone ? 'SCHEDULED' : 'COMPLETED',
             })),
           };
+          return changedTask;
         }
         return t;
       })
     );
+
+    if (changedTask && userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'tasks', taskId), sanitizeForFirestore(changedTask));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
+      }
+    }
   };
 
-  const handleToggleTaskSessionComplete = (taskId: string, sessionId: string) => {
+  const handleToggleTaskSessionComplete = async (taskId: string, sessionId: string) => {
+    let changedTask: Task | null = null;
     setTasks((prev) =>
       prev.map((t) => {
         if (t.id === taskId && t.scheduledSessions) {
@@ -416,15 +446,25 @@ export default function App() {
           });
 
           const allDone = updatedSessions.every((s) => s.status === 'COMPLETED');
-          return {
+          changedTask = {
             ...t,
+            userId: userId || t.userId || 'user-default',
             status: allDone ? 'COMPLETED' : 'IN_PROGRESS',
             scheduledSessions: updatedSessions,
           };
+          return changedTask;
         }
         return t;
       })
     );
+
+    if (changedTask && userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'tasks', taskId), sanitizeForFirestore(changedTask));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
+      }
+    }
   };
 
   // Schedule Single Task
@@ -451,18 +491,30 @@ export default function App() {
 
     if (!token) {
       // Save locally only without pretending Google Calendar sync succeeded
+      let updatedTaskObj: Task | null = null;
       setTasks((prev) =>
         prev.map((t) => {
           if (t.id === res.taskId) {
-            return {
+            updatedTaskObj = {
               ...t,
+              userId: userId || t.userId || 'user-default',
               status: 'SCHEDULED',
               scheduledSessions: initialSessions,
             };
+            return updatedTaskObj;
           }
           return t;
         })
       );
+
+      if (updatedTaskObj && userId && userId !== 'user-default') {
+        try {
+          await setDoc(doc(db, 'users', userId, 'tasks', res.taskId), sanitizeForFirestore(updatedTaskObj));
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${res.taskId}`);
+        }
+      }
+
       showToast(`Jadwal tugas "${res.taskTitle}" berhasil ditempatkan ke kalender lokal (Google Calendar belum terhubung).`, 'info');
       setSingleScheduleResult(null);
       return;
@@ -509,18 +561,29 @@ export default function App() {
       }
     }
 
+    let finalTaskObj: Task | null = null;
     setTasks((prev) =>
       prev.map((t) => {
         if (t.id === res.taskId) {
-          return {
+          finalTaskObj = {
             ...t,
+            userId: userId || t.userId || 'user-default',
             status: 'SCHEDULED',
             scheduledSessions: updatedSessions,
           };
+          return finalTaskObj;
         }
         return t;
       })
     );
+
+    if (finalTaskObj && userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'tasks', res.taskId), sanitizeForFirestore(finalTaskObj));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${res.taskId}`);
+      }
+    }
 
     if (newCalendarEvents.length > 0) {
       setEvents((prev) => [...prev, ...newCalendarEvents]);
@@ -544,10 +607,25 @@ export default function App() {
     setPendingBatchTasks(updatedTasks);
   };
 
-  const handleApplyBatch = () => {
-    setTasks(pendingBatchTasks);
+  const handleApplyBatch = async () => {
+    const currentUserId = userId || 'user-default';
+    const batchWithUser = pendingBatchTasks.map((t) => ({
+      ...t,
+      userId: currentUserId,
+    }));
+    setTasks(batchWithUser);
     const countSuccess = batchScheduleResults.filter((r) => r.success).length;
     showToast(`${countSuccess} tugas berhasil dijadwalkan ke kalender.`);
+
+    if (userId && userId !== 'user-default') {
+      for (const t of batchWithUser) {
+        try {
+          await setDoc(doc(db, 'users', userId, 'tasks', t.id), sanitizeForFirestore(t));
+        } catch (err) {
+          handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${t.id}`);
+        }
+      }
+    }
   };
 
   // AI Assistant Plan application
@@ -580,7 +658,7 @@ export default function App() {
     if (!token || initialSessions.length === 0) {
       const newTask: Task = {
         id: taskId,
-        userId: 'user-default',
+        userId: userId || 'user-default',
         title: plan.title,
         description: plan.description,
         estimatedDurationMinutes: plan.estimatedDurationMinutes,
@@ -651,7 +729,7 @@ export default function App() {
 
     const newTask: Task = {
       id: taskId,
-      userId: 'user-default',
+      userId: userId || 'user-default',
       title: plan.title,
       description: plan.description,
       estimatedDurationMinutes: plan.estimatedDurationMinutes,
@@ -671,6 +749,15 @@ export default function App() {
     };
 
     setTasks((prev) => [newTask, ...prev]);
+
+    // Persist to Firestore if user is authenticated
+    if (userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'tasks', taskId), sanitizeForFirestore(newTask));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, `users/${userId}/tasks/${taskId}`);
+      }
+    }
 
     if (newCalendarEvents.length > 0) {
       setEvents((prev) => [...prev, ...newCalendarEvents]);
@@ -742,27 +829,37 @@ export default function App() {
     if (token) {
       setCachedAccessToken(token);
       setHasGoogleAccessToken(true);
+    } else {
+      setHasGoogleAccessToken(false);
     }
     setPreferences((prev) => ({
       ...prev,
-      displayName: name,
-      email: email,
-      googleCalendarConnected: true,
+      displayName: name || prev.displayName,
+      email: email || prev.email,
+      googleCalendarConnected: Boolean(token),
     }));
 
     if (isNewUser) {
       setIsOnboardingOpen(true);
     } else {
-      showToast(`Selamat datang kembali di EVEN, ${name}!`);
-      // Sync events immediately after login
-      handleSyncCalendar();
+      showToast(`Selamat datang kembali di EVEN, ${name || 'Pengguna'}!`);
+      // Sync events immediately after login ONLY if token is available
+      if (token) {
+        handleSyncCalendar();
+      }
     }
   };
 
   const handleLogout = async () => {
     await firebaseLogout();
     setIsLoggedIn(false);
+    setUserId(null);
     setHasGoogleAccessToken(false);
+    setPreferences((prev) => ({
+      ...prev,
+      googleCalendarConnected: false,
+      calendarSyncStatus: 'pending',
+    }));
     showToast('Anda telah keluar dari akun.', 'info');
   };
 
@@ -987,6 +1084,7 @@ export default function App() {
           setTaskToEdit(null);
         }}
         onSave={handleSaveTask}
+        userId={userId}
       />
 
       <ScheduleResultModal

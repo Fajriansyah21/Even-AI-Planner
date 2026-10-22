@@ -148,22 +148,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </span>
             {hasGoogleAccessToken ? (
               <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#16856B]">
-                <CheckCircle2 size={11} /> Live OAuth
-              </span>
-            ) : preferences.googleCalendarConnected ? (
-              <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#2457A7]">
                 <CheckCircle2 size={11} /> Terhubung
               </span>
             ) : (
               <span className="inline-flex items-center gap-1 text-[10px] font-medium text-[#B86B12]">
-                <AlertCircle size={11} /> Terputus
+                <AlertCircle size={11} /> Belum Terhubung
               </span>
             )}
           </div>
           <p className="text-[11px] text-[#53657A] leading-tight">
             {hasGoogleAccessToken
               ? 'Token Google Calendar aktif untuk sinkronisasi langsung.'
-              : 'Firestore & Calendar sinkronisasi tersambung.'}
+              : 'Hubungkan Google Calendar untuk mendeteksi agenda & mencegah konflik.'}
           </p>
         </div>
 

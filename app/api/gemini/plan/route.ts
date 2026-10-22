@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import { NextRequest, NextResponse } from 'next/server';
 import { parseIndonesianTemporalRules, ParseContext } from '../../../../src/lib/temporalParser';
 import {
@@ -93,17 +93,18 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
 4. Jangan berasumsi diam-diam bahwa waktu adalah pagi jika konteks menyebut malam atau sore.
 5. Sediakan 'reasoning' singkat dalam Bahasa Indonesia yang transparan.`;
 
-    // Execute with automatic retry on 503, 429, 500, and timeouts (max 2 retries, 14s total limit)
+    // Execute with automatic retry on 503, 429, 500, and timeouts
     const retryResult = await executeWithRetryAndTimeout(
       async (attempt, remainingMs) => {
-        const perAttemptTimeoutMs = Math.min(4500, Math.max(2000, remainingMs - 500));
+        const perAttemptTimeoutMs = Math.min(13000, Math.max(4000, remainingMs - 500));
         const controller = new AbortController();
         const timeoutTimer = setTimeout(() => {
           controller.abort();
         }, perAttemptTimeoutMs);
 
-        // Attempt 0 uses gemini-3.8-flash; on retries fallback to high-availability gemini-3.5-flash-lite if primary model has 503 high demand
-        const model = attempt === 0 ? 'gemini-3.8-flash' : 'gemini-3.5-flash-lite';
+        // Attempt 0 uses gemini-3.8-flash; on retry fallback to gemini-3.1-flash-lite
+        const model = attempt === 0 ? 'gemini-3.8-flash' : 'gemini-3.1-flash-lite';
+        const thinkingLevel = attempt === 0 ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL;
 
         try {
           const result = await ai.models.generateContent({
@@ -111,6 +112,7 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
             contents: `Tafsirkan permintaan tugas berikut ke dalam JSON schema terstruktur:\n"${trimmedPrompt}"`,
             config: {
               systemInstruction,
+              thinkingConfig: { thinkingLevel },
               responseMimeType: 'application/json',
               responseSchema: {
                 type: Type.OBJECT,
@@ -160,10 +162,10 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         }
       },
       {
-        maxRetries: 2,
-        totalTimeoutMs: 14000,
+        maxRetries: 1,
+        totalTimeoutMs: 22000,
         initialBackoffMs: 300,
-        maxBackoffMs: 1200,
+        maxBackoffMs: 1000,
       }
     );
 
@@ -175,64 +177,78 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       const category = analysis.category;
 
       // Diagnostics logging (duration, status, retry count, category - strictly no API key or prompt content)
-      console.warn(
-        `[AI Plan Diagnostics] Duration: ${elapsedMs}ms | ProviderStatus: ${providerStatus} | Retries: ${retryCount} | ErrorCategory: ${category} | ErrorCode: ${analysis.errorCode}`
+      console.log(
+        `[AI Plan Diagnostics] Duration: ${elapsedMs}ms | ProviderStatus: ${providerStatus} | Retries: ${retryCount} | ErrorCategory: ${category} | ErrorCode: ${analysis.errorCode} | Fallback: rule_engine`
       );
 
-      return NextResponse.json(
-        {
-          success: false,
-          errorCode: analysis.errorCode,
-          error: analysis.userMessage,
-          category: analysis.category,
-          providerStatus,
-          retryCount,
-          latencyMs: elapsedMs,
-        },
-        { status: providerStatus }
-      );
+      // When AI service encounters timeout or overload, gracefully fall back to baselinePlan so user experience is uninterrupted
+      return NextResponse.json({
+        success: true,
+        isAiGenerated: false,
+        source: 'rule_fallback_on_error',
+        providerStatus,
+        retryCount,
+        latencyMs: elapsedMs,
+        warning: 'Layanan AI sedang mengalami beban tinggi atau batas waktu. Rencana tugas disusun secara akurat menggunakan mesin aturan temporal deterministik EVEN.',
+        plan: baselinePlan,
+      });
     }
 
     const response = retryResult.result;
     const rawPlan = JSON.parse(response.text || '{}');
 
     // Server-side validation and sanitization against hallucinations
+    // Rule C1 & C2: The deterministic baseline is the anchor of truth.
     const sanitizedPlan = {
       ...rawPlan,
       timezone: ctx.userTimezone,
     };
 
-    // HARD ANTI-REGRESSION: Never allow 9 malam / 21:00 to be saved as 09:00 morning!
-    const promptLower = trimmedPrompt.toLowerCase();
-    const indicatesNight = promptLower.includes('malam') || promptLower.includes('21.00') || promptLower.includes('19.00') || promptLower.includes('20.00');
-
-    if (indicatesNight) {
-      sanitizedPlan.preferredTimeOfDay = 'EVENING';
-      if (sanitizedPlan.requestedStartAt) {
-        const sD = new Date(sanitizedPlan.requestedStartAt);
-        // If hour is morning (< 12) despite 'malam', apply baseline rule
-        if (sD.getHours() < 12) {
-          sanitizedPlan.requestedStartAt = baselinePlan.requestedStartAt || sanitizedPlan.requestedStartAt;
-          sanitizedPlan.requestedEndAt = baselinePlan.requestedEndAt || sanitizedPlan.requestedEndAt;
-        }
-      }
-    }
-
-    // If baseline detected fixed event (e.g. "kelas dari jam 7 malam sampai 10 malam") but LLM missed it
+    // 1. Time constraint type determination:
     if (baselinePlan.timeConstraintType === 'fixed_event') {
+      // User explicitly set an exact fixed commitment (e.g. "kelas jam 7 sampai 10 malam" or "rapat 19.00-22.00")
       sanitizedPlan.timeConstraintType = 'fixed_event';
       sanitizedPlan.requestedStartAt = baselinePlan.requestedStartAt;
       sanitizedPlan.requestedEndAt = baselinePlan.requestedEndAt;
       sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
       sanitizedPlan.allowSplit = false;
+    } else if (baselinePlan.timeConstraintType === 'preferred_window') {
+      // User specified a time preference window (e.g. "tidur malam", "belajar malam", "olahraga malam", "besok sore")
+      // MUST NOT be treated as fixed_event, and MUST NOT carry AI-hallucinated requestedStartAt/requestedEndAt!
+      sanitizedPlan.timeConstraintType = 'preferred_window';
+      sanitizedPlan.preferredWindow = baselinePlan.preferredWindow;
+      sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
+      delete sanitizedPlan.requestedStartAt;
+      delete sanitizedPlan.requestedEndAt;
+    } else {
+      // deadline_only: flexible task bounded by deadline
+      sanitizedPlan.timeConstraintType = 'deadline_only';
+      delete sanitizedPlan.requestedStartAt;
+      delete sanitizedPlan.requestedEndAt;
     }
 
-    if (baselinePlan.preferredWindow && !sanitizedPlan.preferredWindow) {
+    // 2. Preferred time of day:
+    if (baselinePlan.preferredTimeOfDay !== 'ANY') {
+      sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
+    }
+
+    // 3. Duration: if explicit duration was extracted by baseline (e.g. "45 menit", "1 jam"), enforce it
+    const promptHasExplicitDuration = /(\d+)\s*(?:menit|mnt|jam)/i.test(trimmedPrompt);
+    if (promptHasExplicitDuration && baselinePlan.estimatedDurationMinutes) {
+      sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
+    } else if (!sanitizedPlan.estimatedDurationMinutes || sanitizedPlan.estimatedDurationMinutes <= 0) {
+      sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes || 60;
+    }
+
+    // 4. Preferred window:
+    if (baselinePlan.preferredWindow) {
       sanitizedPlan.preferredWindow = baselinePlan.preferredWindow;
     }
 
-    if (!sanitizedPlan.deadlineAt && baselinePlan.deadlineAt) {
+    // 5. Deadline:
+    if (baselinePlan.deadlineAt) {
       sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
+      sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
     }
 
     const elapsedMs = Date.now() - startTime;

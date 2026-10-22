@@ -7,6 +7,7 @@ interface TaskModalProps {
   taskToEdit?: Task | null;
   onClose: () => void;
   onSave: (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'scheduledSessions'>) => void;
+  userId?: string | null;
 }
 
 function getInitialState(task?: Task | null) {
@@ -56,6 +57,7 @@ export const TaskModal: React.FC<TaskModalProps> = ({
   taskToEdit,
   onClose,
   onSave,
+  userId,
 }) => {
   const initialState = getInitialState(taskToEdit);
 
@@ -101,9 +103,9 @@ export const TaskModal: React.FC<TaskModalProps> = ({
     }
 
     onSave({
-      userId: 'user-default',
+      userId: userId || 'user-default',
       title: title.trim(),
-      description: description.trim() || undefined,
+      description: description.trim() || '',
       estimatedDurationMinutes: Number(estimatedDurationMinutes),
       deadlineAt: deadlineDate.toISOString(),
       priority,

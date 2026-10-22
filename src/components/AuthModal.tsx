@@ -27,11 +27,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
 
     try {
       const result = await googleSignIn();
-      if (result) {
+      if (result && result.user) {
         const isNew = mode === 'register';
         onSuccess(
-          result.user.email || 'fajriansyahpratama2103@gmail.com',
-          result.user.displayName || 'Fajriansyah Pratama',
+          result.user.email || '',
+          result.user.displayName || 'Pengguna EVEN',
           isNew,
           result.accessToken
         );
@@ -39,17 +39,21 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       }
     } catch (err: any) {
       console.warn('Google sign-in caught:', err);
-      // If user closed popup or provider issue, allow graceful fallback or retry
-      if (err.code === 'auth/popup-closed-by-user') {
-        setErrorMessage('Jendela login ditutup sebelum selesai. Silakan coba kembali.');
+      // Properly handle real errors and user cancellation without fake login
+      if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
+        setErrorMessage('Jendela login ditutup sebelum proses selesai. Silakan coba kembali.');
+      } else if (err.code === 'auth/popup-blocked') {
+        setErrorMessage('Jendela popup login diblokir oleh peramban. Harap izinkan pop-up di peramban Anda.');
+      } else if (err.code === 'auth/network-request-failed') {
+        setErrorMessage('Gagal terhubung ke jaringan. Periksa koneksi internet Anda dan coba lagi.');
+      } else if (err.code === 'auth/unauthorized-domain') {
+        setErrorMessage('Domain aplikasi ini belum diotorisasi di Firebase Authentication Console.');
       } else {
-        // Fallback for preview container
-        onSuccess(
-          'fajriansyahpratama2103@gmail.com',
-          'Fajriansyah Pratama',
-          mode === 'register'
+        setErrorMessage(
+          err.message
+            ? `Autentikasi gagal: ${err.message}`
+            : 'Terjadi kesalahan saat menghubungkan akun Google. Silakan coba kembali.'
         );
-        onClose();
       }
     } finally {
       setIsLoading(false);

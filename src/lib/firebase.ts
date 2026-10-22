@@ -59,6 +59,32 @@ if (typeof window !== 'undefined') {
   testFirestoreConnection();
 }
 
+/**
+ * Recursively removes undefined fields from objects before saving to Firestore,
+ * preventing 'Function setDoc() called with invalid data. Unsupported field value: undefined' errors.
+ */
+export function sanitizeForFirestore<T extends Record<string, any>>(obj: T): Record<string, any> {
+  if (obj === null || typeof obj !== 'object' || obj instanceof Date) {
+    return obj;
+  }
+  const result: Record<string, any> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      result[key] = value.map((item) =>
+        item !== null && typeof item === 'object' && !(item instanceof Date)
+          ? sanitizeForFirestore(item)
+          : item
+      );
+    } else if (value !== null && typeof value === 'object' && !(value instanceof Date)) {
+      result[key] = sanitizeForFirestore(value);
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
 // Structured Firestore Error Handler
 export enum OperationType {
   CREATE = 'create',
