@@ -14,6 +14,12 @@ import {
   Lock,
 } from 'lucide-react';
 import { CalendarEvent, Task, TaskScheduleSession, UserPreferences } from '../types';
+import {
+  normalizeTimezone,
+  getZonedDateTimeParts,
+  formatInUserTimezone,
+  createIsoFromLocalZoned,
+} from '../lib/timezone';
 
 interface CalendarViewProps {
   events: CalendarEvent[];
@@ -34,38 +40,37 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
   onSelectSlotToSchedule,
   onOpenAIAssistant,
 }) => {
+  const tz = normalizeTimezone(preferences.timezone);
   const [viewMode, setViewMode] = useState<'day' | 'week' | 'month'>('week');
   const [currentDate, setCurrentDate] = useState<Date>(new Date());
   const [selectedEventDetails, setSelectedEventDetails] = useState<CalendarEvent | null>(null);
   const [selectedSessionDetails, setSelectedSessionDetails] = useState<{ task: Task; session: TaskScheduleSession } | null>(null);
 
-  // Compute week days starting from Monday of currentDate's week
+  // Compute week days starting from Monday of currentDate's week in user's timezone
   const getWeekDates = (date: Date): Date[] => {
-    const current = new Date(date);
-    const day = current.getDay();
-    // In JS: 0 = Sunday, 1 = Monday, ..., 6 = Saturday
-    const diffToMonday = day === 0 ? -6 : 1 - day;
-    const monday = new Date(current);
-    monday.setDate(current.getDate() + diffToMonday);
-    monday.setHours(0, 0, 0, 0);
+    const p = getZonedDateTimeParts(date, tz);
+    const dUtc = new Date(Date.UTC(p.year, p.month - 1, p.day));
+    const dayOfWeek = dUtc.getUTCDay(); // 0 = Sun, 1 = Mon ... 6 = Sat
+    const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
 
     const week: Date[] = [];
     for (let i = 0; i < 7; i++) {
-      const nextDay = new Date(monday);
-      nextDay.setDate(monday.getDate() + i);
-      week.push(nextDay);
+      const nextUtc = new Date(Date.UTC(p.year, p.month - 1, p.day + diffToMonday + i));
+      const wY = nextUtc.getUTCFullYear();
+      const wM = nextUtc.getUTCMonth() + 1;
+      const wD = nextUtc.getUTCDate();
+      const dayIso = createIsoFromLocalZoned(wY, wM, wD, 0, 0, 0, tz);
+      week.push(new Date(dayIso));
     }
     return week;
   };
 
   const weekDates = getWeekDates(currentDate);
 
-  const isSameDay = (d1: Date, d2: Date) => {
-    return (
-      d1.getFullYear() === d2.getFullYear() &&
-      d1.getMonth() === d2.getMonth() &&
-      d1.getDate() === d2.getDate()
-    );
+  const isSameDay = (d1: Date | string, d2: Date | string) => {
+    const p1 = getZonedDateTimeParts(typeof d1 === 'string' ? new Date(d1) : d1, tz);
+    const p2 = getZonedDateTimeParts(typeof d2 === 'string' ? new Date(d2) : d2, tz);
+    return p1.year === p2.year && p1.month === p2.month && p1.day === p2.day;
   };
 
   const isToday = (d: Date) => isSameDay(d, new Date());
@@ -98,20 +103,18 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
     }
   });
 
-  // Hours to render on weekly grid (07:00 to 23:00) so evening commitments are visible
-  const gridHours = Array.from({ length: 17 }, (_, i) => i + 7);
+  // Hours to render on weekly grid (07:00 to 24:00) so evening & full work commitments are visible
+  const gridHours = Array.from({ length: 18 }, (_, i) => i + 7);
 
   const getEventsForDay = (day: Date) => {
     return events.filter((e) => {
-      const start = new Date(e.startAt);
-      return isSameDay(start, day);
+      return isSameDay(e.startAt, day);
     });
   };
 
   const getSessionsForDay = (day: Date) => {
     return scheduledSessions.filter((item) => {
-      const start = new Date(item.session.startAt);
-      return isSameDay(start, day);
+      return isSameDay(item.session.startAt, day);
     });
   };
 
@@ -245,13 +248,18 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
             {/* Time Grid */}
             <div className="relative divide-y divide-[#D9E3EF]">
               {gridHours.map((hour) => {
-                const isLunchHour = hour >= preferences.lunchStartHour && hour < preferences.lunchEndHour;
+                const isLunchHour =
+                  preferences.lunchBreakEnabled !== false &&
+                  typeof preferences.lunchStartHour === 'number' &&
+                  typeof preferences.lunchEndHour === 'number' &&
+                  hour >= preferences.lunchStartHour &&
+                  hour < preferences.lunchEndHour;
 
                 return (
                   <div key={hour} className="grid grid-cols-[64px_repeat(7,1fr)] min-h-[64px]">
                     {/* Time Label */}
                     <div className="p-2 text-right pr-3 text-[11px] text-[#53657A] font-mono border-r border-[#D9E3EF] select-none bg-[#F8FAFC]">
-                      {String(hour).padStart(2, '0')}:00
+                      {hour === 24 ? '24:00' : `${String(hour).padStart(2, '0')}:00`}
                     </div>
 
                     {/* Columns for each day */}
@@ -259,15 +267,15 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                       const dayEvents = getEventsForDay(dayDate);
                       const daySessions = getSessionsForDay(dayDate);
 
-                      // Events matching this hour slot
+                      // Events matching this hour slot in user's timezone
                       const hourEvents = dayEvents.filter((e) => {
-                        const s = new Date(e.startAt).getHours();
+                        const s = getZonedDateTimeParts(new Date(e.startAt), tz).hour;
                         return s === hour;
                       });
 
-                      // Sessions matching this hour slot
+                      // Sessions matching this hour slot in user's timezone
                       const hourSessions = daySessions.filter((s) => {
-                        const sTime = new Date(s.session.startAt).getHours();
+                        const sTime = getZonedDateTimeParts(new Date(s.session.startAt), tz).hour;
                         return sTime === hour;
                       });
 
@@ -304,9 +312,10 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                               </div>
                               <div className="flex items-center gap-1.5 mt-0.5 text-[10px] text-[#53657A]">
                                 <span className="font-mono">
-                                  {new Date(evt.startAt).toLocaleTimeString('id-ID', {
+                                  {formatInUserTimezone(evt.startAt, tz, {
                                     hour: '2-digit',
                                     minute: '2-digit',
+                                    hour12: false,
                                   })}
                                 </span>
                                 {evt.meetUrl && (
@@ -321,12 +330,15 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                           {/* Render EVEN Scheduled Task Sessions */}
                           {hourSessions.map(({ task, session }) => {
                             const isDone = session.status === 'COMPLETED';
+                            const sParts = getZonedDateTimeParts(new Date(session.startAt), tz);
+                            const eParts = getZonedDateTimeParts(new Date(session.endAt), tz);
+                            const isCross = eParts.day !== sParts.day || eParts.month !== sParts.month;
 
                             return (
                               <div
                                 key={session.id}
                                 onClick={() => setSelectedSessionDetails({ task, session })}
-                                className={`mb-1 p-2 rounded-md border-l-3 cursor-pointer transition-all shadow-2xs text-left ${
+                                className={`mb-1 p-2 rounded-md border-l-3 cursor-pointer transition-all shadow-2xs text-left relative z-10 ${
                                   isDone
                                     ? 'bg-slate-100 border-slate-400 text-slate-500 line-through'
                                     : 'bg-[#EAF3FC] hover:bg-[#d8e9fa] border-[#2457A7] text-[#172B42]'
@@ -350,10 +362,15 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                                     />
                                   </button>
                                 </div>
-                                <div className="flex items-center gap-1.5 mt-1 text-[10px] text-[#53657A]">
+                                <div className="flex flex-wrap items-center gap-1.5 mt-1 text-[10px] text-[#53657A]">
                                   <span className="font-mono">
                                     {session.durationMinutes} mnt
                                   </span>
+                                  {isCross && (
+                                    <span className="bg-indigo-100 text-indigo-800 text-[9px] px-1 py-0.2 rounded font-medium">
+                                      🌙 +1 hari
+                                    </span>
+                                  )}
                                   {session.totalSessions > 1 && (
                                     <span className="bg-white/80 px-1 rounded text-[9px] font-medium text-[#2457A7]">
                                       Sesi {session.sessionIndex}/{session.totalSessions}
@@ -424,8 +441,8 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                           </span>
                         </div>
                         <p className="text-[11px] text-[#53657A] mt-0.5">
-                          {new Date(evt.startAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })} -{' '}
-                          {new Date(evt.endAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
+                          {formatInUserTimezone(evt.startAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false })} -{' '}
+                          {formatInUserTimezone(evt.endAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false })} WIB
                           {evt.location && ` • ${evt.location}`}
                         </p>
                       </div>
@@ -446,6 +463,9 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                   {/* EVEN Task Sessions */}
                   {getSessionsForDay(currentDate).map(({ task, session }) => {
                     const isDone = session.status === 'COMPLETED';
+                    const sParts = getZonedDateTimeParts(new Date(session.startAt), tz);
+                    const eParts = getZonedDateTimeParts(new Date(session.endAt), tz);
+                    const isCross = eParts.day !== sParts.day || eParts.month !== sParts.month;
 
                     return (
                       <div
@@ -465,10 +485,16 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                             <span className="text-[10px] bg-[#2457A7] text-white px-1.5 py-0.2 rounded-full font-medium">
                               Fokus EVEN
                             </span>
+                            {isCross && (
+                              <span className="text-[10px] bg-indigo-100 text-indigo-800 px-1.5 py-0.2 rounded-md font-medium">
+                                🌙 +1 hari
+                              </span>
+                            )}
                           </div>
                           <p className="text-[11px] text-[#53657A] mt-0.5">
-                            {new Date(session.startAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })} -{' '}
-                            {new Date(session.endAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
+                            {formatInUserTimezone(session.startAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false })} -{' '}
+                            {formatInUserTimezone(session.endAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false })} WIB
+                            {isCross && ' (+1 hari)'}
                             {` • ${session.durationMinutes} menit`}
                             {session.totalSessions > 1 && ` (Sesi ${session.sessionIndex}/${session.totalSessions})`}
                           </p>
@@ -506,7 +532,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
             <div className="grid grid-cols-7 gap-2">
               {Array.from({ length: 35 }).map((_, i) => {
                 const dayNum = (i % 31) + 1;
-                const isCurrent = dayNum === new Date().getDate();
+                const isCurrent = dayNum === getZonedDateTimeParts(new Date(), tz).day;
 
                 return (
                   <div
@@ -564,18 +590,20 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               <div className="flex items-center gap-2">
                 <Clock size={14} className="text-[#2457A7]" />
                 <span>
-                  {new Date(selectedEventDetails.startAt).toLocaleDateString('id-ID', {
+                  {formatInUserTimezone(selectedEventDetails.startAt, tz, {
                     weekday: 'long',
                     day: 'numeric',
                     month: 'long',
                     hour: '2-digit',
                     minute: '2-digit',
+                    hour12: false,
                   })}
                   {' — '}
-                  {new Date(selectedEventDetails.endAt).toLocaleTimeString('id-ID', {
+                  {formatInUserTimezone(selectedEventDetails.endAt, tz, {
                     hour: '2-digit',
                     minute: '2-digit',
-                  })}
+                    hour12: false,
+                  })} WIB
                 </span>
               </div>
 
@@ -633,18 +661,23 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               <div className="flex items-center gap-2">
                 <Clock size={14} className="text-[#2457A7]" />
                 <span>
-                  {new Date(selectedSessionDetails.session.startAt).toLocaleDateString('id-ID', {
+                  {formatInUserTimezone(selectedSessionDetails.session.startAt, tz, {
                     weekday: 'long',
                     day: 'numeric',
                     month: 'long',
                     hour: '2-digit',
                     minute: '2-digit',
+                    hour12: false,
                   })}
                   {' — '}
-                  {new Date(selectedSessionDetails.session.endAt).toLocaleTimeString('id-ID', {
+                  {formatInUserTimezone(selectedSessionDetails.session.endAt, tz, {
+                    weekday: 'long',
+                    day: 'numeric',
+                    month: 'long',
                     hour: '2-digit',
                     minute: '2-digit',
-                  })}
+                    hour12: false,
+                  })} WIB
                 </span>
               </div>
               <p>

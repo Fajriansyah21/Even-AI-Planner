@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "test": "tsx tests/timezone.test.ts && tsx tests/parser-scheduler.test.ts && tsx tests/gemini-error-handling.test.ts && tsx tests/auth-and-truth.test.ts",
+    "test": "tsx tests/timezone.test.ts && tsx tests/cross-midnight-and-features.test.ts && tsx tests/parser-scheduler.test.ts && tsx tests/gemini-error-handling.test.ts && tsx tests/auth-and-truth.test.ts",
     "clean": "next clean"
   },
   "dependencies": {

@@ -12,8 +12,11 @@ import {
   Info,
   Calendar,
   Layers,
+  Edit2,
+  X,
+  Check,
 } from 'lucide-react';
-import { KeepNote } from '../types';
+import { KeepNote, KeepChecklistItem } from '../types';
 
 interface KeepNotesViewProps {
   notes: KeepNote[];
@@ -36,6 +39,14 @@ export const KeepNotesView: React.FC<KeepNotesViewProps> = ({
   const [newContent, setNewContent] = useState('');
   const [isChecklist, setIsChecklist] = useState(false);
   const [checklistText, setChecklistText] = useState('');
+
+  // Edit Modal State
+  const [editingNote, setEditingNote] = useState<KeepNote | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editContent, setEditContent] = useState('');
+  const [editChecklist, setEditChecklist] = useState<KeepChecklistItem[]>([]);
+  const [newChecklistText, setNewChecklistText] = useState('');
+  const [editError, setEditError] = useState('');
 
   const colorClasses: Record<KeepNote['color'], string> = {
     default: 'bg-white border-[#D9E3EF]',
@@ -96,6 +107,70 @@ export const KeepNotesView: React.FC<KeepNotesViewProps> = ({
       isPinned: !note.isPinned,
       updatedAt: new Date().toISOString(),
     });
+  };
+
+  const openEditNote = (note: KeepNote) => {
+    setEditingNote(note);
+    setEditTitle(note.title || '');
+    setEditContent(note.content || '');
+    setEditChecklist(note.checklist ? note.checklist.map((c) => ({ ...c })) : []);
+    setNewChecklistText('');
+    setEditError('');
+  };
+
+  const closeEditModal = () => {
+    setEditingNote(null);
+    setEditError('');
+  };
+
+  const handleSaveEdit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingNote) return;
+
+    const trimmedTitle = editTitle.trim();
+    const trimmedContent = editContent.trim();
+    const hasChecklist = editChecklist.length > 0;
+
+    if (!trimmedTitle && !trimmedContent && !hasChecklist) {
+      setEditError('Catatan tidak boleh kosong. Isi judul, isi teks, atau item daftar periksa.');
+      return;
+    }
+
+    const updatedNote: KeepNote = {
+      ...editingNote,
+      title: trimmedTitle,
+      content: trimmedContent,
+      checklist: editChecklist,
+      updatedAt: new Date().toISOString(),
+    };
+
+    onUpdateNote(updatedNote);
+    closeEditModal();
+  };
+
+  const handleAddEditChecklistItem = () => {
+    if (!newChecklistText.trim()) return;
+    const newItem: KeepChecklistItem = {
+      id: `c-${Date.now()}-${editChecklist.length}`,
+      text: newChecklistText.trim(),
+      checked: false,
+    };
+    setEditChecklist([...editChecklist, newItem]);
+    setNewChecklistText('');
+  };
+
+  const handleUpdateEditChecklistItemText = (id: string, text: string) => {
+    setEditChecklist(editChecklist.map((item) => (item.id === id ? { ...item, text } : item)));
+  };
+
+  const handleToggleEditChecklistItem = (id: string) => {
+    setEditChecklist(
+      editChecklist.map((item) => (item.id === id ? { ...item, checked: !item.checked } : item))
+    );
+  };
+
+  const handleRemoveEditChecklistItem = (id: string) => {
+    setEditChecklist(editChecklist.filter((item) => item.id !== id));
   };
 
   const exportKeepJson = () => {
@@ -303,19 +378,43 @@ export const KeepNotesView: React.FC<KeepNotesViewProps> = ({
 
                 {/* Footer Actions */}
                 <div className="pt-3 border-t border-black/5 flex items-center justify-between mt-2">
-                  {/* Convert to EVEN Task */}
-                  <button
-                    onClick={() => onConvertNoteToTask(note)}
-                    className="flex items-center gap-1.5 px-2.5 py-1 bg-[#2457A7] hover:bg-[#1E4889] text-white rounded-lg text-[11px] font-semibold transition-colors shadow-2xs"
-                    title="Jadikan tugas di kalender EVEN"
-                  >
-                    <Calendar size={12} />
-                    <span>Jadikan Tugas EVEN</span>
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    {/* Edit Note Button */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openEditNote(note);
+                      }}
+                      className="flex items-center gap-1 px-2.5 py-1 bg-white hover:bg-slate-50 text-[#2457A7] border border-[#D9E3EF] rounded-lg text-[11px] font-semibold transition-colors shadow-2xs"
+                      title="Ubah rincian catatan"
+                    >
+                      <Edit2 size={12} />
+                      <span>Ubah</span>
+                    </button>
+
+                    {/* Convert to EVEN Task */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onConvertNoteToTask(note);
+                      }}
+                      className="flex items-center gap-1.5 px-2.5 py-1 bg-[#2457A7] hover:bg-[#1E4889] text-white rounded-lg text-[11px] font-semibold transition-colors shadow-2xs"
+                      title="Jadikan tugas di kalender EVEN"
+                    >
+                      <Calendar size={12} />
+                      <span>Jadikan Tugas</span>
+                    </button>
+                  </div>
 
                   <button
-                    onClick={() => onDeleteNote(note.id)}
-                    className="text-[#53657A] hover:text-[#C43D4B] p-1 rounded-md opacity-40 group-hover:opacity-100 transition-opacity"
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteNote(note.id);
+                    }}
+                    className="text-[#53657A] hover:text-[#C43D4B] p-1.5 rounded-md opacity-40 group-hover:opacity-100 transition-opacity"
                     title="Hapus catatan"
                   >
                     <Trash2 size={13} />
@@ -325,6 +424,167 @@ export const KeepNotesView: React.FC<KeepNotesViewProps> = ({
             );
           })}
         </div>
+
+        {/* Modal Ubah Catatan Keep */}
+        {editingNote && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+            <div
+              className="w-full max-w-lg bg-white rounded-2xl shadow-xl border border-[#D9E3EF] overflow-hidden animate-in fade-in zoom-in-95"
+              role="dialog"
+              aria-modal="true"
+            >
+              <div className="px-6 py-4 flex items-center justify-between border-b border-[#D9E3EF]">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-semibold bg-amber-100 text-[#B86B12] px-2 py-0.5 rounded-full border border-amber-200">
+                    Google Keep
+                  </span>
+                  <h3 className="text-base font-bold text-[#172B42]">
+                    Ubah Catatan
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeEditModal}
+                  className="text-[#53657A] hover:text-[#172B42] p-1.5 rounded-lg hover:bg-slate-100 transition-colors"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              <form onSubmit={handleSaveEdit} className="p-6 space-y-4 max-h-[75vh] overflow-y-auto">
+                {editError && (
+                  <div className="p-3 bg-red-50 border border-[#C43D4B]/30 rounded-xl text-xs text-[#C43D4B]">
+                    {editError}
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                    Judul Catatan
+                  </label>
+                  <input
+                    type="text"
+                    value={editTitle}
+                    onChange={(e) => setEditTitle(e.target.value)}
+                    placeholder="Judul catatan..."
+                    className="w-full px-3.5 py-2.5 rounded-xl border border-[#D9E3EF] text-sm text-[#172B42] focus:ring-2 focus:ring-[#2457A7] focus:outline-hidden"
+                  />
+                </div>
+
+                {/* Checklist Section */}
+                {editChecklist.length > 0 && (
+                  <div className="space-y-2">
+                    <label className="block text-xs font-semibold text-[#172B42]">
+                      Daftar Periksa (Checklist)
+                    </label>
+                    <div className="space-y-2 max-h-48 overflow-y-auto p-2 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl">
+                      {editChecklist.map((item) => (
+                        <div key={item.id} className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleToggleEditChecklistItem(item.id)}
+                            className="text-[#53657A] hover:text-[#16856B] shrink-0"
+                          >
+                            {item.checked ? (
+                              <CheckSquare size={16} className="text-[#16856B]" />
+                            ) : (
+                              <Square size={16} className="text-slate-400" />
+                            )}
+                          </button>
+                          <input
+                            type="text"
+                            value={item.text}
+                            onChange={(e) => handleUpdateEditChecklistItemText(item.id, e.target.value)}
+                            className={`flex-1 px-2.5 py-1 text-xs rounded-lg border border-[#D9E3EF] bg-white text-[#172B42] ${
+                              item.checked ? 'line-through text-slate-400' : ''
+                            }`}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveEditChecklistItem(item.id)}
+                            className="text-[#53657A] hover:text-[#C43D4B] p-1"
+                            title="Hapus baris"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Add new item to checklist */}
+                    <div className="flex items-center gap-2 pt-1">
+                      <input
+                        type="text"
+                        value={newChecklistText}
+                        onChange={(e) => setNewChecklistText(e.target.value)}
+                        placeholder="Tambah item baru..."
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            handleAddEditChecklistItem();
+                          }
+                        }}
+                        className="flex-1 px-3 py-1.5 text-xs rounded-xl border border-[#D9E3EF] text-[#172B42]"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleAddEditChecklistItem}
+                        className="px-3 py-1.5 text-xs font-semibold bg-[#EAF3FC] text-[#2457A7] hover:bg-[#d8e9fa] rounded-xl transition-colors"
+                      >
+                        + Tambah
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Content / Body Text */}
+                <div>
+                  <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                    Isi Catatan Teks
+                  </label>
+                  <textarea
+                    rows={4}
+                    value={editContent}
+                    onChange={(e) => setEditContent(e.target.value)}
+                    placeholder="Tuliskan catatan detail atau ide Anda di sini..."
+                    className="w-full p-3 text-xs rounded-xl border border-[#D9E3EF] text-[#172B42] focus:ring-2 focus:ring-[#2457A7] focus:outline-hidden resize-none"
+                  />
+                </div>
+
+                {editChecklist.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditChecklist([
+                        { id: `c-${Date.now()}-0`, text: '', checked: false },
+                      ]);
+                    }}
+                    className="text-xs text-[#2457A7] font-semibold hover:underline flex items-center gap-1.5"
+                  >
+                    <CheckSquare size={14} />
+                    <span>Tambahkan Daftar Periksa (Checklist)</span>
+                  </button>
+                )}
+
+                <div className="pt-3 border-t border-[#D9E3EF] flex items-center justify-end gap-2.5">
+                  <button
+                    type="button"
+                    onClick={closeEditModal}
+                    className="px-4 py-2 text-xs font-semibold text-[#53657A] hover:text-[#172B42] transition-colors"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-4 py-2 text-xs font-semibold text-white bg-[#2457A7] hover:bg-[#1E4889] rounded-xl shadow-2xs transition-colors"
+                  >
+                    Simpan Perubahan
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

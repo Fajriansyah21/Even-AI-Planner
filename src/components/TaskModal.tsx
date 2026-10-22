@@ -108,24 +108,69 @@ export const TaskModal: React.FC<TaskModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Auto-calculated manual duration
-  const calcManualDuration = (): number => {
-    if (!manualStartTime || !manualEndTime) return 0;
+  // Auto-calculated manual timestamps & duration
+  const getManualTimeMeta = () => {
+    if (!manualDate || !manualStartTime || !manualEndTime) {
+      return { durationMinutes: 0, isNextDay: false, startIso: '', endIso: '', error: null, formattedEnd: '' };
+    }
     const [sH, sM] = manualStartTime.split(':').map((x) => parseInt(x, 10));
     const [eH, eM] = manualEndTime.split(':').map((x) => parseInt(x, 10));
     const startM = sH * 60 + sM;
     const endM = eH * 60 + eM;
-    return endM - startM;
+
+    if (startM === endM) {
+      return {
+        durationMinutes: 0,
+        isNextDay: false,
+        startIso: '',
+        endIso: '',
+        error: 'Jam mulai dan jam selesai tidak boleh sama. Tentukan durasi kegiatan yang valid.',
+        formattedEnd: '',
+      };
+    }
+
+    const [y, m, d] = manualDate.split('-').map((v) => parseInt(v, 10));
+    const startIso = createIsoFromLocalZoned(y, m, d, sH, sM, 0, tz);
+
+    let endIso = '';
+    let isNextDay = false;
+    let endDayStr = '';
+
+    if (endM < startM) {
+      // Cross-midnight: ends on the next calendar day
+      isNextDay = true;
+      const nextDate = new Date(Date.UTC(y, m - 1, d + 1));
+      const nY = nextDate.getUTCFullYear();
+      const nM = nextDate.getUTCMonth() + 1;
+      const nD = nextDate.getUTCDate();
+      endIso = createIsoFromLocalZoned(nY, nM, nD, eH, eM, 0, tz);
+      endDayStr = `${nD}/${nM}/${nY}`;
+    } else {
+      endIso = createIsoFromLocalZoned(y, m, d, eH, eM, 0, tz);
+      endDayStr = `${d}/${m}/${y}`;
+    }
+
+    const durationMinutes = Math.round((new Date(endIso).getTime() - new Date(startIso).getTime()) / 60000);
+
+    return {
+      durationMinutes,
+      isNextDay,
+      startIso,
+      endIso,
+      error: null,
+      formattedEnd: `${endDayStr} pukul ${manualEndTime}`,
+    };
   };
 
-  const manualDurationMinutes = calcManualDuration();
+  const manualMeta = getManualTimeMeta();
+  const manualDurationMinutes = manualMeta.durationMinutes;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
 
     if (!title.trim()) {
-      setErrorMsg('Judul tugas wajib diisi.');
+      setErrorMsg('Judul kegiatan wajib diisi.');
       return;
     }
 
@@ -138,30 +183,29 @@ export const TaskModal: React.FC<TaskModalProps> = ({
         setErrorMsg('Jam mulai dan jam selesai wajib ditentukan.');
         return;
       }
+      if (manualMeta.error) {
+        setErrorMsg(manualMeta.error);
+        return;
+      }
       if (manualDurationMinutes <= 0) {
-        setErrorMsg('Jam selesai harus lebih akhir dari jam mulai.');
+        setErrorMsg('Rentang waktu tidak valid. Tentukan durasi kegiatan yang valid.');
         return;
       }
 
-      const [y, m, d] = manualDate.split('-').map((v) => parseInt(v, 10));
-      const [sH, sM] = manualStartTime.split(':').map((v) => parseInt(v, 10));
-      const [eH, eM] = manualEndTime.split(':').map((v) => parseInt(v, 10));
-
-      const startIso = createIsoFromLocalZoned(y, m, d, sH, sM, 0, tz);
-      const endIso = createIsoFromLocalZoned(y, m, d, eH, eM, 0, tz);
+      const [sH] = manualStartTime.split(':').map((v) => parseInt(v, 10));
 
       onSave({
         userId: userId || 'user-default',
         title: title.trim(),
         description: description.trim() || '',
         estimatedDurationMinutes: manualDurationMinutes,
-        deadlineAt: endIso, // in manual mode, deadline equals end time
+        deadlineAt: manualMeta.endIso, // in manual mode, deadline equals end time
         priority,
         allowSplit: false, // fixed manual events cannot be split
         preferredTimeOfDay: sH >= 18 ? 'EVENING' : sH >= 12 ? 'AFTERNOON' : 'MORNING',
         timeConstraintType: 'fixed_event',
-        requestedStartAt: startIso,
-        requestedEndAt: endIso,
+        requestedStartAt: manualMeta.startIso,
+        requestedEndAt: manualMeta.endIso,
         timezone: tz,
       });
 
@@ -278,7 +322,7 @@ export const TaskModal: React.FC<TaskModalProps> = ({
 
           <div>
             <label className="block text-xs font-semibold text-[#172B42] mb-1">
-              Judul Tugas / Acara <span className="text-[#C43D4B]">*</span>
+              Judul Kegiatan <span className="text-[#C43D4B]">*</span>
             </label>
             <input
               type="text"
@@ -368,10 +412,19 @@ export const TaskModal: React.FC<TaskModalProps> = ({
                 </div>
               </div>
 
+              {manualMeta.isNextDay && (
+                <div className="p-2.5 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center gap-2 text-xs text-indigo-800 animate-in fade-in">
+                  <Clock size={14} className="text-indigo-600 shrink-0" />
+                  <span>
+                    Kegiatan berlanjut lintas tengah malam dan berakhir pada <strong>{manualMeta.formattedEnd}</strong> (+1 hari).
+                  </span>
+                </div>
+              )}
+
               <div className="pt-2 border-t border-[#D9E3EF] flex items-center justify-between text-xs">
                 <span className="text-[#53657A]">Durasi Terhitung Otomatis:</span>
                 <span className={`font-mono font-bold ${manualDurationMinutes > 0 ? 'text-[#2457A7]' : 'text-[#C43D4B]'}`}>
-                  {manualDurationMinutes > 0 ? `${manualDurationMinutes} menit (${(manualDurationMinutes / 60).toFixed(1)} jam)` : 'Waktu tidak valid'}
+                  {manualDurationMinutes > 0 ? `${manualDurationMinutes} menit (${(manualDurationMinutes / 60).toFixed(1)} jam)` : (manualMeta.error || 'Waktu tidak valid')}
                 </span>
               </div>
             </div>

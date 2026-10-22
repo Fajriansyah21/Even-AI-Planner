@@ -70,10 +70,13 @@ export interface UserPreferences {
   displayName: string;
   email: string;
   timezone: string;
-  workStartHour: number; // e.g., 9
-  workEndHour: number;   // e.g., 18
-  lunchStartHour: number; // e.g., 12
-  lunchEndHour: number;   // e.g., 13
+  workStartHour: number; // e.g., 9 (range 7 to 24)
+  workEndHour: number;   // e.g., 18 (range 7 to 24)
+  lunchBreakEnabled?: boolean; // If false or omitted, lunch break is not deducted
+  lunchStartHour?: number; // e.g., 12
+  lunchEndHour?: number;   // e.g., 13
+  lunchBreakStartHour?: number; // synonym for lunchStartHour
+  lunchBreakEndHour?: number;   // synonym for lunchEndHour
   bufferMinutes: number;  // e.g., 15
   workDays: number[];     // [1,2,3,4,5] (Senin = 1, Minggu = 0)
   googleCalendarConnected: boolean;

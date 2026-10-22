@@ -74,7 +74,10 @@ export const BatchScheduleModal: React.FC<BatchScheduleModalProps> = ({
                 }`}
               >
                 <div className="flex items-center justify-between">
-                  <span className="font-bold text-[#172B42]">{res.taskTitle}</span>
+                  <div>
+                    <span className="text-[10px] text-[#53657A] font-medium block">Judul Kegiatan:</span>
+                    <span className="font-bold text-[#172B42]">{res.taskTitle}</span>
+                  </div>
                   {res.success ? (
                     <span className="text-[10px] bg-emerald-100 text-[#16856B] px-2 py-0.5 rounded-full font-semibold">
                       Tersedia

@@ -103,12 +103,46 @@ export function calculateFreeTimeMinutes(
  */
 export function scheduleTaskDeterministically(
   task: Task,
-  existingEvents: CalendarEvent[],
-  existingTasks: Task[],
-  preferences: UserPreferences,
+  existingEvents: CalendarEvent[] = [],
+  existingTasks: Task[] = [],
+  preferences?: UserPreferences,
   referenceDate: Date = new Date()
 ): ScheduleCalculationResult {
-  const tz = normalizeTimezone(task.timezone || preferences.timezone || 'Asia/Jakarta');
+  const safeEvents = Array.isArray(existingEvents) ? existingEvents : [];
+  let safeTasks: Task[] = [];
+  let safePreferences: UserPreferences;
+
+  const defaultPreferences: UserPreferences = {
+    displayName: 'Pengguna',
+    email: '',
+    timezone: 'Asia/Jakarta (WIB)',
+    workStartHour: 8,
+    workEndHour: 18,
+    lunchStartHour: 12,
+    lunchEndHour: 13,
+    lunchBreakStartHour: 12,
+    lunchBreakEndHour: 13,
+    lunchBreakEnabled: true,
+    bufferMinutes: 10,
+    workDays: [1, 2, 3, 4, 5],
+    googleCalendarConnected: false,
+    calendarSyncStatus: 'synced',
+    lastSyncedAt: null,
+    allowAutoSplit: false,
+  };
+
+  if (Array.isArray(existingTasks)) {
+    safeTasks = existingTasks;
+    safePreferences = preferences || defaultPreferences;
+  } else if (existingTasks && typeof existingTasks === 'object' && 'workStartHour' in existingTasks) {
+    safeTasks = [];
+    safePreferences = existingTasks as unknown as UserPreferences;
+  } else {
+    safeTasks = [];
+    safePreferences = preferences || defaultPreferences;
+  }
+
+  const tz = normalizeTimezone(task.timezone || safePreferences.timezone || 'Asia/Jakarta');
   const durationNeeded = task.estimatedDurationMinutes || 60;
 
   // -------------------------------------------------------------
@@ -133,14 +167,14 @@ export function scheduleTaskDeterministically(
         explanation: 'Format rentang waktu komitmen tetap (requestedStartAt / requestedEndAt) tidak valid atau jam selesai mendahului jam mulai.',
         warning: 'Periksa kembali input tanggal dan jam yang Anda tentukan.',
         diagnostics: {
-          calendarEventsCount: existingEvents.length,
+          calendarEventsCount: safeEvents.length,
         },
       };
     }
 
     // Check collision against calendar events
     const conflictingEvents: string[] = [];
-    for (const evt of existingEvents) {
+    for (const evt of safeEvents) {
       const eStart = new Date(evt.startAt);
       const eEnd = new Date(evt.endAt);
       if (fixedStart < eEnd && fixedEnd > eStart) {
@@ -149,7 +183,7 @@ export function scheduleTaskDeterministically(
     }
 
     // Check collision against other scheduled task sessions
-    for (const t of existingTasks) {
+    for (const t of safeTasks) {
       if (t.id === task.id) continue;
       if (t.scheduledSessions && t.scheduledSessions.length > 0) {
         for (const s of t.scheduledSessions) {
@@ -183,7 +217,13 @@ export function scheduleTaskDeterministically(
     // No collision: Place fixed event precisely
     const fixedDuration = Math.round((fixedEnd.getTime() - fixedStart.getTime()) / 60000);
     const dayStr = formatIndonesianDate(fixedStart, tz);
-    const timeStr = `${formatTime(fixedStart, tz)} - ${formatTime(fixedEnd, tz)}`;
+    const startParts = getZonedDateTimeParts(fixedStart, tz);
+    const endParts = getZonedDateTimeParts(fixedEnd, tz);
+    const isNextDay = endParts.day !== startParts.day || endParts.month !== startParts.month;
+
+    const timeStr = isNextDay
+      ? `${formatTime(fixedStart, tz)} WIB hingga ${formatIndonesianDate(fixedEnd, tz)}, pukul ${formatTime(fixedEnd, tz)} WIB (+1 hari)`
+      : `${formatTime(fixedStart, tz)} - ${formatTime(fixedEnd, tz)} WIB`;
 
     return {
       success: true,
@@ -198,7 +238,7 @@ export function scheduleTaskDeterministically(
           totalSessions: 1,
         },
       ],
-      explanation: `Komitmen waktu tetap berhasil ditempatkan pada ${dayStr}, pukul ${timeStr} WIB. Jadwal ini dikunci tepat sesuai waktu yang Anda minta.`,
+      explanation: `Komitmen waktu tetap berhasil ditempatkan pada ${dayStr}, pukul ${timeStr}. Jadwal ini dikunci tepat sesuai waktu yang Anda minta.`,
       diagnostics: {
         calendarEventsCount: existingEvents.length,
         conflictingEvents: [],
@@ -235,7 +275,7 @@ export function scheduleTaskDeterministically(
       explanation: `Tenggat waktu (${formatIndonesianDate(deadline, tz)}, ${formatTime(deadline, tz)}) sudah lewat dari waktu saat ini.`,
       warning: 'Perpanjang tenggat waktu agar perencana dapat mengalokasikan slot baru.',
       diagnostics: {
-        calendarEventsCount: existingEvents.length,
+        calendarEventsCount: safeEvents.length,
       },
     };
   }
@@ -243,7 +283,7 @@ export function scheduleTaskDeterministically(
   // Collect busy intervals
   const busyWindows: TimeInterval[] = [];
 
-  for (const event of existingEvents) {
+  for (const event of safeEvents) {
     const s = new Date(event.startAt);
     const e = new Date(event.endAt);
     if (!isNaN(s.getTime()) && !isNaN(e.getTime()) && e > s) {
@@ -251,7 +291,7 @@ export function scheduleTaskDeterministically(
     }
   }
 
-  for (const t of existingTasks) {
+  for (const t of safeTasks) {
     if (t.id === task.id) continue;
     if (t.scheduledSessions) {
       for (const session of t.scheduledSessions) {
@@ -294,7 +334,8 @@ export function scheduleTaskDeterministically(
     const isPreferredWindowSpecified =
       Boolean(task.preferredWindow) || task.preferredTimeOfDay === 'EVENING';
 
-    if (preferences.workDays.includes(dayOfWeek) || (isPreferredWindowSpecified && d === 0)) {
+    const workDaysList = safePreferences.workDays || [1, 2, 3, 4, 5];
+    if (workDaysList.includes(dayOfWeek) || (isPreferredWindowSpecified && d === 0)) {
       candidateDayStarts.push({
         date: dayDate,
         year: parts.year,
@@ -382,7 +423,7 @@ export function scheduleTaskDeterministically(
 
     const boundedPref = boundSegments(preferredSegments);
     const { freeBlocks: preferredFreeBlocks, totalFreeMinutes: prefFreeMinutes } =
-      calculateFreeTimeMinutes(boundedPref, busyWindows, preferences.bufferMinutes);
+      calculateFreeTimeMinutes(boundedPref, busyWindows, safePreferences.bufferMinutes);
 
     totalSlotsEvaluated += preferredFreeBlocks.length;
 
@@ -492,23 +533,45 @@ export function scheduleTaskDeterministically(
   }
 
   // -------------------------------------------------------------
-  // Phase B: Standard Work Hours Search (09:00 - 18:00 excluding lunch)
+  // Phase B: Standard Work Hours Search (based on configured preferences)
   // -------------------------------------------------------------
   const standardSegments: TimeInterval[] = [];
 
-  for (const cDay of candidateDayStarts) {
-    const workStartIso = createIsoFromLocalZoned(cDay.year, cDay.month, cDay.day, preferences.workStartHour, 0, 0, tz);
-    const lunchStartIso = createIsoFromLocalZoned(cDay.year, cDay.month, cDay.day, preferences.lunchStartHour, 0, 0, tz);
-    const lunchEndIso = createIsoFromLocalZoned(cDay.year, cDay.month, cDay.day, preferences.lunchEndHour, 0, 0, tz);
-    const workEndIso = createIsoFromLocalZoned(cDay.year, cDay.month, cDay.day, preferences.workEndHour, 0, 0, tz);
+  const lunchStart = typeof safePreferences.lunchBreakStartHour === 'number'
+    ? safePreferences.lunchBreakStartHour
+    : (safePreferences as any).lunchStartHour ?? 12;
+  const lunchEnd = typeof safePreferences.lunchBreakEndHour === 'number'
+    ? safePreferences.lunchBreakEndHour
+    : (safePreferences as any).lunchEndHour ?? 13;
 
-    standardSegments.push({ start: new Date(workStartIso), end: new Date(lunchStartIso) });
-    standardSegments.push({ start: new Date(lunchEndIso), end: new Date(workEndIso) });
+  const hasLunch =
+    safePreferences.lunchBreakEnabled !== false &&
+    lunchEnd > lunchStart &&
+    lunchStart >= safePreferences.workStartHour &&
+    lunchEnd <= safePreferences.workEndHour;
+
+  for (const cDay of candidateDayStarts) {
+    const workStartIso = createIsoFromLocalZoned(cDay.year, cDay.month, cDay.day, safePreferences.workStartHour, 0, 0, tz);
+    const workEndIso = createIsoFromLocalZoned(cDay.year, cDay.month, cDay.day, safePreferences.workEndHour, 0, 0, tz);
+
+    if (hasLunch) {
+      const lunchStartIso = createIsoFromLocalZoned(cDay.year, cDay.month, cDay.day, lunchStart, 0, 0, tz);
+      const lunchEndIso = createIsoFromLocalZoned(cDay.year, cDay.month, cDay.day, lunchEnd, 0, 0, tz);
+
+      if (lunchStart > safePreferences.workStartHour) {
+        standardSegments.push({ start: new Date(workStartIso), end: new Date(lunchStartIso) });
+      }
+      if (safePreferences.workEndHour > lunchEnd) {
+        standardSegments.push({ start: new Date(lunchEndIso), end: new Date(workEndIso) });
+      }
+    } else {
+      standardSegments.push({ start: new Date(workStartIso), end: new Date(workEndIso) });
+    }
   }
 
   const boundedStd = boundSegments(standardSegments);
   const { freeBlocks: standardFreeBlocks, totalFreeMinutes: stdFreeMinutes } =
-    calculateFreeTimeMinutes(boundedStd, busyWindows, preferences.bufferMinutes);
+    calculateFreeTimeMinutes(boundedStd, busyWindows, safePreferences.bufferMinutes);
 
   totalSlotsEvaluated += standardFreeBlocks.length;
 
@@ -539,7 +602,7 @@ export function scheduleTaskDeterministically(
         diagnostics: {
           freeTimeCalculatedMinutes: Math.round(stdFreeMinutes),
           totalSlotsEvaluated,
-          calendarEventsCount: existingEvents.length,
+          calendarEventsCount: safeEvents.length,
         },
       };
     }
@@ -588,7 +651,7 @@ export function scheduleTaskDeterministically(
         diagnostics: {
           freeTimeCalculatedMinutes: Math.round(stdFreeMinutes),
           totalSlotsEvaluated,
-          calendarEventsCount: existingEvents.length,
+          calendarEventsCount: safeEvents.length,
         },
       };
     }
@@ -608,7 +671,7 @@ export function scheduleTaskDeterministically(
     diagnostics: {
       freeTimeCalculatedMinutes: Math.round(stdFreeMinutes),
       totalSlotsEvaluated,
-      calendarEventsCount: existingEvents.length,
+      calendarEventsCount: safeEvents.length,
     },
   };
 }

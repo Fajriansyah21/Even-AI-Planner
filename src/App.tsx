@@ -773,19 +773,45 @@ export default function App() {
   };
 
   // Google Keep Handlers
-  const handleCreateKeepNote = (noteData: Omit<KeepNote, 'id' | 'createdAt' | 'updatedAt'>) => {
+  const handleCreateKeepNote = async (noteData: Omit<KeepNote, 'id' | 'createdAt' | 'updatedAt'>) => {
+    const currentUserId = userId || 'user-default';
+    const noteId = `keep-${Date.now()}`;
     const newNote: KeepNote = {
       ...noteData,
-      id: `keep-${Date.now()}`,
+      id: noteId,
+      userId: currentUserId,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     setKeepNotes((prev) => [newNote, ...prev]);
     showToast('Catatan Google Keep berhasil disimpan.');
+
+    if (userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'keep_notes', noteId), sanitizeForFirestore(newNote));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, `users/${userId}/keep_notes/${noteId}`);
+      }
+    }
   };
 
-  const handleUpdateKeepNote = (updatedNote: KeepNote) => {
-    setKeepNotes((prev) => prev.map((n) => (n.id === updatedNote.id ? updatedNote : n)));
+  const handleUpdateKeepNote = async (updatedNote: KeepNote) => {
+    const currentUserId = userId || updatedNote.userId || 'user-default';
+    const noteToSave: KeepNote = {
+      ...updatedNote,
+      userId: currentUserId,
+      updatedAt: new Date().toISOString(),
+    };
+    setKeepNotes((prev) => prev.map((n) => (n.id === updatedNote.id ? noteToSave : n)));
+    showToast('Perubahan catatan berhasil disimpan.');
+
+    if (userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'keep_notes', updatedNote.id), sanitizeForFirestore(noteToSave));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/keep_notes/${updatedNote.id}`);
+      }
+    }
   };
 
   const handleDeleteKeepNote = (noteId: string) => {
@@ -797,10 +823,18 @@ export default function App() {
       title: 'Hapus Catatan Keep?',
       description: `Apakah Anda yakin ingin menghapus catatan "${noteToDelete.title || 'Tanpa Judul'}"? Tindakan ini tidak dapat dibatalkan.`,
       actionLabel: 'Hapus Catatan',
-      onConfirm: () => {
+      onConfirm: async () => {
         setKeepNotes((prev) => prev.filter((n) => n.id !== noteId));
         showToast('Catatan Keep dihapus.', 'info');
         setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+
+        if (userId && userId !== 'user-default') {
+          try {
+            await deleteDoc(doc(db, 'users', userId, 'keep_notes', noteId));
+          } catch (err) {
+            handleFirestoreError(err, OperationType.DELETE, `users/${userId}/keep_notes/${noteId}`);
+          }
+        }
       },
     });
   };

@@ -18,6 +18,7 @@ import {
 import { Task, CalendarEvent, UserPreferences, AIPlanDraft, ScheduleCalculationResult } from '../types';
 import { scheduleTaskDeterministically } from '../lib/scheduler';
 import { formatUserErrorMessage } from '../lib/geminiErrorHandling';
+import { formatInUserTimezone, getZonedDateTimeParts } from '../lib/timezone';
 
 interface AIAssistantViewProps {
   tasks: Task[];
@@ -43,10 +44,15 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const [scheduleTestResult, setScheduleTestResult] = useState<ScheduleCalculationResult | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [warningMessage, setWarningMessage] = useState('');
+  const [planSource, setPlanSource] = useState<'gemini' | 'rule_fallback_on_error' | 'rule_fallback'>('gemini');
   const [appliedSuccess, setAppliedSuccess] = useState(false);
 
   const isAnalyzing = loadingPhase === 'interpreting' || loadingPhase === 'checking_slots';
   const isSaving = loadingPhase === 'saving_calendar';
+
+  const userTimezone = preferences.timezone
+    ? preferences.timezone.split(' ')[0]
+    : 'Asia/Jakarta';
 
   const samplePrompts = [
     'Kelas dari jam 7 malam sampai jam 10 malam',
@@ -125,6 +131,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       }
 
       const plan: AIPlanDraft = data.plan;
+      setPlanSource(data.source || (data.isAiGenerated ? 'gemini' : 'rule_fallback_on_error'));
       setProposedPlan(plan);
 
       // Phase 2: Memeriksa waktu kosong via scheduler
@@ -320,9 +327,15 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
           <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-5 animate-in fade-in slide-in-from-bottom-2">
             <div className="flex items-start justify-between border-b border-[#D9E3EF] pb-4">
               <div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-bold uppercase tracking-wider text-[#2457A7] bg-[#EAF3FC] px-2.5 py-0.5 rounded-full">
-                    Hasil Analisis AI
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span
+                    className={`text-xs font-bold uppercase tracking-wider px-2.5 py-0.5 rounded-full ${
+                      planSource === 'gemini'
+                        ? 'text-[#2457A7] bg-[#EAF3FC]'
+                        : 'text-amber-800 bg-amber-100 border border-amber-300'
+                    }`}
+                  >
+                    {planSource === 'gemini' ? 'Hasil Analisis AI' : 'Mesin Aturan Deterministik (Fallback)'}
                   </span>
                   {proposedPlan.timeConstraintType === 'fixed_event' ? (
                     <span className="flex items-center gap-1 text-[11px] font-semibold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-md">
@@ -338,9 +351,12 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                     </span>
                   )}
                 </div>
-                <h3 className="text-base font-bold text-[#172B42] mt-1.5">
-                  {proposedPlan.title}
-                </h3>
+                <div className="mt-2">
+                  <span className="text-[11px] font-semibold text-[#53657A] block">Judul Kegiatan:</span>
+                  <h3 className="text-base font-bold text-[#172B42] mt-0.5">
+                    {proposedPlan.title}
+                  </h3>
+                </div>
               </div>
               <span
                 className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${
@@ -367,14 +383,29 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
               </div>
               <div className="p-3 bg-[#F8FAFC] rounded-xl border border-[#D9E3EF]/60 space-y-1">
                 <span className="text-[11px] text-[#53657A] flex items-center gap-1">
-                  <Calendar size={12} /> Target / Tenggat
+                  <Calendar size={12} /> Target / Waktu
                 </span>
                 <span className="text-xs font-bold text-[#172B42]">
                   {proposedPlan.requestedStartAt
-                    ? new Date(proposedPlan.requestedStartAt).toLocaleTimeString('id-ID', {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })
+                    ? (() => {
+                        const startD = new Date(proposedPlan.requestedStartAt);
+                        const startStr = formatInUserTimezone(startD, userTimezone, {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        });
+                        if (proposedPlan.requestedEndAt) {
+                          const endD = new Date(proposedPlan.requestedEndAt);
+                          const endStr = formatInUserTimezone(endD, userTimezone, {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          });
+                          const isNextDay =
+                            getZonedDateTimeParts(endD, userTimezone).day !==
+                            getZonedDateTimeParts(startD, userTimezone).day;
+                          return `${startStr} - ${endStr}${isNextDay ? ' (+1 hr)' : ''}`;
+                        }
+                        return startStr;
+                      })()
                     : proposedPlan.deadlineDaysFromNow === 0
                     ? 'Hari ini'
                     : proposedPlan.deadlineDaysFromNow === 1
@@ -408,10 +439,10 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
               </div>
             </div>
 
-            {/* AI Reasoning */}
+            {/* AI or Rule Reasoning */}
             <div className="p-3.5 bg-[#EAF3FC]/50 border border-[#8DBCEB]/30 rounded-xl space-y-1">
               <span className="text-[11px] font-bold text-[#2457A7] uppercase tracking-wider">
-                Pertimbangan Logis AI:
+                {planSource === 'gemini' ? 'Pertimbangan Logis AI:' : 'Pertimbangan Aturan Deterministik:'}
               </span>
               <p className="text-xs text-[#172B42] leading-relaxed">
                 {proposedPlan.reasoning}
