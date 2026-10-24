@@ -99,9 +99,10 @@ export function scheduleTaskDeterministically(
                 success: false,
                 taskId: task.id,
                 taskTitle: task.title,
+                failureCode: 'TIME_CONFLICT',
                 proposedSessions: [],
-                explanation: `Konflik jadwal: Komitmen tetap bertabrakan dengan tugas "${t.title}" sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)}).`,
-                warning: 'Jadwal waktu tetap memerlukan slot kosong tanpa tabrakan tugas lain.',
+                explanation: `Konflik jadwal: Komitmen tetap bertabrakan dengan kegiatan "${t.title}" sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)}).`,
+                warning: 'Jadwal waktu tetap memerlukan slot kosong tanpa tabrakan kegiatan lain.',
               };
             }
           }
@@ -134,18 +135,22 @@ export function scheduleTaskDeterministically(
   // -------------------------------------------------------------
   // 2. FLEXIBLE TASKS WITH PREFERRED WINDOW OR DEADLINE
   // -------------------------------------------------------------
-  let deadline = new Date(task.deadlineAt);
-  if (isNaN(deadline.getTime())) {
-    deadline = new Date(referenceDate.getTime() + 3 * 86400000);
-    const dParts = getPartsInTimezone(deadline, userTz);
-    deadline = new Date(createIsoInTimezone(dParts.year, dParts.month, dParts.day, 23, 59, 59, userTz));
+  const hasExplicitDeadline = Boolean(task.deadlineAt && task.deadlineAt.trim().length > 0);
+  let deadline: Date | null = null;
+
+  if (hasExplicitDeadline && task.deadlineAt) {
+    const parsed = new Date(task.deadlineAt);
+    if (!isNaN(parsed.getTime())) {
+      deadline = parsed;
+    }
   }
 
-  if (deadline.getTime() <= referenceDate.getTime()) {
+  if (deadline && deadline.getTime() <= referenceDate.getTime()) {
     return {
       success: false,
       taskId: task.id,
       taskTitle: task.title,
+      failureCode: 'DEADLINE_PASSED',
       proposedSessions: [],
       explanation: `Tenggat waktu (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)}) sudah lewat dari waktu saat ini.`,
     };
@@ -179,9 +184,9 @@ export function scheduleTaskDeterministically(
 
   busyWindows.sort((a, b) => a.start.getTime() - b.start.getTime());
 
-  // Build candidate days in target timezone
-  const maxSearchDays = 14;
-  const candidateDays: { year: number; month: number; day: number; dayOfWeek: number }[] = [];
+  // Search horizon: If deadline is specified, cap search by deadline; otherwise search up to 21 days
+  const maxSearchDays = hasExplicitDeadline ? 14 : 21;
+  const candidateDays: { year: number; month: number; day: number; dayOfWeek: number; dateObj: Date }[] = [];
   const searchStart = new Date(referenceDate);
 
   for (let d = 0; d < maxSearchDays; d++) {
@@ -191,7 +196,7 @@ export function scheduleTaskDeterministically(
       Boolean(task.preferredWindow) || task.preferredTimeOfDay === 'EVENING' || task.preferredTimeOfDay === 'MORNING';
 
     if (preferences.workDays.includes(parts.dayOfWeek) || (isPreferredWindowSpecified && d <= 1)) {
-      candidateDays.push(parts);
+      candidateDays.push({ ...parts, dateObj: dayObj });
     }
   }
 
@@ -230,7 +235,7 @@ export function scheduleTaskDeterministically(
 
     for (const seg of segments) {
       const segStart = seg.start > searchStart ? seg.start : searchStart;
-      const segEnd = seg.end < deadline ? seg.end : deadline;
+      const segEnd = deadline && seg.end > deadline ? deadline : seg.end;
 
       if (segStart >= segEnd) continue;
 
@@ -373,7 +378,7 @@ export function scheduleTaskDeterministically(
           taskId: task.id,
           taskTitle: task.title,
           proposedSessions: splitSessions,
-          explanation: `Tugas dipecah menjadi ${total} sesi realistis di jendela waktu ${task.preferredWindow?.label || 'malam'} yang diminta. Sesi pertama mulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+          explanation: `Kegiatan dipecah menjadi ${total} sesi realistis di jendela waktu ${task.preferredWindow?.label || 'malam'} yang diminta. Sesi pertama mulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
         };
       }
     }
@@ -382,39 +387,90 @@ export function scheduleTaskDeterministically(
   // If task has explicit evening preference or preferred window, do NOT silently fall back to daytime work hours!
   if (hasEveningPref || task.timeConstraintType === 'preferred_window' || hasMorningPref) {
     const windowName = task.preferredWindow?.label || (hasEveningPref ? 'malam (19:00 - 23:00)' : 'pagi (06:00 - 12:00)');
+    const deadlineText = deadline
+      ? ` sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)})`
+      : '';
     return {
       success: false,
       taskId: task.id,
       taskTitle: task.title,
+      failureCode: 'PREFERRED_WINDOW_FULL',
       proposedSessions: [],
-      explanation: `Tidak ditemukan slot waktu luang yang mencukupi (${durationNeeded} menit) di jendela waktu ${windowName} sebelum tenggat waktu (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)}). Jadwal pada jendela waktu tersebut penuh atau terhalang agenda lain.`,
+      explanation: `Tidak ditemukan slot waktu luang yang mencukupi (${durationNeeded} menit) di jendela waktu ${windowName}${deadlineText}. Jadwal pada jendela waktu tersebut penuh atau terhalang agenda lain.`,
       warning: task.allowSplit
-        ? 'Pertimbangkan untuk memperpanjang batas tenggat atau mengurangi durasi tugas.'
-        : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau memperpanjang tenggat waktu.',
+        ? 'Pertimbangkan untuk memperpanjang batas tenggat atau mengurangi durasi kegiatan.'
+        : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau menyesuaikan preferensi waktu.',
     };
   }
 
-  // Phase B: Standard Work Hours Search (09:00 - 18:00, excluding lunch)
-  const standardSegments: TimeInterval[] = [];
+  // Phase B: Standard / Night Shift Work Hours Search (01:00 - 24:00)
+  const workStartHour = preferences.workStartHour ?? 9;
+  const workEndHour = preferences.workEndHour ?? 18;
+  const isNightShift = workEndHour < workStartHour;
+  const enableLunch = preferences.enableLunchBreak !== false;
+  const lunchStartHour = preferences.lunchStartHour ?? 12;
+  const lunchEndHour = preferences.lunchEndHour ?? 13;
+
+  const workSegments: TimeInterval[] = [];
 
   for (const day of candidateDays) {
-    const workStartIso = createIsoInTimezone(day.year, day.month, day.day, preferences.workStartHour, 0, 0, userTz);
-    const workEndIso = createIsoInTimezone(day.year, day.month, day.day, preferences.workEndHour, 0, 0, userTz);
-    const lunchStartIso = createIsoInTimezone(day.year, day.month, day.day, preferences.lunchStartHour, 0, 0, userTz);
-    const lunchEndIso = createIsoInTimezone(day.year, day.month, day.day, preferences.lunchEndHour, 0, 0, userTz);
+    if (isNightShift) {
+      // Night shift crossing midnight: starts on `day` at workStartHour, ends on `day + 1` at workEndHour
+      const shiftStartIso = createIsoInTimezone(day.year, day.month, day.day, workStartHour, 0, 0, userTz);
+      const nextDayDate = new Date(day.dateObj.getTime() + 86400000);
+      const nextParts = getPartsInTimezone(nextDayDate, userTz);
+      const shiftEndIso = createIsoInTimezone(nextParts.year, nextParts.month, nextParts.day, workEndHour, 0, 0, userTz);
 
-    const workStart = new Date(workStartIso);
-    const workEnd = new Date(workEndIso);
-    const lunchStart = new Date(lunchStartIso);
-    const lunchEnd = new Date(lunchEndIso);
+      const shiftStart = new Date(shiftStartIso);
+      const shiftEnd = new Date(shiftEndIso);
 
-    standardSegments.push({ start: workStart, end: lunchStart });
-    standardSegments.push({ start: lunchEnd, end: workEnd });
+      if (enableLunch && lunchStartHour && lunchEndHour) {
+        // If lunch is configured, check if lunch falls within shift
+        const lunchStartIso = createIsoInTimezone(day.year, day.month, day.day, lunchStartHour, 0, 0, userTz);
+        const lunchEndIso = createIsoInTimezone(day.year, day.month, day.day, lunchEndHour, 0, 0, userTz);
+        const lunchStart = new Date(lunchStartIso);
+        const lunchEnd = new Date(lunchEndIso);
+
+        if (lunchStart > shiftStart && lunchEnd < shiftEnd) {
+          workSegments.push({ start: shiftStart, end: lunchStart });
+          workSegments.push({ start: lunchEnd, end: shiftEnd });
+        } else {
+          workSegments.push({ start: shiftStart, end: shiftEnd });
+        }
+      } else {
+        workSegments.push({ start: shiftStart, end: shiftEnd });
+      }
+    } else {
+      // Day shift within same day
+      const shiftStartIso = createIsoInTimezone(day.year, day.month, day.day, workStartHour, 0, 0, userTz);
+      // If workEndHour is 24, createIsoInTimezone automatically rolls to next day 00:00:00
+      const shiftEndIso = createIsoInTimezone(day.year, day.month, day.day, workEndHour, 0, 0, userTz);
+
+      const shiftStart = new Date(shiftStartIso);
+      const shiftEnd = new Date(shiftEndIso);
+
+      if (enableLunch && lunchStartHour && lunchEndHour && lunchStartHour < lunchEndHour) {
+        const lunchStartIso = createIsoInTimezone(day.year, day.month, day.day, lunchStartHour, 0, 0, userTz);
+        const lunchEndIso = createIsoInTimezone(day.year, day.month, day.day, lunchEndHour, 0, 0, userTz);
+        const lunchStart = new Date(lunchStartIso);
+        const lunchEnd = new Date(lunchEndIso);
+
+        if (lunchStart > shiftStart && lunchEnd < shiftEnd) {
+          workSegments.push({ start: shiftStart, end: lunchStart });
+          workSegments.push({ start: lunchEnd, end: shiftEnd });
+        } else {
+          workSegments.push({ start: shiftStart, end: shiftEnd });
+        }
+      } else {
+        // Lunch disabled: single continuous work segment!
+        workSegments.push({ start: shiftStart, end: shiftEnd });
+      }
+    }
   }
 
-  const standardFreeBlocks = extractFreeBlocks(standardSegments);
+  const standardFreeBlocks = extractFreeBlocks(workSegments);
 
-  // Contiguous slot in standard hours
+  // Contiguous slot in standard / night shift hours
   for (const block of standardFreeBlocks) {
     const blockDuration = (block.end.getTime() - block.start.getTime()) / 60000;
     if (blockDuration >= durationNeeded) {
@@ -438,11 +494,14 @@ export function scheduleTaskDeterministically(
           },
         ],
         explanation: `Ditemukan waktu fokus penuh ${durationNeeded} menit pada ${dayStr}, pukul ${timeStr} WIB.`,
+        diagnostics: {
+          isNightShift,
+        },
       };
     }
   }
 
-  // Split sessions in standard hours
+  // Split sessions in standard / night shift hours
   if (task.allowSplit) {
     const minSession = task.minimumSessionMinutes || 30;
     let remainingMinutes = durationNeeded;
@@ -481,7 +540,10 @@ export function scheduleTaskDeterministically(
         taskId: task.id,
         taskTitle: task.title,
         proposedSessions: splitSessions,
-        explanation: `Tugas dipecah menjadi ${total} sesi realistis (total ${durationNeeded} menit). Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+        explanation: `Kegiatan dipecah menjadi ${total} sesi realistis (total ${durationNeeded} menit). Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+        diagnostics: {
+          isNightShift,
+        },
       };
     }
   }
@@ -492,15 +554,24 @@ export function scheduleTaskDeterministically(
     0
   );
 
+  const deadlineInfo = deadline
+    ? ` sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)})`
+    : '';
+
   return {
     success: false,
     taskId: task.id,
     taskTitle: task.title,
+    failureCode: 'NO_SLOT_BEFORE_DEADLINE',
     proposedSessions: [],
-    explanation: `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit) sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)}). Total waktu luang tersisa di kalender Anda hanya ${Math.round(totalFreeAvailable)} menit.`,
+    explanation: `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit)${deadlineInfo}. Total waktu luang tersisa di jam kerja Anda hanya ${Math.round(totalFreeAvailable)} menit.`,
     warning: task.allowSplit
-      ? 'Pertimbangkan untuk memperpanjang tenggat atau mengurangi durasi tugas.'
-      : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau memperpanjang tenggat waktu.',
+      ? 'Pertimbangkan untuk memperpanjang tenggat atau mengurangi durasi kegiatan.'
+      : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau menyesuaikan jam kerja di Pengaturan.',
+    diagnostics: {
+      freeTimeCalculatedMinutes: Math.round(totalFreeAvailable),
+      isNightShift,
+    },
   };
 }
 
@@ -530,7 +601,9 @@ export function scheduleAllPendingTasks(
     const pB = priorityScore[b.priority] || 0;
     if (pB !== pA) return pB - pA;
 
-    return new Date(a.deadlineAt).getTime() - new Date(b.deadlineAt).getTime();
+    const aTime = a.deadlineAt ? new Date(a.deadlineAt).getTime() : Infinity;
+    const bTime = b.deadlineAt ? new Date(b.deadlineAt).getTime() : Infinity;
+    return aTime - bTime;
   });
 
   const results: ScheduleCalculationResult[] = [];

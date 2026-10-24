@@ -79,13 +79,13 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="sm:hidden">AI</span>
         </button>
 
-        {/* New Task Button */}
+        {/* New Activity Button */}
         <button
           onClick={onOpenTaskModal}
           className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold text-white bg-[#2457A7] hover:bg-[#1E4889] transition-colors shadow-xs"
         >
           <Plus size={15} />
-          <span>Tugas Baru</span>
+          <span>Kegiatan Baru</span>
         </button>
       </div>
     </header>

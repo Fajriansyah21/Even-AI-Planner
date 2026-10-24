@@ -12,8 +12,17 @@ import {
   ExternalLink,
   Plus,
   Lock,
+  Layers,
+  AlertTriangle,
 } from 'lucide-react';
 import { CalendarEvent, Task, TaskScheduleSession, UserPreferences } from '../types';
+import {
+  normalizeTimezone,
+  startOfDayInTimezone,
+  endOfDayInTimezone,
+  getZonedDateTimeParts,
+  formatInTimezone,
+} from '../lib/timezone';
 
 interface CalendarViewProps {
   events: CalendarEvent[];
@@ -25,6 +34,31 @@ interface CalendarViewProps {
   onOpenAIAssistant: () => void;
 }
 
+interface SlicedCalendarItem {
+  id: string;
+  sourceType: 'google' | 'session';
+  title: string;
+  event?: CalendarEvent;
+  task?: Task;
+  session?: TaskScheduleSession;
+  itemStart: Date;
+  itemEnd: Date;
+  visibleStart: Date;
+  visibleEnd: Date;
+  visibleDurationMinutes: number;
+  totalDurationMinutes: number;
+  topPx: number;
+  heightPx: number;
+  isContinuedFromYesterday: boolean;
+  isContinuedToTomorrow: boolean;
+  isDone?: boolean;
+  colIndex: number;
+  totalCols: number;
+  hasConflict: boolean;
+}
+
+const ROW_HEIGHT = 56; // 56px per 1 hour slot
+
 export const CalendarView: React.FC<CalendarViewProps> = ({
   events,
   tasks,
@@ -34,20 +68,19 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
   onSelectSlotToSchedule,
   onOpenAIAssistant,
 }) => {
+  const tz = normalizeTimezone(preferences.timezone);
   const [viewMode, setViewMode] = useState<'day' | 'week' | 'month'>('week');
   const [currentDate, setCurrentDate] = useState<Date>(new Date());
   const [selectedEventDetails, setSelectedEventDetails] = useState<CalendarEvent | null>(null);
   const [selectedSessionDetails, setSelectedSessionDetails] = useState<{ task: Task; session: TaskScheduleSession } | null>(null);
 
-  // Compute week days starting from Monday of currentDate's week
+  // Compute week dates starting from Monday of currentDate
   const getWeekDates = (date: Date): Date[] => {
-    const current = new Date(date);
-    const day = current.getDay();
-    // In JS: 0 = Sunday, 1 = Monday, ..., 6 = Saturday
-    const diffToMonday = day === 0 ? -6 : 1 - day;
-    const monday = new Date(current);
-    monday.setDate(current.getDate() + diffToMonday);
-    monday.setHours(0, 0, 0, 0);
+    const p = getZonedDateTimeParts(date, tz);
+    // JS getDay(): 0 is Sunday, 1 is Monday...
+    const diffToMonday = p.dayOfWeek === 0 ? -6 : 1 - p.dayOfWeek;
+    const monday = new Date(date);
+    monday.setDate(date.getDate() + diffToMonday);
 
     const week: Date[] = [];
     for (let i = 0; i < 7; i++) {
@@ -60,15 +93,13 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
 
   const weekDates = getWeekDates(currentDate);
 
-  const isSameDay = (d1: Date, d2: Date) => {
-    return (
-      d1.getFullYear() === d2.getFullYear() &&
-      d1.getMonth() === d2.getMonth() &&
-      d1.getDate() === d2.getDate()
-    );
+  const isSameCalendarDay = (d1: Date, d2: Date) => {
+    const p1 = getZonedDateTimeParts(d1, tz);
+    const p2 = getZonedDateTimeParts(d2, tz);
+    return p1.year === p2.year && p1.month === p2.month && p1.day === p2.day;
   };
 
-  const isToday = (d: Date) => isSameDay(d, new Date());
+  const isToday = (d: Date) => isSameCalendarDay(d, new Date());
 
   const navigateDate = (direction: 'prev' | 'next') => {
     const copy = new Date(currentDate);
@@ -86,10 +117,10 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
     setCurrentDate(new Date());
   };
 
-  // Collect all scheduled sessions
+  // Collect scheduled sessions from tasks
   const scheduledSessions: { task: Task; session: TaskScheduleSession }[] = [];
   tasks.forEach((t) => {
-    if (t.scheduledSessions) {
+    if (t.scheduledSessions && t.scheduledSessions.length > 0) {
       t.scheduledSessions.forEach((s) => {
         if (s.status !== 'CANCELLED') {
           scheduledSessions.push({ task: t, session: s });
@@ -98,51 +129,162 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
     }
   });
 
-  // Hours to render on weekly grid (07:00 to 23:00) so evening commitments are visible
-  const gridHours = Array.from({ length: 17 }, (_, i) => i + 7);
+  // Hours: 01:00 to 24:00 (24 one-hour segments)
+  const gridHours = Array.from({ length: 24 }, (_, i) => i + 1);
 
-  const getEventsForDay = (day: Date) => {
-    return events.filter((e) => {
-      const start = new Date(e.startAt);
-      return isSameDay(start, day);
-    });
-  };
+  // Mathematical slicing of items for any given calendar day [dayStart, dayEnd)
+  const getSlicedItemsForDay = (dayDate: Date): SlicedCalendarItem[] => {
+    const dayStart = startOfDayInTimezone(dayDate, tz);
+    const dayEnd = endOfDayInTimezone(dayDate, tz);
+    const dayStartMs = dayStart.getTime();
+    const dayEndMs = dayEnd.getTime();
 
-  const getSessionsForDay = (day: Date) => {
-    return scheduledSessions.filter((item) => {
-      const start = new Date(item.session.startAt);
-      return isSameDay(start, day);
+    const rawItems: {
+      id: string;
+      sourceType: 'google' | 'session';
+      title: string;
+      event?: CalendarEvent;
+      task?: Task;
+      session?: TaskScheduleSession;
+      start: Date;
+      end: Date;
+      isDone?: boolean;
+    }[] = [];
+
+    // 1. Google & manual calendar events
+    for (const evt of events) {
+      const s = new Date(evt.startAt);
+      const e = new Date(evt.endAt);
+      if (!isNaN(s.getTime()) && !isNaN(e.getTime()) && e > s) {
+        // Half-open interval intersection: s < dayEnd && e > dayStart
+        if (s.getTime() < dayEndMs && e.getTime() > dayStartMs) {
+          rawItems.push({
+            id: `evt-${evt.id}`,
+            sourceType: 'google',
+            title: evt.title,
+            event: evt,
+            start: s,
+            end: e,
+          });
+        }
+      }
+    }
+
+    // 2. EVEN scheduled sessions
+    for (const item of scheduledSessions) {
+      const s = new Date(item.session.startAt);
+      const e = new Date(item.session.endAt);
+      if (!isNaN(s.getTime()) && !isNaN(e.getTime()) && e > s) {
+        if (s.getTime() < dayEndMs && e.getTime() > dayStartMs) {
+          rawItems.push({
+            id: `sess-${item.session.id}`,
+            sourceType: 'session',
+            title: item.session.taskTitle,
+            task: item.task,
+            session: item.session,
+            start: s,
+            end: e,
+            isDone: item.session.status === 'COMPLETED',
+          });
+        }
+      }
+    }
+
+    // Sort items by start time
+    rawItems.sort((a, b) => a.start.getTime() - b.start.getTime());
+
+    // Calculate layout slices
+    const slices = rawItems.map((r) => {
+      const itemStartMs = r.start.getTime();
+      const itemEndMs = r.end.getTime();
+      const visibleStartMs = Math.max(itemStartMs, dayStartMs);
+      const visibleEndMs = Math.min(itemEndMs, dayEndMs);
+
+      const totalDurationMinutes = Math.round((itemEndMs - itemStartMs) / 60000);
+      const visibleDurationMinutes = Math.max(1, Math.round((visibleEndMs - visibleStartMs) / 60000));
+      const startMinutesFromMidnight = (visibleStartMs - dayStartMs) / 60000;
+
+      const topPx = (startMinutesFromMidnight / 60) * ROW_HEIGHT;
+      // Guarantee minimum height so title & buttons stay legible
+      const heightPx = Math.max(26, (visibleDurationMinutes / 60) * ROW_HEIGHT);
+
+      return {
+        id: r.id,
+        sourceType: r.sourceType,
+        title: r.title,
+        event: r.event,
+        task: r.task,
+        session: r.session,
+        itemStart: r.start,
+        itemEnd: r.end,
+        visibleStart: new Date(visibleStartMs),
+        visibleEnd: new Date(visibleEndMs),
+        visibleDurationMinutes,
+        totalDurationMinutes,
+        topPx,
+        heightPx,
+        isContinuedFromYesterday: itemStartMs < dayStartMs,
+        isContinuedToTomorrow: itemEndMs > dayEndMs,
+        isDone: r.isDone,
+        colIndex: 0,
+        totalCols: 1,
+        hasConflict: false,
+      };
     });
+
+    // Conflict detection & column positioning
+    for (let i = 0; i < slices.length; i++) {
+      const cur = slices[i];
+      const overlapping: SlicedCalendarItem[] = [cur];
+      for (let j = 0; j < slices.length; j++) {
+        if (i === j) continue;
+        const other = slices[j];
+        if (cur.visibleStart < other.visibleEnd && cur.visibleEnd > other.visibleStart) {
+          overlapping.push(other);
+          cur.hasConflict = true;
+          other.hasConflict = true;
+        }
+      }
+      if (overlapping.length > 1) {
+        overlapping.sort((a, b) => a.visibleStart.getTime() - b.visibleStart.getTime());
+        overlapping.forEach((item, idx) => {
+          item.colIndex = idx;
+          item.totalCols = overlapping.length;
+        });
+      }
+    }
+
+    return slices;
   };
 
   // Format header range
   const formatHeaderRange = () => {
     if (viewMode === 'day') {
-      return new Intl.DateTimeFormat('id-ID', {
+      return formatInTimezone(currentDate, tz, {
         weekday: 'long',
         day: 'numeric',
         month: 'long',
         year: 'numeric',
-      }).format(currentDate);
+      });
     }
     if (viewMode === 'week') {
       const start = weekDates[0];
       const end = weekDates[6];
-      const startMonth = start.toLocaleDateString('id-ID', { month: 'short' });
-      const endMonth = end.toLocaleDateString('id-ID', { month: 'short', year: 'numeric' });
+      const startMonth = formatInTimezone(start, tz, { month: 'short' });
+      const endMonth = formatInTimezone(end, tz, { month: 'short', year: 'numeric' });
       return `${start.getDate()} ${startMonth} — ${end.getDate()} ${endMonth}`;
     }
-    return new Intl.DateTimeFormat('id-ID', { month: 'long', year: 'numeric' }).format(currentDate);
+    return formatInTimezone(currentDate, tz, { month: 'long', year: 'numeric' });
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-[#F8FAFC] overflow-hidden">
+    <div className="flex-1 flex flex-col h-full bg-[#F8FAFC] overflow-hidden select-none">
       {/* Top Toolbar */}
-      <div className="p-4 bg-white border-b border-[#D9E3EF] flex flex-wrap items-center justify-between gap-3 shrink-0">
-        <div className="flex items-center gap-2 sm:gap-3">
+      <div className="h-14 px-6 bg-white border-b border-[#D9E3EF] flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-3">
           <button
             onClick={resetToToday}
-            className="px-3 py-1.5 text-xs font-semibold text-[#172B42] bg-[#F8FAFC] hover:bg-slate-100 border border-[#D9E3EF] rounded-xl transition-colors shadow-2xs"
+            className="px-3 py-1.5 text-xs font-semibold text-[#172B42] hover:bg-slate-100 rounded-xl border border-[#D9E3EF] transition-colors"
           >
             Hari Ini
           </button>
@@ -164,7 +306,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
             </button>
           </div>
 
-          <h2 className="text-sm sm:text-base font-bold text-[#172B42] tracking-tight">
+          <h2 className="text-sm sm:text-base font-bold text-[#172B42] font-editorial tracking-tight">
             {formatHeaderRange()}
           </h2>
         </div>
@@ -206,17 +348,17 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
 
       {/* Main Calendar Content Area */}
       <div className="flex-1 overflow-y-auto p-4 sm:p-6">
-        {/* Weekly View (Primary Desktop Experience) */}
+        {/* Weekly View (01:00 - 24:00) */}
         {viewMode === 'week' && (
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl shadow-xs overflow-hidden flex flex-col min-w-[700px]">
+          <div className="bg-white border border-[#D9E3EF] rounded-2xl shadow-xs overflow-hidden flex flex-col min-w-[760px]">
             {/* Day Header Row */}
-            <div className="grid grid-cols-[64px_repeat(7,1fr)] border-b border-[#D9E3EF] bg-[#F8FAFC]">
+            <div className="grid grid-cols-[64px_repeat(7,1fr)] border-b border-[#D9E3EF] bg-[#F8FAFC] sticky top-0 z-20">
               <div className="p-3 text-[11px] font-medium text-[#53657A] border-r border-[#D9E3EF] flex items-center justify-center">
                 WIB
               </div>
               {weekDates.map((date, idx) => {
                 const today = isToday(date);
-                const dayName = new Intl.DateTimeFormat('id-ID', { weekday: 'short' }).format(date);
+                const dayName = formatInTimezone(date, tz, { weekday: 'short' });
 
                 return (
                   <div
@@ -242,143 +384,146 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               })}
             </div>
 
-            {/* Time Grid */}
-            <div className="relative divide-y divide-[#D9E3EF]">
-              {gridHours.map((hour) => {
-                const isLunchHour = hour >= preferences.lunchStartHour && hour < preferences.lunchEndHour;
+            {/* Time Grid (01:00 to 24:00) */}
+            <div className="relative grid grid-cols-[64px_repeat(7,1fr)]" style={{ height: `${24 * ROW_HEIGHT}px` }}>
+              {/* Hour Labels Column (Left) */}
+              <div className="border-r border-[#D9E3EF] bg-[#F8FAFC] divide-y divide-[#D9E3EF]">
+                {gridHours.map((hour) => (
+                  <div
+                    key={hour}
+                    className="text-right pr-2 text-[10px] text-[#53657A] font-mono select-none flex items-start justify-end pt-1"
+                    style={{ height: `${ROW_HEIGHT}px` }}
+                  >
+                    {String(hour).padStart(2, '0')}:00
+                  </div>
+                ))}
+              </div>
+
+              {/* 7 Day Columns with Grid Background Lines & Absolute Positioned Cards */}
+              {weekDates.map((dayDate, dayIdx) => {
+                const slicedItems = getSlicedItemsForDay(dayDate);
+                const enableLunch = preferences.enableLunchBreak !== false;
+                const lunchStart = preferences.lunchStartHour ?? 12;
+                const lunchEnd = preferences.lunchEndHour ?? 13;
 
                 return (
-                  <div key={hour} className="grid grid-cols-[64px_repeat(7,1fr)] min-h-[64px]">
-                    {/* Time Label */}
-                    <div className="p-2 text-right pr-3 text-[11px] text-[#53657A] font-mono border-r border-[#D9E3EF] select-none bg-[#F8FAFC]">
-                      {String(hour).padStart(2, '0')}:00
-                    </div>
+                  <div
+                    key={dayIdx}
+                    className="relative border-r border-[#D9E3EF] last:border-r-0 h-full"
+                  >
+                    {/* Horizontal Guideline Rows */}
+                    {gridHours.map((hour) => {
+                      const isLunch = enableLunch && hour >= lunchStart && hour < lunchEnd;
+                      return (
+                        <div
+                          key={hour}
+                          className={`border-b border-[#D9E3EF]/70 transition-colors group relative ${
+                            isLunch ? 'bg-amber-50/30' : 'hover:bg-slate-50/50'
+                          }`}
+                          style={{ height: `${ROW_HEIGHT}px` }}
+                        >
+                          {/* Quick Add Button */}
+                          <button
+                            onClick={() => {
+                              if (onSelectSlotToSchedule) {
+                                onSelectSlotToSchedule(dayDate, hour);
+                              } else {
+                                onOpenTaskModal();
+                              }
+                            }}
+                            className="opacity-0 group-hover:opacity-100 transition-opacity absolute inset-0 flex items-center justify-center text-[#53657A] hover:text-[#2457A7] text-[10px]"
+                            title={`Jadwalkan kegiatan di slot ${String(hour).padStart(2, '0')}:00`}
+                          >
+                            <Plus size={12} />
+                          </button>
+                        </div>
+                      );
+                    })}
 
-                    {/* Columns for each day */}
-                    {weekDates.map((dayDate, dayIdx) => {
-                      const dayEvents = getEventsForDay(dayDate);
-                      const daySessions = getSessionsForDay(dayDate);
+                    {/* Sliced Event & Session Cards with Exact Height & Offset */}
+                    {slicedItems.map((item) => {
+                      const widthPercent = item.totalCols > 1 ? 100 / item.totalCols : 100;
+                      const leftPercent = item.colIndex * widthPercent;
 
-                      // Events matching this hour slot
-                      const hourEvents = dayEvents.filter((e) => {
-                        const s = new Date(e.startAt).getHours();
-                        return s === hour;
-                      });
-
-                      // Sessions matching this hour slot
-                      const hourSessions = daySessions.filter((s) => {
-                        const sTime = new Date(s.session.startAt).getHours();
-                        return sTime === hour;
-                      });
+                      const isGoogle = item.sourceType === 'google';
+                      const isDone = Boolean(item.isDone);
 
                       return (
                         <div
-                          key={dayIdx}
-                          className={`p-1 border-r border-[#D9E3EF] last:border-r-0 relative group transition-colors ${
-                            isLunchHour ? 'bg-amber-50/40' : 'hover:bg-slate-50/70'
+                          key={item.id}
+                          onClick={() => {
+                            if (isGoogle && item.event) {
+                              setSelectedEventDetails(item.event);
+                            } else if (item.task && item.session) {
+                              setSelectedSessionDetails({ task: item.task, session: item.session });
+                            }
+                          }}
+                          style={{
+                            top: `${item.topPx}px`,
+                            height: `${item.heightPx}px`,
+                            left: `calc(${leftPercent}% + 2px)`,
+                            width: `calc(${widthPercent}% - 4px)`,
+                          }}
+                          className={`absolute z-10 p-1.5 rounded-lg border-l-3 cursor-pointer transition-all shadow-2xs overflow-hidden flex flex-col justify-between ${
+                            item.hasConflict ? 'ring-1 ring-red-400' : ''
+                          } ${
+                            isGoogle
+                              ? 'bg-[#2457A7]/10 hover:bg-[#2457A7]/15 border-[#2457A7] text-[#172B42]'
+                              : isDone
+                              ? 'bg-slate-100 hover:bg-slate-200 border-slate-400 text-slate-500 line-through'
+                              : 'bg-[#EAF3FC] hover:bg-[#d8e9fa] border-[#2457A7] text-[#172B42]'
                           }`}
+                          title={`${item.title} (${item.totalDurationMinutes} menit)${item.hasConflict ? ' [Bentrok Jadwal]' : ''}`}
                         >
-                          {/* Lunch hour label on first day or subtle watermark */}
-                          {isLunchHour && hour === preferences.lunchStartHour && (
-                            <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-40">
-                              <span className="text-[10px] font-semibold text-[#B86B12] uppercase tracking-wider">
-                                Istirahat
+                          <div>
+                            <div className="flex items-center justify-between gap-1 leading-tight">
+                              <span className="text-[11px] font-bold truncate">
+                                {item.title}
                               </span>
+                              {isGoogle ? (
+                                <Lock size={9} className="text-[#53657A] shrink-0" />
+                              ) : (
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (item.task && item.session) {
+                                      onToggleTaskSessionComplete(item.task.id, item.session.id);
+                                    }
+                                  }}
+                                  className="text-[#2457A7] hover:text-[#16856B] shrink-0"
+                                  title={isDone ? 'Tandai belum selesai' : 'Tandai selesai'}
+                                >
+                                  <CheckCircle2
+                                    size={11}
+                                    className={isDone ? 'text-[#16856B] fill-[#16856B]/20' : 'text-[#2457A7]'}
+                                  />
+                                </button>
+                              )}
                             </div>
-                          )}
 
-                          {/* Render Google Calendar Events */}
-                          {hourEvents.map((evt) => (
-                            <div
-                              key={evt.id}
-                              onClick={() => setSelectedEventDetails(evt)}
-                              className="mb-1 p-2 bg-[#2457A7]/10 hover:bg-[#2457A7]/15 border-l-3 border-[#2457A7] rounded-md cursor-pointer transition-all shadow-2xs text-left"
-                            >
-                              <div className="flex items-center justify-between gap-1">
-                                <span className="text-xs font-semibold text-[#172B42] truncate">
-                                  {evt.title}
-                                </span>
-                                <span title="Read-only Google Event">
-                                  <Lock size={10} className="text-[#53657A] shrink-0" />
-                                </span>
-                              </div>
-                              <div className="flex items-center gap-1.5 mt-0.5 text-[10px] text-[#53657A]">
-                                <span className="font-mono">
-                                  {new Date(evt.startAt).toLocaleTimeString('id-ID', {
-                                    hour: '2-digit',
-                                    minute: '2-digit',
-                                  })}
-                                </span>
-                                {evt.meetUrl && (
-                                  <span className="flex items-center gap-0.5 text-[#2457A7] font-medium">
-                                    <Video size={10} /> Meet
-                                  </span>
-                                )}
-                              </div>
+                            {/* Continuation Badges for Cross-Midnight Events */}
+                            {item.isContinuedFromYesterday && (
+                              <span className="inline-block text-[9px] bg-indigo-100 text-indigo-800 font-semibold px-1 rounded-sm mt-0.5">
+                                (Lanjutan kemarin)
+                              </span>
+                            )}
+                            {item.isContinuedToTomorrow && (
+                              <span className="inline-block text-[9px] bg-indigo-100 text-indigo-800 font-semibold px-1 rounded-sm mt-0.5">
+                                (Bersambung besok)
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Time & Duration Info */}
+                          {item.heightPx >= 40 && (
+                            <div className="flex items-center justify-between text-[9px] text-[#53657A] font-mono pt-0.5">
+                              <span>
+                                {formatInTimezone(item.visibleStart, tz, { hour: '2-digit', minute: '2-digit' })}
+                                {' - '}
+                                {formatInTimezone(item.visibleEnd, tz, { hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                              <span>{item.visibleDurationMinutes}m</span>
                             </div>
-                          ))}
-
-                          {/* Render EVEN Scheduled Task Sessions */}
-                          {hourSessions.map(({ task, session }) => {
-                            const isDone = session.status === 'COMPLETED';
-
-                            return (
-                              <div
-                                key={session.id}
-                                onClick={() => setSelectedSessionDetails({ task, session })}
-                                className={`mb-1 p-2 rounded-md border-l-3 cursor-pointer transition-all shadow-2xs text-left ${
-                                  isDone
-                                    ? 'bg-slate-100 border-slate-400 text-slate-500 line-through'
-                                    : 'bg-[#EAF3FC] hover:bg-[#d8e9fa] border-[#2457A7] text-[#172B42]'
-                                }`}
-                              >
-                                <div className="flex items-start justify-between gap-1">
-                                  <span className="text-xs font-semibold truncate leading-tight">
-                                    {session.taskTitle}
-                                  </span>
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      onToggleTaskSessionComplete(task.id, session.id);
-                                    }}
-                                    className="text-[#2457A7] hover:text-[#16856B] shrink-0 mt-0.5"
-                                    title={isDone ? 'Tandai belum selesai' : 'Tandai selesai'}
-                                  >
-                                    <CheckCircle2
-                                      size={13}
-                                      className={isDone ? 'text-[#16856B] fill-[#16856B]/20' : 'text-[#2457A7]'}
-                                    />
-                                  </button>
-                                </div>
-                                <div className="flex items-center gap-1.5 mt-1 text-[10px] text-[#53657A]">
-                                  <span className="font-mono">
-                                    {session.durationMinutes} mnt
-                                  </span>
-                                  {session.totalSessions > 1 && (
-                                    <span className="bg-white/80 px-1 rounded text-[9px] font-medium text-[#2457A7]">
-                                      Sesi {session.sessionIndex}/{session.totalSessions}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
-
-                          {/* Quick Add Button on Hover when slot is empty */}
-                          {hourEvents.length === 0 && hourSessions.length === 0 && !isLunchHour && (
-                            <button
-                              onClick={() => {
-                                if (onSelectSlotToSchedule) {
-                                  onSelectSlotToSchedule(dayDate, hour);
-                                } else {
-                                  onOpenTaskModal();
-                                }
-                              }}
-                              className="opacity-0 group-hover:opacity-100 transition-opacity w-full h-full min-h-[30px] flex items-center justify-center text-[#53657A] hover:text-[#2457A7] hover:bg-[#EAF3FC]/40 rounded-sm text-[11px]"
-                              title="Jadwalkan tugas di slot ini"
-                            >
-                              <Plus size={14} />
-                            </button>
                           )}
                         </div>
                       );
@@ -390,163 +535,156 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
           </div>
         )}
 
-        {/* Daily Agenda View (Mobile priority) */}
+        {/* Daily Grid & Agenda View (01:00 - 24:00) */}
         {viewMode === 'day' && (
-          <div className="max-w-2xl mx-auto space-y-3">
-            <div className="p-4 bg-white border border-[#D9E3EF] rounded-2xl shadow-xs">
-              <h3 className="font-bold text-[#172B42] text-sm mb-3 flex items-center justify-between">
-                <span>Agenda Hari Ini</span>
-                <span className="text-xs text-[#53657A] font-normal">
-                  {new Intl.DateTimeFormat('id-ID', { dateStyle: 'full' }).format(currentDate)}
-                </span>
-              </h3>
-
-              {getEventsForDay(currentDate).length === 0 && getSessionsForDay(currentDate).length === 0 ? (
-                <div className="py-10 text-center text-[#53657A]">
-                  <CalendarIcon className="w-8 h-8 mx-auto text-[#8DBCEB] mb-2 opacity-60" />
-                  <p className="text-xs font-medium text-[#172B42]">Tidak ada agenda atau tugas hari ini.</p>
-                  <p className="text-[11px] mt-1">Gunakan tombol &ldquo;+ Tugas Baru&rdquo; atau minta AI merencanakan hari Anda.</p>
+          <div className="max-w-3xl mx-auto space-y-4">
+            <div className="bg-white border border-[#D9E3EF] rounded-2xl shadow-xs overflow-hidden">
+              <div className="p-4 border-b border-[#D9E3EF] bg-[#F8FAFC] flex items-center justify-between">
+                <div>
+                  <h3 className="font-bold text-[#172B42] text-sm flex items-center gap-2">
+                    <CalendarIcon size={16} className="text-[#2457A7]" />
+                    <span>Jadwal Harian Berurutan (01:00 - 24:00)</span>
+                  </h3>
+                  <p className="text-xs text-[#53657A] mt-0.5">
+                    {formatInTimezone(currentDate, tz, { dateStyle: 'full' })}
+                  </p>
                 </div>
-              ) : (
-                <div className="space-y-2.5">
-                  {/* Google Events */}
-                  {getEventsForDay(currentDate).map((evt) => (
+                <button
+                  onClick={onOpenTaskModal}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-[#2457A7] text-white rounded-xl text-xs font-semibold shadow-2xs hover:bg-[#1E4889]"
+                >
+                  <Plus size={13} />
+                  <span>Tambah Kegiatan</span>
+                </button>
+              </div>
+
+              {/* Day Time Grid */}
+              <div className="relative grid grid-cols-[64px_1fr]" style={{ height: `${24 * ROW_HEIGHT}px` }}>
+                {/* Hours column */}
+                <div className="border-r border-[#D9E3EF] bg-[#F8FAFC] divide-y divide-[#D9E3EF]">
+                  {gridHours.map((hour) => (
                     <div
-                      key={evt.id}
-                      onClick={() => setSelectedEventDetails(evt)}
-                      className="p-3 bg-[#2457A7]/5 border-l-4 border-[#2457A7] rounded-xl flex items-center justify-between cursor-pointer hover:bg-[#2457A7]/10 transition-colors"
+                      key={hour}
+                      className="text-right pr-2 text-[10px] text-[#53657A] font-mono flex items-start justify-end pt-1"
+                      style={{ height: `${ROW_HEIGHT}px` }}
                     >
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs font-bold text-[#172B42]">{evt.title}</span>
-                          <span className="text-[10px] bg-white border border-[#D9E3EF] text-[#53657A] px-1.5 py-0.2 rounded font-medium">
-                            Rapat Google
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-[#53657A] mt-0.5">
-                          {new Date(evt.startAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })} -{' '}
-                          {new Date(evt.endAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
-                          {evt.location && ` • ${evt.location}`}
-                        </p>
-                      </div>
-                      {evt.meetUrl && (
-                        <a
-                          href={evt.meetUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          onClick={(e) => e.stopPropagation()}
-                          className="flex items-center gap-1 text-xs text-[#2457A7] bg-white px-2.5 py-1.5 rounded-lg border border-[#D9E3EF] font-medium"
-                        >
-                          <Video size={13} /> Gabung Meet
-                        </a>
-                      )}
+                      {String(hour).padStart(2, '0')}:00
                     </div>
                   ))}
+                </div>
 
-                  {/* EVEN Task Sessions */}
-                  {getSessionsForDay(currentDate).map(({ task, session }) => {
-                    const isDone = session.status === 'COMPLETED';
+                {/* Day Column with Cards */}
+                <div className="relative h-full">
+                  {gridHours.map((hour) => (
+                    <div
+                      key={hour}
+                      className="border-b border-[#D9E3EF]/70 hover:bg-slate-50/50"
+                      style={{ height: `${ROW_HEIGHT}px` }}
+                    />
+                  ))}
+
+                  {/* Sliced items for day view */}
+                  {getSlicedItemsForDay(currentDate).map((item) => {
+                    const isGoogle = item.sourceType === 'google';
+                    const isDone = Boolean(item.isDone);
+                    const widthPercent = item.totalCols > 1 ? 100 / item.totalCols : 100;
+                    const leftPercent = item.colIndex * widthPercent;
 
                     return (
                       <div
-                        key={session.id}
-                        onClick={() => setSelectedSessionDetails({ task, session })}
-                        className={`p-3 border-l-4 rounded-xl flex items-center justify-between cursor-pointer transition-colors ${
-                          isDone
-                            ? 'bg-slate-50 border-slate-300 opacity-60'
-                            : 'bg-[#EAF3FC] border-[#2457A7] hover:bg-[#d8e9fa]'
+                        key={item.id}
+                        onClick={() => {
+                          if (isGoogle && item.event) {
+                            setSelectedEventDetails(item.event);
+                          } else if (item.task && item.session) {
+                            setSelectedSessionDetails({ task: item.task, session: item.session });
+                          }
+                        }}
+                        style={{
+                          top: `${item.topPx}px`,
+                          height: `${item.heightPx}px`,
+                          left: `calc(${leftPercent}% + 4px)`,
+                          width: `calc(${widthPercent}% - 8px)`,
+                        }}
+                        className={`absolute z-10 p-2.5 rounded-xl border-l-4 cursor-pointer transition-all shadow-xs flex flex-col justify-between ${
+                          item.hasConflict ? 'ring-2 ring-red-400' : ''
+                        } ${
+                          isGoogle
+                            ? 'bg-[#2457A7]/10 hover:bg-[#2457A7]/15 border-[#2457A7] text-[#172B42]'
+                            : isDone
+                            ? 'bg-slate-100 hover:bg-slate-200 border-slate-400 text-slate-500 line-through'
+                            : 'bg-[#EAF3FC] hover:bg-[#d8e9fa] border-[#2457A7] text-[#172B42]'
                         }`}
                       >
                         <div>
-                          <div className="flex items-center gap-2">
-                            <span className={`text-xs font-bold ${isDone ? 'line-through text-slate-500' : 'text-[#172B42]'}`}>
-                              {session.taskTitle}
-                            </span>
-                            <span className="text-[10px] bg-[#2457A7] text-white px-1.5 py-0.2 rounded-full font-medium">
-                              Fokus EVEN
-                            </span>
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold truncate">{item.title}</span>
+                            {isGoogle ? (
+                              <span className="text-[10px] bg-white border border-[#D9E3EF] text-[#53657A] px-1.5 py-0.2 rounded font-medium shrink-0">
+                                Google
+                              </span>
+                            ) : (
+                              <span className="text-[10px] bg-[#2457A7] text-white px-2 py-0.2 rounded-full font-medium shrink-0">
+                                Sesi Fokus
+                              </span>
+                            )}
                           </div>
-                          <p className="text-[11px] text-[#53657A] mt-0.5">
-                            {new Date(session.startAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })} -{' '}
-                            {new Date(session.endAt).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}
-                            {` • ${session.durationMinutes} menit`}
-                            {session.totalSessions > 1 && ` (Sesi ${session.sessionIndex}/${session.totalSessions})`}
-                          </p>
+                          {item.isContinuedFromYesterday && (
+                            <span className="text-[10px] bg-indigo-100 text-indigo-800 px-1.5 py-0.2 rounded mt-1 inline-block">
+                              Lanjutan dari hari sebelumnya
+                            </span>
+                          )}
+                          {item.isContinuedToTomorrow && (
+                            <span className="text-[10px] bg-indigo-100 text-indigo-800 px-1.5 py-0.2 rounded mt-1 inline-block">
+                              Bersambung ke hari berikutnya
+                            </span>
+                          )}
                         </div>
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onToggleTaskSessionComplete(task.id, session.id);
-                          }}
-                          className="p-1.5 text-[#2457A7] hover:text-[#16856B]"
-                        >
-                          <CheckCircle2 size={18} className={isDone ? 'text-[#16856B]' : 'text-[#2457A7]'} />
-                        </button>
+
+                        <div className="flex items-center justify-between text-[11px] text-[#53657A] font-mono pt-1">
+                          <span>
+                            {formatInTimezone(item.visibleStart, tz, { hour: '2-digit', minute: '2-digit' })} -{' '}
+                            {formatInTimezone(item.visibleEnd, tz, { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                          <span>{item.visibleDurationMinutes} menit</span>
+                        </div>
                       </div>
                     );
                   })}
                 </div>
-              )}
+              </div>
             </div>
           </div>
         )}
 
-        {/* Monthly View */}
+        {/* Month View Placeholder */}
         {viewMode === 'month' && (
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl shadow-xs p-4">
-            <div className="grid grid-cols-7 gap-2 text-center text-xs font-medium text-[#53657A] mb-2 pb-2 border-b border-[#D9E3EF]">
-              <span>Sen</span>
-              <span>Sel</span>
-              <span>Rab</span>
-              <span>Kam</span>
-              <span>Jum</span>
-              <span>Sab</span>
-              <span>Min</span>
-            </div>
-            <div className="grid grid-cols-7 gap-2">
-              {Array.from({ length: 35 }).map((_, i) => {
-                const dayNum = (i % 31) + 1;
-                const isCurrent = dayNum === new Date().getDate();
-
-                return (
-                  <div
-                    key={i}
-                    onClick={() => {
-                      const d = new Date(currentDate);
-                      d.setDate(dayNum);
-                      setCurrentDate(d);
-                      setViewMode('day');
-                    }}
-                    className={`min-h-[75px] p-2 border rounded-xl cursor-pointer hover:border-[#2457A7] transition-all flex flex-col justify-between ${
-                      isCurrent ? 'bg-[#EAF3FC]/50 border-[#2457A7]' : 'border-[#D9E3EF]/70 bg-white'
-                    }`}
-                  >
-                    <span className={`text-xs font-bold ${isCurrent ? 'text-[#2457A7]' : 'text-[#172B42]'}`}>
-                      {dayNum}
-                    </span>
-                    <div className="space-y-1">
-                      {isCurrent && (
-                        <div className="text-[10px] bg-[#2457A7] text-white px-1 py-0.5 rounded-sm truncate">
-                          Hari ini
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-6 shadow-xs text-center space-y-3">
+            <CalendarIcon className="w-10 h-10 text-[#2457A7] mx-auto opacity-70" />
+            <h3 className="text-base font-bold text-[#172B42] font-editorial">
+              Tinjauan Bulanan {formatInTimezone(currentDate, tz, { month: 'long', year: 'numeric' })}
+            </h3>
+            <p className="text-xs text-[#53657A] max-w-md mx-auto leading-relaxed">
+              Tampilan kalender bulanan mengelompokkan kegiatan Anda secara makro. Gunakan tampilan <strong>Minggu</strong> atau <strong>Hari</strong> untuk melihat skala jam 01:00 sampai 24:00 dengan posisi dan tinggi kartu presisi.
+            </p>
+            <button
+              onClick={() => setViewMode('week')}
+              className="px-4 py-2 bg-[#2457A7] text-white text-xs font-semibold rounded-xl hover:bg-[#1E4889]"
+            >
+              Buka Tampilan Mingguan
+            </button>
           </div>
         )}
       </div>
 
-      {/* Event Details Drawer/Modal */}
+      {/* Google Event Details Modal */}
       {selectedEventDetails && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
           <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-xl border border-[#D9E3EF] space-y-4">
             <div className="flex items-start justify-between">
               <div>
                 <span className="text-[10px] font-semibold bg-[#2457A7]/10 text-[#2457A7] px-2 py-0.5 rounded-full">
-                  Google Calendar
+                  Acara Google Calendar
                 </span>
                 <h3 className="text-base font-bold text-[#172B42] mt-1.5">
                   {selectedEventDetails.title}
@@ -554,7 +692,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               </div>
               <button
                 onClick={() => setSelectedEventDetails(null)}
-                className="text-[#53657A] hover:text-[#172B42] p-1"
+                className="text-[#53657A] hover:text-[#172B42] p-1 rounded-lg"
               >
                 ✕
               </button>
@@ -564,7 +702,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               <div className="flex items-center gap-2">
                 <Clock size={14} className="text-[#2457A7]" />
                 <span>
-                  {new Date(selectedEventDetails.startAt).toLocaleDateString('id-ID', {
+                  {formatInTimezone(new Date(selectedEventDetails.startAt), tz, {
                     weekday: 'long',
                     day: 'numeric',
                     month: 'long',
@@ -572,7 +710,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                     minute: '2-digit',
                   })}
                   {' — '}
-                  {new Date(selectedEventDetails.endAt).toLocaleTimeString('id-ID', {
+                  {formatInTimezone(new Date(selectedEventDetails.endAt), tz, {
                     hour: '2-digit',
                     minute: '2-digit',
                   })}
@@ -621,14 +759,14 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
         </div>
       )}
 
-      {/* Task Session Details Drawer/Modal */}
+      {/* Task Session Details Modal */}
       {selectedSessionDetails && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
           <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-xl border border-[#D9E3EF] space-y-4">
             <div className="flex items-start justify-between">
               <div>
                 <span className="text-[10px] font-semibold bg-[#EAF3FC] text-[#2457A7] px-2 py-0.5 rounded-full">
-                  Jadwal Sesi EVEN
+                  Sesi Kegiatan EVEN
                 </span>
                 <h3 className="text-base font-bold text-[#172B42] mt-1.5">
                   {selectedSessionDetails.session.taskTitle}
@@ -636,7 +774,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               </div>
               <button
                 onClick={() => setSelectedSessionDetails(null)}
-                className="text-[#53657A] hover:text-[#172B42] p-1"
+                className="text-[#53657A] hover:text-[#172B42] p-1 rounded-lg"
               >
                 ✕
               </button>
@@ -646,7 +784,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               <div className="flex items-center gap-2">
                 <Clock size={14} className="text-[#2457A7]" />
                 <span>
-                  {new Date(selectedSessionDetails.session.startAt).toLocaleDateString('id-ID', {
+                  {formatInTimezone(new Date(selectedSessionDetails.session.startAt), tz, {
                     weekday: 'long',
                     day: 'numeric',
                     month: 'long',
@@ -654,7 +792,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                     minute: '2-digit',
                   })}
                   {' — '}
-                  {new Date(selectedSessionDetails.session.endAt).toLocaleTimeString('id-ID', {
+                  {formatInTimezone(new Date(selectedSessionDetails.session.endAt), tz, {
                     hour: '2-digit',
                     minute: '2-digit',
                   })}
@@ -678,7 +816,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                 className="flex-1 py-2.5 px-4 bg-[#16856B] hover:bg-[#126E58] text-white rounded-xl text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
               >
                 <CheckCircle2 size={14} />
-                {selectedSessionDetails.session.status === 'COMPLETED' ? 'Tandai Belum Selesai' : 'Selesaikan Sesi Ini'}
+                {selectedSessionDetails.session.status === 'COMPLETED' ? 'Tandai Belum Selesai' : 'Selesaikan Kegiatan Ini'}
               </button>
             </div>
           </div>

@@ -6,6 +6,7 @@ export const INITIAL_PREFERENCES: UserPreferences = {
   timezone: 'Asia/Jakarta (WIB)',
   workStartHour: 9,
   workEndHour: 18,
+  enableLunchBreak: true,
   lunchStartHour: 12,
   lunchEndHour: 13,
   bufferMinutes: 15,

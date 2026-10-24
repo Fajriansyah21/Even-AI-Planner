@@ -142,3 +142,21 @@ export function createIsoFromLocalZoned(
   );
 }
 
+export function startOfDayInTimezone(date: Date, timeZone: string = 'Asia/Jakarta'): Date {
+  const parts = getPartsInTimezone(date, timeZone);
+  const iso = createIsoInTimezone(parts.year, parts.month, parts.day, 0, 0, 0, timeZone);
+  return new Date(iso);
+}
+
+export function endOfDayInTimezone(date: Date, timeZone: string = 'Asia/Jakarta'): Date {
+  const parts = getPartsInTimezone(date, timeZone);
+  // 24:00 is next day 00:00:00
+  const iso = createIsoInTimezone(parts.year, parts.month, parts.day, 24, 0, 0, timeZone);
+  return new Date(iso);
+}
+
+export function formatDateOnlyInTimezone(date: Date, timeZone: string = 'Asia/Jakarta'): string {
+  const p = getPartsInTimezone(date, timeZone);
+  return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
+}
+

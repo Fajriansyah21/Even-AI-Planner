@@ -197,14 +197,14 @@ export const KeepNotesView: React.FC<KeepNotesViewProps> = ({
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-xl sm:text-2xl font-bold font-editorial text-[#172B42] tracking-tight">
-                Catatan Google Keep & Ide Tugas
+                Catatan Google Keep & Ide Kegiatan
               </h2>
               <span className="text-[10px] bg-amber-100 text-[#B86B12] px-2 py-0.5 rounded-full font-semibold border border-amber-200">
                 Google Keep
               </span>
             </div>
             <p className="text-xs text-[#53657A] mt-0.5">
-              Tulis catatan cepat, daftar cek ide, dan konversikan langsung menjadi tugas terencana di kalender EVEN.
+              Tulis catatan cepat, daftar cek ide, dan konversikan langsung menjadi kegiatan terencana di kalender EVEN.
             </p>
           </div>
 
@@ -401,10 +401,10 @@ export const KeepNotesView: React.FC<KeepNotesViewProps> = ({
                         onConvertNoteToTask(note);
                       }}
                       className="flex items-center gap-1.5 px-2.5 py-1 bg-[#2457A7] hover:bg-[#1E4889] text-white rounded-lg text-[11px] font-semibold transition-colors shadow-2xs"
-                      title="Jadikan tugas di kalender EVEN"
+                      title="Jadikan kegiatan di kalender EVEN"
                     >
                       <Calendar size={12} />
-                      <span>Jadikan Tugas</span>
+                      <span>Jadikan Kegiatan</span>
                     </button>
                   </div>
 

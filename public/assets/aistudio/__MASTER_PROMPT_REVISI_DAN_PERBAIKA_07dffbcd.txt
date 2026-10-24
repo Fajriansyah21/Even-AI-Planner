@@ -1,0 +1,526 @@
+# MASTER PROMPT REVISI DAN PERBAIKAN EVEN AI PLANNER
+
+## 1. PERAN DAN TUJUAN
+
+Bertindaklah sebagai senior full-stack engineer, UI/UX designer, software architect, dan quality assurance engineer.
+
+
+Lakukan audit terhadap kode, struktur proyek, komponen UI, tipe data, sistem penjadwalan, integrasi Google Calendar, pengaturan pengguna, serta alur data sebelum mulai mengubahnya.
+
+Implementasikan perbaikannya langsung pada proyek yang sedang terbuka di Google AI Studio sejauh kemampuan lingkungan tersebut memungkinkan.
+
+**Aturan utama:**
+- Pertahankan identitas, fitur, struktur, dan desain dasar EVEN AI Planner yang sudah ada, kecuali bagian yang memang harus diperbaiki.
+- Jangan menghapus fitur yang masih berfungsi.
+- Jangan membuat ulang aplikasi dari nol hanya karena lebih mudah.
+- Jangan mengganti teknologi, framework, dependensi, atau struktur proyek tanpa alasan teknis yang kuat.
+- Jangan membuat tombol, pengaturan, atau fitur yang hanya tampak berfungsi tetapi tidak memiliki implementasi nyata.
+- Jangan menggunakan data palsu untuk menutupi kegagalan autentikasi, sinkronisasi, atau operasi backend.
+- Jangan mengubah nama field internal, skema database, atau format penyimpanan secara sembarangan hingga merusak data pengguna.
+- Jika perubahan membutuhkan migrasi data, implementasikan migrasi yang aman dan kompatibel dengan data lama.
+- Jangan berhenti setelah memperbaiki satu komponen. Periksa seluruh alur yang terdampak.
+- Jangan mengklaim fitur sudah berhasil apabila belum menjalankan pengujian yang relevan.
+
+## 2. AUDIT KODE SEBELUM IMPLEMENTASI
+
+Periksa seluruh bagian proyek yang berkaitan dengan:
+
+- Komponen kalender dan tampilan kegiatan.
+- Formulir penambahan dan pengeditan kegiatan.
+- Mode penjadwalan manual dan penjadwalan berbantuan AI.
+- Sistem parsing waktu dan zona waktu.
+- Algoritma penjadwalan dan pembagian durasi kegiatan.
+- Pengaturan jam kerja, istirahat, serta preferensi pengguna.
+- Model data kegiatan, tenggat, dan sesi penjadwalan.
+- Integrasi Google Calendar dan autentikasi Google.
+- Tampilan pengaturan dan seluruh notifikasi.
+- Font, tipografi, spacing, responsivitas, dan konsistensi istilah.
+- Semua komponen lain yang menggunakan data waktu atau istilah kegiatan.
+
+Gunakan implementasi dan file yang sudah ada sebagai sumber utama. Identifikasi penyebab masalah sebelum mengubah kode. Hindari membuat implementasi kedua yang bertabrakan dengan implementasi lama.
+
+Setelah audit, langsung kerjakan seluruh perubahan di bawah ini secara terpadu.
+
+## 3. REVISI FONT DAN IDENTITAS VISUAL
+
+Pulihkan gaya font aplikasi ke gaya sebelumnya, khususnya font editorial atau serif yang digunakan pada logo, judul tanggal, dan elemen yang sebelumnya memiliki karakter tersebut.
+
+Ketentuan:
+- Periksa riwayat kode, stylesheet, konfigurasi font, atau komponen yang tersedia untuk menemukan gaya sebelumnya.
+- Pertahankan font serif pada elemen yang memang dirancang menggunakannya.
+- Jangan mengganti seluruh font aplikasi menjadi serif jika desain sebelumnya menggunakan kombinasi serif dan sans-serif.
+- Pertahankan hierarki visual, ukuran, ketebalan, jarak antarhuruf, dan karakter desain yang sudah ada.
+- Pastikan font tampil konsisten pada seluruh halaman dan tidak menimbulkan layout shift atau teks terpotong.
+- Jika font sebelumnya tidak dapat ditemukan, gunakan alternatif terdekat yang tersedia dan dokumentasikan keputusan tersebut.
+
+Jangan melakukan redesign besar-besaran. Tujuannya adalah memulihkan dan merapikan identitas visual yang sudah ada.
+
+## 4. PISAHKAN MODE KEGIATAN MANUAL DAN KEGIATAN DENGAN BANTUAN AI
+
+Sediakan dua mode yang jelas ketika pengguna menambahkan kegiatan.
+
+### A. Mode manual
+
+Mode manual digunakan untuk kegiatan yang waktu pelaksanaannya sudah ditentukan oleh pengguna.
+
+Formulir minimal harus menyediakan:
+- Nama kegiatan.
+- Deskripsi, jika diperlukan.
+- Tanggal mulai.
+- Waktu mulai.
+- Tanggal selesai.
+- Waktu selesai.
+- Opsi kegiatan sepanjang hari jika fitur tersebut sesuai dengan arsitektur aplikasi.
+- Kategori atau warna kegiatan apabila fitur itu sudah tersedia.
+
+Pengguna harus bisa menetapkan waktu secara langsung tanpa meminta AI menyusun jadwal.
+
+Contoh:
+- Tanggal mulai: 25 Oktober 2026.
+- Waktu mulai: 22:00.
+- Tanggal selesai: 26 Oktober 2026.
+- Waktu selesai: 06:00.
+
+Hasilnya harus menjadi kegiatan berdurasi delapan jam yang melewati tengah malam, bukan kegiatan yang berakhir pada pukul 06:00 di tanggal yang sama.
+
+Validasi agar tanggal dan waktu akhir tidak lebih awal daripada waktu mulai. Tolak rentang waktu nol atau negatif, kecuali kegiatan sepanjang hari ditangani secara khusus.
+
+Jangan menganggap semua kegiatan manual sebagai kegiatan yang dapat dipindahkan oleh AI. Kegiatan manual dengan waktu yang telah ditetapkan harus diperlakukan sebagai jadwal tetap.
+
+### B. Mode penjadwalan AI
+
+Mode ini digunakan ketika pengguna ingin AI membantu menentukan waktu pelaksanaan kegiatan.
+
+Formulir harus menyediakan:
+- Nama kegiatan.
+- Deskripsi atau instruksi kegiatan.
+- Estimasi durasi.
+- Prioritas.
+- Preferensi waktu, misalnya pagi, siang, sore, malam, atau waktu tertentu.
+- Tenggat waktu yang bersifat opsional.
+- Opsi pembagian kegiatan menjadi beberapa sesi apabila didukung.
+- Pengaturan relevan lain yang sudah tersedia di aplikasi.
+
+AI harus menyusun jadwal berdasarkan durasi, prioritas, preferensi waktu, tenggat jika diaktifkan, jam kerja pengguna, waktu istirahat, dan jadwal tetap yang sudah ada.
+
+Jangan memaksa pengguna memasukkan tanggal mulai atau waktu mulai yang pasti jika tujuan mode AI adalah mencari waktu yang paling sesuai.
+
+Gunakan label antarmuka yang jelas, misalnya **Manual** dan **Jadwalkan dengan AI**. Pertahankan gaya desain aplikasi.
+
+## 5. TENGGAT WAKTU HARUS BENAR-BENAR OPSIONAL
+
+Pertahankan fitur tenggat waktu, tetapi tambahkan kontrol untuk mengaktifkan atau menonaktifkannya.
+
+Ketika tenggat diaktifkan:
+- Tampilkan input tanggal dan waktu tenggat.
+- Jadikan tenggat sebagai batas penyelesaian yang diperhitungkan oleh scheduler.
+- Pastikan kegiatan dijadwalkan sebelum atau pada tenggat yang ditentukan, sesuai definisi waktu akhir kegiatan.
+- Berikan informasi yang jelas jika durasi dan jadwal yang tersedia tidak memungkinkan kegiatan selesai sebelum tenggat.
+
+Ketika tenggat dinonaktifkan:
+- Sembunyikan atau nonaktifkan input tenggat.
+- Simpan nilai tenggat sebagai `null` atau representasi tanpa tenggat yang konsisten dengan skema data.
+- Jangan otomatis menetapkan tenggat tujuh hari ke depan.
+- Jangan menggunakan tenggat tersembunyi atau tenggat bawaan untuk membatasi penjadwalan.
+- AI tetap harus dapat menyusun jadwal berdasarkan preferensi waktu, durasi, prioritas, dan ketersediaan kalender.
+
+Periksa seluruh kode yang membaca atau menulis `deadlineAt`. Perbarui tipe data, validasi, penyimpanan, scheduler, komponen formulir, serta tampilan detail kegiatan secara konsisten.
+
+Jika skema lama mewajibkan `deadlineAt`, lakukan perubahan yang aman dan kompatibel. Pastikan kegiatan lama yang sudah memiliki tenggat tetap dapat dibaca tanpa kehilangan data.
+
+Bedakan secara tegas:
+- Waktu mulai dan waktu selesai.
+- Tenggat penyelesaian.
+- Preferensi waktu.
+- Jadwal tetap.
+
+Keempat hal tersebut tidak boleh saling menggantikan.
+
+## 6. PERBAIKI MODEL WAKTU DAN KEGIATAN LINTAS TENGAH MALAM
+
+Ini merupakan salah satu bagian paling penting.
+
+Audit semua perhitungan tanggal, jam, durasi, sesi kegiatan, dan zona waktu. Jangan memperbaiki tampilan saja sementara data waktunya tetap salah.
+
+Gunakan tanggal dan waktu lengkap sebagai sumber kebenaran untuk waktu mulai dan waktu selesai. Jangan hanya mengandalkan angka jam seperti `22` dan `6` tanpa tanggal yang jelas.
+
+Contoh kegiatan:
+- Mulai: 25 Oktober 2026 pukul 22:00.
+- Selesai: 26 Oktober 2026 pukul 06:00.
+- Durasi: 8 jam.
+
+Perhitungan durasi harus berdasarkan selisih waktu aktual:
+
+`durasi = waktu selesai - waktu mulai`
+
+Pastikan hasil perhitungan tetap benar untuk:
+- Kegiatan pada hari yang sama.
+- Kegiatan yang melewati tengah malam.
+- Kegiatan yang berlangsung selama lebih dari 24 jam.
+- Kegiatan yang melintasi beberapa tanggal.
+- Perubahan zona waktu atau waktu musim panas pada zona yang menggunakannya.
+
+Jangan memperbaiki masalah waktu dengan aturan khusus berdasarkan nama kegiatan seperti tidur, belajar, atau bekerja. Gunakan aturan umum yang didasarkan pada data tanggal, waktu, dan jenis batasan jadwal.
+
+Untuk kegiatan yang sudah memiliki waktu tetap, jangan biarkan AI memindahkan atau mengubah waktunya secara diam-diam.
+
+Jika AI menghasilkan waktu yang bertentangan dengan batasan pengguna, validasi hasilnya dan minta AI memperbaikinya atau tampilkan kegagalan yang dapat dipahami pengguna.
+
+Jangan mengubah waktu yang sudah valid hanya untuk membuat hasil jadwal terlihat lebih rapi.
+
+## 7. PERBAIKI ALGORITMA PENJADWALAN AI
+
+Periksa scheduler yang sudah ada dan integrasikan perbaikannya ke implementasi tersebut.
+
+### Prioritas penjadwalan
+
+Urutan pertimbangan harus konsisten:
+1. Kegiatan yang waktu mulainya dan waktu selesainya sudah ditetapkan.
+2. Ketersediaan waktu aktual pada kalender.
+3. Durasi dan kebutuhan sesi kegiatan.
+4. Tenggat yang benar-benar diaktifkan.
+5. Prioritas kegiatan.
+6. Preferensi waktu pengguna.
+7. Jam kerja dan waktu istirahat.
+8. Pemerataan beban kegiatan serta kualitas susunan jadwal.
+
+Jangan mengubah urutan ini secara kaku jika ada aturan domain aplikasi yang memang lebih tepat, tetapi pastikan jadwal tetap tidak bertabrakan dan tidak melanggar batasan eksplisit pengguna.
+
+### Kegiatan dengan durasi panjang
+
+Jika pembagian sesi diaktifkan:
+- Bagi kegiatan menjadi beberapa sesi sesuai aturan yang sudah ada.
+- Pertahankan jumlah total durasi yang direncanakan.
+- Simpan hubungan antara sesi dan kegiatan induknya.
+- Pastikan setiap sesi memiliki waktu mulai dan selesai yang valid.
+- Jangan menempatkan sesi pada jam yang bertabrakan dengan kegiatan lain.
+
+Jika pembagian sesi dinonaktifkan, jangan membagi kegiatan secara diam-diam.
+
+### Penanganan konflik
+
+Jika tidak ada slot yang sesuai:
+- Jangan membuat jadwal yang bertabrakan.
+- Jangan diam-diam memindahkan kegiatan ke jam yang bertentangan dengan preferensi eksplisit pengguna.
+- Jangan mengabaikan tenggat yang diaktifkan.
+- Berikan informasi bahwa jadwal tidak dapat disusun dengan batasan saat ini.
+- Jika memungkinkan, tawarkan pilihan untuk memperpanjang rentang pencarian, mengubah preferensi waktu, mengubah durasi, atau menyesuaikan tenggat.
+
+Jangan menyatakan bahwa penjadwalan berhasil jika sebagian sesi gagal ditempatkan.
+
+## 8. PENGATURAN JAM KERJA HARUS MENDUKUNG SHIFT MALAM
+
+Perluas pilihan jam kerja pada halaman pengaturan.
+
+Pengguna harus dapat memilih waktu mulai dan waktu selesai dari pukul **01:00 sampai 24:00**, dengan interval satu jam jika sesuai dengan desain yang sudah ada.
+
+Contoh:
+- 01:00 sampai 09:00.
+- 08:00 sampai 16:00.
+- 14:00 sampai 22:00.
+- 22:00 sampai 06:00 keesokan harinya.
+
+Pastikan antarmuka dapat merepresentasikan shift yang melewati tengah malam. Jangan hanya memperluas pilihan dropdown, karena hal itu tidak cukup untuk mendukung shift malam.
+
+Tetapkan semantik yang konsisten:
+- Jam `24:00` berarti tengah malam pada akhir hari yang bersangkutan, bukan `00:00` di awal hari yang sama.
+- Jika waktu selesai lebih awal daripada waktu mulai, perlakukan sebagai shift lintas tengah malam apabila konfigurasi memang mengizinkannya.
+- Jika waktu mulai sama dengan waktu selesai, jangan otomatis menganggap durasi shift 24 jam. Tangani sebagai input ambigu atau konfigurasi khusus yang membutuhkan penanganan eksplisit.
+
+Perbarui scheduler agar slot kerja benar-benar mencakup rentang waktu yang dipilih, termasuk bagian sebelum dan sesudah tengah malam.
+
+Jangan memaksakan jadwal kegiatan ke jam kerja siang hari ketika pengguna telah memilih shift malam.
+
+Pastikan seluruh preferensi tetap tersimpan dan dipulihkan setelah halaman dimuat ulang.
+
+## 9. WAKTU ISTIRAHAT MAKAN SIANG HARUS BISA DINONAKTIFKAN
+
+Tambahkan pilihan **Tidak ada** atau toggle untuk menonaktifkan waktu istirahat makan siang.
+
+Ketika istirahat diaktifkan:
+- Pengguna dapat menentukan rentang waktu istirahat.
+- Scheduler tidak boleh menempatkan kegiatan kerja pada rentang tersebut jika aturan aplikasi menetapkannya sebagai waktu istirahat.
+- Rentang istirahat harus diperlakukan dengan benar pada shift yang melintasi tengah malam.
+
+Ketika istirahat dinonaktifkan:
+- Scheduler tidak boleh membuat slot istirahat otomatis.
+- Tidak boleh ada jeda makan siang tersembunyi yang memengaruhi perhitungan ketersediaan.
+- Data preferensi harus menyatakan bahwa istirahat dinonaktifkan, bukan menyimpulkannya dari jam default.
+
+Perbarui tipe data, nilai default, validasi, penyimpanan, dan seluruh bagian scheduler yang menggunakan `lunchStartHour` serta `lunchEndHour`.
+
+Jika terdapat data lama, lakukan migrasi atau fallback yang aman agar preferensi pengguna yang sudah tersimpan tidak rusak.
+
+Jangan menganggap nilai awal dan akhir istirahat yang sama sebagai pengganti yang memadai untuk opsi nonaktif, kecuali sistem memang memiliki representasi eksplisit yang tidak ambigu.
+
+## 10. PERBAIKI TAMPILAN KALENDER
+
+Ubah rentang jam yang ditampilkan pada kalender harian dan mingguan menjadi **01:00 sampai 24:00**.
+
+Pastikan:
+- Label jam tersusun konsisten.
+- Tinggi baris atau skala waktu konsisten.
+- Kegiatan yang mulai pada pukul 01:00 atau berakhir pada pukul 24:00 dapat ditampilkan dengan benar.
+- Tampilan tidak menghilangkan kegiatan pada dini hari.
+- Kalender tetap dapat digunakan pada desktop dan perangkat mobile.
+- Navigasi tanggal, pergantian hari, dan pergantian minggu tetap berfungsi.
+
+Jangan hanya mengubah label menjadi 01:00 sampai 24:00. Area grid, posisi kegiatan, dan rentang waktu yang dipetakan juga harus diperbarui.
+
+### Posisi dan ukuran kartu kegiatan
+
+Posisi vertikal kartu harus ditentukan berdasarkan waktu mulai aktual.
+
+Tinggi kartu harus mencerminkan durasi aktual pada skala waktu kalender, bukan hanya tinggi tetap berdasarkan jumlah baris.
+
+Sebagai contoh:
+- Kegiatan 30 menit harus lebih pendek daripada kegiatan 2 jam.
+- Kegiatan 2 jam harus menempati rentang waktu yang benar.
+- Kegiatan 8 jam harus memiliki tinggi yang sebanding dengan rentang delapan jam yang ditampilkan pada hari tersebut.
+
+Pastikan kartu tidak menutupi label jam secara tidak sengaja, tidak terpotong, dan tidak meluber ke tanggal yang salah.
+
+Jika beberapa kegiatan berlangsung pada waktu yang bersamaan, tampilkan konflik secara jelas dengan tata letak yang tidak menyebabkan informasi utama hilang.
+
+Gunakan pendekatan posisi berbasis waktu, misalnya posisi relatif terhadap menit sejak awal rentang kalender dan tinggi berdasarkan durasi, dengan memperhatikan arsitektur komponen yang sudah ada.
+
+### Kegiatan yang melewati tengah malam
+
+Kegiatan lintas hari harus dirender pada setiap tanggal yang dilewatinya.
+
+Contoh:
+- Mulai 25 Oktober pukul 22:00.
+- Selesai 26 Oktober pukul 06:00.
+
+Pada tanggal 25 Oktober, tampilkan bagian 22:00 sampai akhir hari.
+Pada tanggal 26 Oktober, tampilkan bagian awal hari sampai 06:00.
+
+Kedua bagian harus tetap merujuk pada kegiatan yang sama, dengan tanggal, durasi, dan identitas yang konsisten.
+
+Untuk kegiatan yang berlangsung selama beberapa hari, potong tampilan berdasarkan batas masing-masing hari, bukan dengan memindahkan seluruh kartu ke tanggal mulai atau menggambarkannya secara keliru sebagai satu kartu yang membentang di luar kolom.
+
+Gunakan perhitungan interval waktu yang benar, termasuk kondisi ketika kegiatan dimulai atau berakhir tepat pada tengah malam.
+
+Jangan mengubah data sumber hanya demi menyesuaikan bentuk kartu kalender.
+
+## 11. PERBAIKI BUG POSISI DAN UKURAN KEGIATAN PADA TANGGAL BERBEDA
+
+Periksa masalah kartu kegiatan yang pada tanggal tertentu terlihat salah posisi atau seolah membentang dari tanggal 23 sampai 25 Oktober, padahal rentang waktunya tidak demikian.
+
+Audit fungsi yang mengelompokkan kegiatan berdasarkan tanggal, fungsi yang mengambil kegiatan untuk satu hari, dan fungsi yang memetakan kegiatan ke baris jam.
+
+Pastikan:
+- Kegiatan hanya dirender pada hari yang benar-benar beririsan dengan rentang waktunya.
+- Kegiatan yang berakhir pada tengah malam tidak secara keliru dianggap berlangsung sepanjang hari berikutnya.
+- Kegiatan yang dimulai pada tengah malam tidak kehilangan bagian awalnya.
+- Sesi kegiatan dan kegiatan induk tidak digambar ganda.
+- Zona waktu tidak menyebabkan kegiatan berpindah ke tanggal yang salah.
+- Perhitungan ukuran kartu menggunakan rentang yang terlihat pada hari tersebut, bukan durasi penuh ketika kegiatan melintasi beberapa hari.
+- Perubahan tampilan kalender tidak mengubah data waktu asli.
+
+Gunakan interval waktu yang konsisten dengan batas awal inklusif dan batas akhir eksklusif untuk menghindari duplikasi pada batas hari.
+
+Jangan mengatasi bug dengan mengurangi tinggi kartu secara acak, menambahkan margin khusus untuk tanggal tertentu, atau membuat pengecualian berdasarkan tanggal tertentu.
+
+## 12. GOOGLE CALENDAR DAN AUTENTIKASI
+
+Periksa kembali seluruh alur integrasi Google Calendar.
+
+Keberhasilan membuat event di Google Calendar tidak otomatis membuktikan bahwa seluruh fitur sinkronisasi sudah benar. Periksa proses autentikasi, token, pembuatan event, respons API, penanganan error, dan konsistensi data antara aplikasi dengan kalender eksternal.
+
+Ketentuan:
+- Jangan menyatakan autentikasi berhasil jika belum ada autentikasi yang valid.
+- Hapus atau perbaiki fallback yang memberikan status login berhasil menggunakan email dan nama statis ketika autentikasi Google gagal.
+- Jika login gagal, tampilkan pesan yang jelas dan pertahankan status pengguna sebagai belum terautentikasi.
+- Validasi respons API dan identitas event yang dikembalikan.
+- Tampilkan error yang relevan jika pembuatan event atau sinkronisasi gagal.
+- Pastikan tanggal, waktu mulai, waktu selesai, dan zona waktu yang dikirim ke Google Calendar sesuai dengan data kegiatan yang sebenarnya.
+- Jangan membuat event duplikat setiap kali pengguna mengulangi sinkronisasi.
+- Jika sinkronisasi dua arah memang sudah didukung, periksa pemetaan ID event dan mekanisme pembaruan atau penghapusan.
+- Jangan mengklaim sinkronisasi dua arah jika implementasinya hanya membuat event dari aplikasi ke Google Calendar.
+- Jangan menampilkan notifikasi sukses sebelum operasi benar-benar berhasil.
+
+Jaga keamanan token dan kredensial. Jangan menaruh rahasia API di kode frontend atau mengekspos kredensial pada log.
+
+Pertahankan integrasi yang sudah berfungsi dan lakukan perubahan hanya pada bagian yang diperlukan.
+
+## 13. KONSISTENSI ISTILAH: GANTI "TUGAS" MENJADI "KEGIATAN"
+
+Ganti istilah **"Tugas"** menjadi **"Kegiatan"** secara konsisten pada seluruh teks yang terlihat oleh pengguna.
+
+Periksa:
+- Judul modal.
+- Tombol tambah dan hapus.
+- Formulir.
+- Label input.
+- Pesan sukses dan error.
+- Notifikasi.
+- Halaman pengaturan.
+- Kalender.
+- Empty state.
+- Dialog konfirmasi.
+- Tooltip.
+- Petunjuk penggunaan.
+- Ringkasan AI.
+- Pesan status sinkronisasi.
+- Label aksesibilitas dan teks yang tampil pada layar kecil.
+
+Contoh:
+- "Tugas Baru" menjadi "Kegiatan Baru".
+- "Tambah Tugas" menjadi "Tambah Kegiatan".
+- "Hapus Tugas" menjadi "Hapus Kegiatan".
+- "Tugas Hari Ini" menjadi "Kegiatan Hari Ini".
+
+Lakukan pencarian global pada seluruh proyek untuk menemukan teks yang masih tertinggal.
+
+Jangan mengganti nama variabel, field API, nama tabel, atau identifier internal secara membabi buta. Jika istilah lama merupakan bagian dari skema atau kontrak internal, pertahankan kompatibilitasnya dan ubah hanya teks yang terlihat oleh pengguna, kecuali migrasi memang diperlukan dan aman.
+
+## 14. PERBAIKI UX DAN RESPONSIVITAS
+
+Rapikan pengalaman pengguna tanpa mengubah karakter utama aplikasi.
+
+Pastikan:
+- Pemilihan mode manual dan AI mudah dipahami.
+- Input yang tidak relevan dengan mode yang dipilih tidak mengganggu pengguna.
+- Input tenggat hanya aktif ketika tenggat diaktifkan.
+- Pengaturan jam kerja dan istirahat mudah digunakan.
+- Formulir menampilkan validasi yang jelas.
+- Pesan error menjelaskan masalah dan cara memperbaikinya.
+- Tombol menyimpan, mengedit, menghapus, dan menyinkronkan memiliki perilaku yang benar.
+- Status loading dan hasil operasi ditampilkan dengan tepat.
+- Tidak ada komponen yang saling bertumpuk atau terpotong.
+- Tampilan tetap berfungsi pada ukuran layar desktop, tablet, dan ponsel.
+
+Jangan menambahkan animasi atau elemen dekoratif yang tidak diperlukan jika dapat mengurangi keterbacaan atau kinerja.
+
+## 15. KETENTUAN TEKNIS IMPLEMENTASI
+
+Saat menerapkan perubahan:
+
+1. Periksa dependensi antara tipe data, komponen UI, scheduler, penyimpanan, dan integrasi kalender.
+2. Gunakan satu sumber kebenaran untuk perhitungan waktu. Hindari implementasi durasi berbeda pada beberapa komponen.
+3. Pisahkan logika perhitungan tanggal dari logika presentasi kalender jika sesuai dengan struktur proyek.
+4. Hindari duplikasi fungsi parsing dan konversi waktu.
+5. Jangan menggunakan waktu lokal dan UTC secara tidak konsisten.
+6. Pertahankan identitas kegiatan dan sesi agar pembaruan tidak menghasilkan duplikasi.
+7. Tangani data lama dengan aman.
+8. Periksa semua pemanggil fungsi yang terdampak setelah mengubah tanda tangan fungsi atau tipe data.
+9. Pastikan nilai `null`, tanggal kosong, dan waktu yang tidak valid ditangani secara eksplisit.
+10. Jangan menghilangkan validasi untuk membuat build berhasil.
+11. Jangan menambahkan dependensi baru jika solusi yang aman dapat diterapkan dengan dependensi yang sudah ada.
+12. Jangan menghapus fitur hanya karena fitur tersebut memerlukan perubahan lintas beberapa file.
+
+Jika aplikasi menggunakan TypeScript, pastikan perubahan lolos pemeriksaan tipe. Jika menggunakan sistem database atau penyimpanan persisten, pastikan skema dan migrasinya konsisten.
+
+## 16. PENGUJIAN WAJIB
+
+Setelah implementasi, jalankan pengujian yang tersedia di proyek. Tambahkan atau perbarui unit test dan integration test jika infrastruktur pengujian memungkinkan.
+
+Minimal uji kasus berikut.
+
+### A. Mode dan tenggat
+
+- Membuat kegiatan manual dengan waktu mulai dan selesai pada hari yang sama.
+- Membuat kegiatan manual dari pukul 22:00 sampai 06:00 keesokan harinya.
+- Membuat kegiatan AI tanpa tenggat.
+- Membuat kegiatan AI dengan tenggat.
+- Memastikan tenggat yang dinonaktifkan tidak diisi otomatis.
+- Memastikan kegiatan dengan tenggat yang tidak mungkin dipenuhi tidak menghasilkan status sukses palsu.
+
+### B. Scheduler
+
+- Kegiatan tetap tidak dipindahkan oleh AI.
+- Tidak ada dua kegiatan yang bertabrakan tanpa penanganan konflik yang eksplisit.
+- Preferensi waktu malam tidak otomatis berubah menjadi siang.
+- Pembagian sesi mempertahankan total durasi.
+- Kegiatan tanpa tenggat tetap bisa dijadwalkan.
+- Scheduler menangani shift malam dan rentang kerja lintas tengah malam.
+
+### C. Kalender
+
+- Grid menampilkan 01:00 sampai 24:00.
+- Kegiatan 30 menit memiliki ukuran yang sesuai.
+- Kegiatan 2 jam memiliki posisi dan tinggi yang benar.
+- Kegiatan 22:00 sampai 06:00 ditampilkan pada dua tanggal yang tepat.
+- Kegiatan beberapa hari tidak salah membentang ke kolom yang tidak terkait.
+- Event yang berakhir tepat pada tengah malam tidak digambar ganda.
+- Event pada tanggal 25 Oktober tidak berubah posisi akibat perhitungan zona waktu atau pengelompokan hari.
+
+### D. Pengaturan
+
+- Pengguna dapat mengatur shift malam.
+- Pengguna dapat menonaktifkan istirahat makan siang.
+- Pengaturan tetap tersimpan setelah aplikasi dimuat ulang.
+- Data preferensi lama tetap dapat digunakan.
+
+### E. Google Calendar
+
+- Kegagalan autentikasi tidak menghasilkan login palsu.
+- Event yang berhasil dibuat memiliki waktu yang benar.
+- Kegagalan API ditampilkan sebagai kegagalan, bukan keberhasilan.
+- Sinkronisasi ulang tidak membuat duplikasi jika mekanisme anti-duplikasi tersedia.
+
+### F. Kualitas aplikasi
+
+- Jalankan lint, typecheck, test, dan build sesuai skrip yang tersedia.
+- Perbaiki regresi yang ditemukan.
+- Pastikan tidak ada error baru yang disebabkan oleh revisi.
+- Periksa console browser untuk error runtime yang relevan.
+
+Jika suatu pengujian tidak dapat dijalankan, jelaskan alasannya. Jangan mengarang hasil pengujian.
+
+## 17. URUTAN PELAKSANAAN
+
+Kerjakan seluruh revisi dalam satu rangkaian implementasi, dengan urutan berikut:
+
+**Tahap 1:** Audit kode, tipe data, alur waktu, dan penyimpanan.
+
+**Tahap 2:** Perbaiki model waktu, rentang tanggal, tenggat opsional, dan kompatibilitas data.
+
+**Tahap 3:** Perbaiki scheduler, shift malam, istirahat opsional, dan penanganan konflik.
+
+**Tahap 4:** Perbaiki formulir mode manual dan AI.
+
+**Tahap 5:** Perbaiki kalender, posisi, tinggi kartu, serta tampilan kegiatan lintas hari.
+
+**Tahap 6:** Perbaiki integrasi Google Calendar dan autentikasi jika ditemukan masalah.
+
+**Tahap 7:** Pulihkan tipografi, konsistensi istilah, dan responsivitas UI.
+
+**Tahap 8:** Jalankan pengujian, perbaiki regresi, dan audit seluruh perubahan.
+
+Jangan berhenti setelah satu tahap hanya untuk memberikan laporan. Lanjutkan ke tahap berikutnya sampai seluruh ruang lingkup yang dapat diimplementasikan telah dikerjakan.
+
+Jika ada keputusan yang belum ditentukan, pilih solusi yang paling konsisten dengan arsitektur yang sudah ada, aman bagi data pengguna, dan paling sedikit mengganggu fitur yang sudah berfungsi. Jangan mengajukan pertanyaan untuk hal-hal yang dapat diselesaikan melalui pemeriksaan kode.
+
+## 18. LAPORAN AKHIR
+
+Setelah selesai, berikan laporan singkat tetapi spesifik yang memuat:
+
+1. File atau komponen yang diubah.
+2. Masalah yang ditemukan dan penyebab utamanya.
+3. Perbaikan yang benar-benar sudah diterapkan.
+4. Pengujian yang benar-benar dijalankan beserta hasilnya.
+5. Pengujian yang belum dapat dijalankan.
+6. Fitur atau masalah yang masih belum terselesaikan.
+7. Apakah ada migrasi data atau konfigurasi tambahan yang diperlukan.
+
+Jangan menyatakan semua fitur sudah sempurna hanya karena aplikasi berhasil dibuka atau build berhasil.
+
+## TARGET AKHIR
+
+Hasil akhir harus tetap menjadi EVEN AI Planner yang sudah ada, tetapi dengan:
+- Tipografi yang sesuai dengan desain sebelumnya.
+- Mode manual dan AI yang terpisah dengan jelas.
+- Tenggat waktu yang benar-benar opsional.
+- Dukungan kegiatan lintas tengah malam dan beberapa tanggal.
+- Scheduler yang mematuhi batasan waktu dan tidak membuat konflik secara diam-diam.
+- Pengaturan jam kerja 01:00 sampai 24:00 yang mendukung shift malam.
+- Waktu istirahat yang dapat dinonaktifkan.
+- Kalender 01:00 sampai 24:00 dengan posisi dan ukuran kartu yang sesuai durasi.
+- Kegiatan lintas hari yang dirender dengan benar.
+- Integrasi Google Calendar dan autentikasi yang tidak memberikan status sukses palsu.
+- Istilah "Kegiatan" yang konsisten pada antarmuka.
+- Kode yang konsisten, aman terhadap data lama, dan sudah diuji sejauh lingkungan memungkinkan.
+
+**Mulai dengan memeriksa proyek yang sedang terbuka, lalu langsung implementasikan revisi tersebut. Jangan mengganti proyek yang ada dengan aplikasi contoh atau membuat ulang aplikasi dari nol.**

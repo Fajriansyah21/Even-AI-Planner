@@ -45,10 +45,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
     },
     {
       id: 'tasks' as const,
-      label: 'Daftar Tugas',
+      label: 'Daftar Kegiatan',
       icon: CheckSquare,
       badge: pendingTasksCount > 0 ? pendingTasksCount : null,
-      subtitle: 'Durasi & Tenggat',
+      subtitle: 'Durasi & Jadwal',
     },
     {
       id: 'keep' as const,

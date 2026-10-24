@@ -68,10 +68,10 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <h2 className="text-xl sm:text-2xl font-bold text-[#172B42] font-editorial tracking-tight">
-              Daftar Tugas & Komitmen
+              Daftar Kegiatan & Komitmen
             </h2>
             <p className="text-xs text-[#53657A] mt-0.5">
-              Atur durasi, tenggat waktu, dan biarkan scheduler deterministik menempatkannya ke kalender.
+              Atur durasi, tenggat waktu opsional, dan biarkan scheduler deterministik menyusun jadwal realistis.
             </p>
           </div>
 
@@ -91,7 +91,7 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
               className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#2457A7] hover:bg-[#1E4889] rounded-xl transition-colors shadow-xs"
             >
               <Plus size={15} />
-              <span>Tambah Tugas</span>
+              <span>Tambah Kegiatan</span>
             </button>
           </div>
         </div>
@@ -145,7 +145,7 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
           {/* Search input */}
           <input
             type="text"
-            placeholder="Cari tugas..."
+            placeholder="Cari kegiatan..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full sm:w-48 px-3 py-1.5 text-xs rounded-xl border border-[#D9E3EF] bg-[#F8FAFC] focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
@@ -156,9 +156,9 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
         {filteredTasks.length === 0 ? (
           <div className="bg-white border border-[#D9E3EF] rounded-2xl p-10 text-center space-y-2">
             <Clock className="w-8 h-8 text-[#8DBCEB] mx-auto opacity-70" />
-            <h4 className="text-sm font-bold text-[#172B42]">Tidak ada tugas dalam kategori ini</h4>
+            <h4 className="text-sm font-bold text-[#172B42]">Tidak ada kegiatan dalam kategori ini</h4>
             <p className="text-xs text-[#53657A]">
-              Buat tugas baru dan tentukan durasi serta tenggat agar jadwal Anda selalu realistis.
+              Buat kegiatan baru dan tentukan durasi serta jadwal agar agenda Anda selalu realistis.
             </p>
           </div>
         ) : (
@@ -166,7 +166,8 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
             {filteredTasks.map((task) => {
               const isDone = task.status === 'COMPLETED';
               const pInfo = priorityStyles[task.priority];
-              const deadlineDate = new Date(task.deadlineAt);
+              const hasDl = Boolean(task.deadlineAt && task.deadlineAt.trim().length > 0);
+              const deadlineDate = hasDl && task.deadlineAt ? new Date(task.deadlineAt) : null;
 
               return (
                 <div
@@ -218,13 +219,15 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
                             <Calendar size={12} className="text-[#2457A7]" />
                             Tenggat:{' '}
                             <strong className="text-[#172B42]">
-                              {deadlineDate.toLocaleDateString('id-ID', {
-                                weekday: 'short',
-                                day: 'numeric',
-                                month: 'short',
-                                hour: '2-digit',
-                                minute: '2-digit',
-                              })}
+                              {deadlineDate && !isNaN(deadlineDate.getTime())
+                                ? deadlineDate.toLocaleDateString('id-ID', {
+                                    weekday: 'short',
+                                    day: 'numeric',
+                                    month: 'short',
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                  })
+                                : 'Tanpa tenggat'}
                             </strong>
                           </span>
 
@@ -278,7 +281,7 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
                       <button
                         onClick={() => onEditTask(task)}
                         className="p-1.5 text-[#53657A] hover:text-[#2457A7] rounded-lg hover:bg-slate-100 transition-colors"
-                        title="Ubah rincian tugas"
+                        title="Ubah rincian kegiatan"
                       >
                         <Edit2 size={15} />
                       </button>
@@ -286,7 +289,7 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
                       <button
                         onClick={() => onDeleteTask(task.id)}
                         className="p-1.5 text-[#53657A] hover:text-[#C43D4B] rounded-lg hover:bg-slate-100 transition-colors"
-                        title="Hapus tugas"
+                        title="Hapus kegiatan"
                       >
                         <Trash2 size={15} />
                       </button>

@@ -35,7 +35,7 @@ export interface Task {
   title: string;
   description?: string;
   estimatedDurationMinutes: number;
-  deadlineAt: string; // ISO date string
+  deadlineAt?: string | null; // ISO date string - strictly optional
   priority: Priority;
   status: TaskStatus;
   allowSplit: boolean;
@@ -44,6 +44,8 @@ export interface Task {
   timeConstraintType?: TimeConstraintType;
   requestedStartAt?: string; // ISO string for fixed event
   requestedEndAt?: string;   // ISO string for fixed event
+  isAllDay?: boolean;
+  category?: 'work' | 'personal' | 'study' | 'focus';
   preferredWindow?: PreferredTimeWindow;
   timezone?: string;
   createdAt: string;
@@ -72,8 +74,9 @@ export interface UserPreferences {
   displayName: string;
   email: string;
   timezone: string;
-  workStartHour: number; // e.g., 9
-  workEndHour: number;   // e.g., 18
+  workStartHour: number; // 1 to 24 (e.g. 9 or 22 for night shift)
+  workEndHour: number;   // 1 to 24 (e.g. 18 or 6 for next day)
+  enableLunchBreak: boolean; // Lunch break can be disabled
   lunchStartHour: number; // e.g., 12
   lunchEndHour: number;   // e.g., 13
   bufferMinutes: number;  // e.g., 15
@@ -88,6 +91,12 @@ export interface ScheduleCalculationResult {
   success: boolean;
   taskId: string;
   taskTitle: string;
+  failureCode?:
+    | 'TIME_CONFLICT'
+    | 'PREFERRED_WINDOW_FULL'
+    | 'NO_SLOT_BEFORE_DEADLINE'
+    | 'DEADLINE_PASSED'
+    | 'INVALID_TIME_RANGE';
   proposedSessions: {
     startAt: string;
     endAt: string;
@@ -97,6 +106,11 @@ export interface ScheduleCalculationResult {
   }[];
   explanation: string;
   warning?: string;
+  diagnostics?: {
+    freeTimeCalculatedMinutes?: number;
+    searchDaysLimit?: number;
+    isNightShift?: boolean;
+  };
 }
 
 export interface AIPlanDraft {
@@ -108,8 +122,9 @@ export interface AIPlanDraft {
   requestedEndAt?: string;               // ISO date string for fixed event
   preferredWindow?: PreferredTimeWindow; // Custom window e.g. 19:00 - 22:00
   preferredTimeOfDay: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY';
-  deadlineAt?: string;                   // ISO date string
-  deadlineDaysFromNow: number;
+  deadlineAt?: string | null;            // ISO date string (optional)
+  hasDeadline?: boolean;
+  deadlineDaysFromNow?: number;
   timezone: string;                      // e.g. 'Asia/Jakarta'
   priority: Priority;
   allowSplit: boolean;

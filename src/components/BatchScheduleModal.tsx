@@ -31,7 +31,7 @@ export const BatchScheduleModal: React.FC<BatchScheduleModalProps> = ({
           <div className="flex items-center gap-2">
             <Zap size={16} className="text-[#2457A7]" />
             <h3 className="text-base font-bold text-[#172B42]">
-              Hasil Penjadwalan Otomatis ({results.length} Tugas)
+              Hasil Penjadwalan Otomatis ({results.length} Kegiatan)
             </h3>
           </div>
           <button
@@ -47,12 +47,12 @@ export const BatchScheduleModal: React.FC<BatchScheduleModalProps> = ({
           <div className="grid grid-cols-2 gap-3 text-xs">
             <div className="p-3 bg-emerald-50 border border-[#16856B]/30 rounded-xl text-[#16856B] flex items-center gap-2 font-medium">
               <CheckCircle2 size={16} />
-              <span>{successCount} tugas berhasil dijadwalkan</span>
+              <span>{successCount} kegiatan berhasil dijadwalkan</span>
             </div>
             {failCount > 0 ? (
               <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-[#B86B12] flex items-center gap-2 font-medium">
                 <AlertTriangle size={16} />
-                <span>{failCount} tugas memerlukan penyesuaian</span>
+                <span>{failCount} kegiatan memerlukan penyesuaian</span>
               </div>
             ) : (
               <div className="p-3 bg-[#EAF3FC] border border-[#8DBCEB]/50 rounded-xl text-[#2457A7] flex items-center gap-2 font-medium">

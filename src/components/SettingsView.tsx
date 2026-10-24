@@ -66,10 +66,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 }) => {
   const [displayName, setDisplayName] = useState(preferences.displayName);
   const [timezone, setTimezone] = useState(preferences.timezone);
-  const [workStartHour, setWorkStartHour] = useState(preferences.workStartHour);
-  const [workEndHour, setWorkEndHour] = useState(preferences.workEndHour);
-  const [lunchStartHour, setLunchStartHour] = useState(preferences.lunchStartHour);
-  const [lunchEndHour, setLunchEndHour] = useState(preferences.lunchEndHour);
+  const [workStartHour, setWorkStartHour] = useState(preferences.workStartHour ?? 9);
+  const [workEndHour, setWorkEndHour] = useState(preferences.workEndHour ?? 18);
+  const [enableLunchBreak, setEnableLunchBreak] = useState(preferences.enableLunchBreak !== false);
+  const [lunchStartHour, setLunchStartHour] = useState(preferences.lunchStartHour ?? 12);
+  const [lunchEndHour, setLunchEndHour] = useState(preferences.lunchEndHour ?? 13);
   const [bufferMinutes, setBufferMinutes] = useState(preferences.bufferMinutes);
   const [workDays, setWorkDays] = useState<number[]>(preferences.workDays);
   const [allowAutoSplit, setAllowAutoSplit] = useState(preferences.allowAutoSplit);
@@ -102,6 +103,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       timezone,
       workStartHour: Number(workStartHour),
       workEndHour: Number(workEndHour),
+      enableLunchBreak,
       lunchStartHour: Number(lunchStartHour),
       lunchEndHour: Number(lunchEndHour),
       bufferMinutes: Number(bufferMinutes),
@@ -368,7 +370,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               Integrasi Google Keep
             </h3>
             <p className="text-xs text-[#53657A] leading-relaxed">
-              Catatan ide dan daftar periksa Keep Anda tersinkronisasi dua arah dengan tugas kalender di EVEN. Anda dapat mengekspor atau mengubah catatan menjadi sesi terjadwal kapan saja di tab <strong>Google Keep</strong>.
+              Catatan ide dan daftar periksa Keep Anda tersinkronisasi dua arah dengan kegiatan kalender di EVEN. Anda dapat mengekspor atau mengubah catatan menjadi sesi terjadwal kapan saja di tab <strong>Google Keep</strong>.
             </p>
           </div>
 
@@ -376,7 +378,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-4">
             <h3 className="text-sm font-bold text-[#172B42] flex items-center gap-2">
               <Clock size={16} className="text-[#2457A7]" />
-              Zona Waktu & Jam Ketersediaan
+              Zona Waktu & Jam Ketersediaan (01:00 - 24:00)
             </h3>
 
             <div>
@@ -395,7 +397,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </select>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+            {/* Work Start & End (01:00 to 24:00) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
               <div>
                 <label className="block text-xs font-semibold text-[#172B42] mb-1">
                   Mulai Kerja
@@ -403,10 +406,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <select
                   value={workStartHour}
                   onChange={(e) => setWorkStartHour(Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm"
+                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white"
                 >
-                  {[7, 8, 9, 10].map((h) => (
-                    <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                  {Array.from({ length: 24 }, (_, i) => i + 1).map((h) => (
+                    <option key={h} value={h}>
+                      {String(h).padStart(2, '0')}:00 {h === 24 ? '(Tengah Malam)' : ''}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -418,48 +423,103 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <select
                   value={workEndHour}
                   onChange={(e) => setWorkEndHour(Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm"
+                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white"
                 >
-                  {[16, 17, 18, 19, 20, 21].map((h) => (
-                    <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                  {Array.from({ length: 24 }, (_, i) => i + 1).map((h) => (
+                    <option key={h} value={h}>
+                      {String(h).padStart(2, '0')}:00 {h === 24 ? '(Tengah Malam Akhir Hari)' : ''}
+                    </option>
                   ))}
                 </select>
               </div>
+            </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                  Makan Siang
-                </label>
-                <select
-                  value={lunchStartHour}
-                  onChange={(e) => {
-                    const start = Number(e.target.value);
-                    setLunchStartHour(start);
-                    setLunchEndHour(start + 1);
-                  }}
-                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm"
-                >
-                  <option value={11}>11:00 - 12:00</option>
-                  <option value={12}>12:00 - 13:00</option>
-                  <option value={13}>13:00 - 14:00</option>
-                </select>
+            {/* Night shift indicator */}
+            {workEndHour < workStartHour && (
+              <div className="p-3 bg-indigo-50 border border-indigo-200 rounded-xl text-xs text-indigo-900 flex items-center gap-2">
+                <Clock size={15} className="text-indigo-600 shrink-0" />
+                <span>
+                  <strong>Shift Malam Aktif:</strong> Jam kerja Anda melintasi tengah malam dari pukul {String(workStartHour).padStart(2, '0')}:00 hingga {String(workEndHour).padStart(2, '0')}:00 keesokan harinya. Perencana jadwal tidak akan memaksakan kegiatan ke jam siang.
+                </span>
               </div>
+            )}
 
-              <div>
-                <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                  Buffer Antar Sesi
-                </label>
-                <select
-                  value={bufferMinutes}
-                  onChange={(e) => setBufferMinutes(Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm"
-                >
-                  <option value={0}>0 menit</option>
-                  <option value={10}>10 menit</option>
-                  <option value={15}>15 menit</option>
-                  <option value={30}>30 menit</option>
-                </select>
-              </div>
+            {/* Lunch break configuration */}
+            <div className="p-3.5 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl space-y-3">
+              <label className="flex items-center justify-between cursor-pointer">
+                <div>
+                  <span className="text-xs font-semibold text-[#172B42] block">
+                    Waktu Istirahat Makan Siang
+                  </span>
+                  <span className="text-[11px] text-[#53657A]">
+                    Bila dinonaktifkan, scheduler tidak akan membuat jeda istirahat otomatis.
+                  </span>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={enableLunchBreak}
+                  onChange={(e) => setEnableLunchBreak(e.target.checked)}
+                  className="w-4 h-4 text-[#2457A7] rounded-sm focus:ring-[#2457A7]"
+                />
+              </label>
+
+              {enableLunchBreak ? (
+                <div className="grid grid-cols-2 gap-3 pt-2 border-t border-[#D9E3EF]/70">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-[#172B42] mb-1">
+                      Mulai Istirahat
+                    </label>
+                    <select
+                      value={lunchStartHour}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        setLunchStartHour(val);
+                        if (lunchEndHour <= val) setLunchEndHour(val + 1);
+                      }}
+                      className="w-full px-3 py-1.5 rounded-xl border border-[#D9E3EF] text-xs bg-white"
+                    >
+                      {Array.from({ length: 24 }, (_, i) => i + 1).map((h) => (
+                        <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-[#172B42] mb-1">
+                      Selesai Istirahat
+                    </label>
+                    <select
+                      value={lunchEndHour}
+                      onChange={(e) => setLunchEndHour(Number(e.target.value))}
+                      className="w-full px-3 py-1.5 rounded-xl border border-[#D9E3EF] text-xs bg-white"
+                    >
+                      {Array.from({ length: 24 }, (_, i) => i + 1).map((h) => (
+                        <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-xs text-[#53657A] italic">
+                  Tidak ada istirahat — Jam kerja penuh tanpa blok jeda otomatis.
+                </div>
+              )}
+            </div>
+
+            {/* Buffer between sessions */}
+            <div>
+              <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                Jeda Waktu (Buffer) Antar Kegiatan
+              </label>
+              <select
+                value={bufferMinutes}
+                onChange={(e) => setBufferMinutes(Number(e.target.value))}
+                className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white"
+              >
+                <option value={0}>0 menit</option>
+                <option value={10}>10 menit</option>
+                <option value={15}>15 menit (Disarankan)</option>
+                <option value={30}>30 menit</option>
+              </select>
             </div>
 
             {/* Workdays */}
