@@ -1,12 +1,10 @@
-'use client';
-
 import React, { useState, useEffect } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { CalendarView } from './components/CalendarView';
 import { TaskListView } from './components/TaskListView';
 import { AIAssistantView } from './components/AIAssistantView';
-import { SettingsView } from './components/SettingsView';
+import { SettingsView, CalendarDiagnosticInfo } from './components/SettingsView';
 import { KeepNotesView } from './components/KeepNotesView';
 import { AuthModal } from './components/AuthModal';
 import { OnboardingModal } from './components/OnboardingModal';
@@ -105,6 +103,20 @@ export default function App() {
   // Sync state
   const [isSyncing, setIsSyncing] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+  const [diagnosticInfo, setDiagnosticInfo] = useState<CalendarDiagnosticInfo>({
+    connectionStatus: 'unconnected',
+    accountEmail: null,
+    targetCalendar: 'primary',
+    queryRangeStart: '',
+    queryRangeEnd: '',
+    queryTimezone: 'Asia/Jakarta (WIB)',
+    lastSyncedAt: null,
+    eventsGoogleCount: 0,
+    eventsLocalCount: 0,
+    eventsCreatedCount: 0,
+    eventsFailedCount: 0,
+    eventsUnconfirmedCount: 0,
+  });
 
   // Destructive Confirmation Modal state
   const [confirmModal, setConfirmModal] = useState<{
@@ -218,6 +230,7 @@ export default function App() {
   };
 
   const handleConnectCalendar = async () => {
+    setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'connecting' }));
     try {
       const res = await googleSignIn();
       if (res && res.accessToken) {
@@ -231,14 +244,24 @@ export default function App() {
           email: res.user.email || prev.email,
           displayName: res.user.displayName || prev.displayName,
         }));
+        setDiagnosticInfo((prev) => ({
+          ...prev,
+          connectionStatus: 'connected_unsynced',
+          accountEmail: res.user.email || prev.accountEmail,
+        }));
         showToast('Google Calendar berhasil dihubungkan!', 'success');
-        // Immediately sync live events
         await handleSyncCalendar();
       }
     } catch (err: any) {
       if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
+        setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'unconnected' }));
         showToast('Penghubungan Google Calendar dibatalkan.', 'info');
       } else {
+        setDiagnosticInfo((prev) => ({
+          ...prev,
+          connectionStatus: 'sync_failed',
+          lastErrorMessage: err.message,
+        }));
         showToast(`Gagal menghubungkan Google Calendar: ${err.message}`, 'error');
       }
     }
@@ -252,12 +275,18 @@ export default function App() {
       googleCalendarConnected: false,
       calendarSyncStatus: 'pending',
     }));
+    setDiagnosticInfo((prev) => ({
+      ...prev,
+      connectionStatus: 'unconnected',
+      lastErrorMessage: undefined,
+    }));
     showToast('Hubungan Google Calendar telah diputuskan.', 'info');
   };
 
   // Google Calendar Sync
   const handleSyncCalendar = async () => {
     setIsSyncing(true);
+    setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'syncing' }));
     const token = getCachedAccessToken();
 
     if (!token) {
@@ -267,18 +296,27 @@ export default function App() {
         calendarSyncStatus: 'needs_reconciliation',
         googleCalendarConnected: false,
       }));
+      setDiagnosticInfo((prev) => ({
+        ...prev,
+        connectionStatus: 'needs_reauth',
+        lastErrorMessage: 'Token Google Calendar tidak aktif. Silakan hubungkan akun Google Calendar di Pengaturan.',
+      }));
       showToast('Token Google Calendar tidak aktif. Silakan klik Hubungkan Kalender di Pengaturan.', 'error');
       return;
     }
 
     try {
-      const liveGoogleEvents = await fetchGoogleCalendarEvents(token);
+      const { events: liveGoogleEvents, rangeStart, rangeEnd } = await fetchGoogleCalendarEvents(token);
+      
       // Merge live Google events with internal task sessions
       setEvents((prev) => {
         const internalEvents = prev.filter((e) => e.provider !== 'google');
         return [...liveGoogleEvents, ...internalEvents];
       });
+
       const updatedTime = new Date().toISOString();
+      const localScheduledCount = tasks.filter((t) => t.status === 'SCHEDULED').length;
+
       setPreferences((prev) => ({
         ...prev,
         calendarSyncStatus: 'synced',
@@ -286,19 +324,43 @@ export default function App() {
         googleCalendarConnected: true,
       }));
 
+      setDiagnosticInfo((prev) => ({
+        ...prev,
+        connectionStatus: 'sync_success',
+        accountEmail: preferences.email,
+        targetCalendar: 'primary',
+        queryRangeStart: rangeStart,
+        queryRangeEnd: rangeEnd,
+        queryTimezone: preferences.timezone,
+        lastSyncedAt: updatedTime,
+        eventsGoogleCount: liveGoogleEvents.length,
+        eventsLocalCount: localScheduledCount,
+        lastErrorMessage: undefined,
+      }));
+
       if (liveGoogleEvents.length === 0) {
-        showToast('Sinkronisasi selesai: 0 agenda ditemukan di Google Calendar.', 'info');
+        showToast('Sinkronisasi selesai: 0 agenda ditemukan di rentang Google Calendar.', 'info');
       } else {
         showToast(`Sinkronisasi Google Calendar berhasil! Dimuat ${liveGoogleEvents.length} agenda.`);
       }
     } catch (err: any) {
       console.error('Calendar sync error:', err.message);
-      const isAuthError = err.message.includes('401') || err.message.includes('403') || err.message.includes('Token');
+      const isAuthError = err.message.includes('401') || err.message.includes('Token');
+      const isForbidden = err.message.includes('403');
+      const nextStatus = isAuthError ? 'needs_reauth' : 'sync_failed';
+
       setPreferences((prev) => ({
         ...prev,
         calendarSyncStatus: 'failed',
         googleCalendarConnected: isAuthError ? false : prev.googleCalendarConnected,
       }));
+
+      setDiagnosticInfo((prev) => ({
+        ...prev,
+        connectionStatus: nextStatus,
+        lastErrorMessage: err.message,
+      }));
+
       showToast(`Gagal menyinkronkan Google Calendar: ${err.message}`, 'error');
     } finally {
       setIsSyncing(false);
@@ -326,25 +388,29 @@ export default function App() {
   // Task creation/update
   const handleSaveTask = async (taskData: Omit<Task, 'id' | 'createdAt' | 'status' | 'scheduledSessions'>) => {
     const currentUserId = userId || 'user-default';
-    if (taskToEdit) {
+    const isEditingExisting = Boolean(taskToEdit && taskToEdit.id && taskToEdit.id.trim().length > 0);
+
+    if (isEditingExisting && taskToEdit && taskToEdit.id) {
+      const editTaskId = taskToEdit.id.trim();
       const updatedTask: Task = {
         ...taskToEdit,
         ...taskData,
+        id: editTaskId,
         userId: currentUserId,
         status: 'UNSCHEDULED',
         scheduledSessions: [],
       };
       setTasks((prev) =>
-        prev.map((t) => (t.id === taskToEdit.id ? updatedTask : t))
+        prev.map((t) => (t.id === editTaskId ? updatedTask : t))
       );
       showToast(`Tugas "${taskData.title}" berhasil diperbarui.`);
 
-      // Persist to Firestore if user is authenticated
-      if (userId && userId !== 'user-default') {
+      // Persist to Firestore if user is authenticated and document id is valid
+      if (userId && userId !== 'user-default' && editTaskId) {
         try {
-          await setDoc(doc(db, 'users', userId, 'tasks', taskToEdit.id), sanitizeForFirestore(updatedTask));
+          await setDoc(doc(db, 'users', userId, 'tasks', editTaskId), sanitizeForFirestore(updatedTask));
         } catch (err) {
-          handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskToEdit.id}`);
+          handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${editTaskId}`);
         }
       }
     } else {
@@ -360,8 +426,8 @@ export default function App() {
       setTasks((prev) => [newTask, ...prev]);
       showToast(`Tugas baru "${newTask.title}" berhasil dibuat.`);
 
-      // Persist to Firestore if user is authenticated
-      if (userId && userId !== 'user-default') {
+      // Persist to Firestore if user is authenticated and document id is valid
+      if (userId && userId !== 'user-default' && newTaskId) {
         try {
           await setDoc(doc(db, 'users', userId, 'tasks', newTaskId), sanitizeForFirestore(newTask));
         } catch (err) {
@@ -525,6 +591,9 @@ export default function App() {
     const updatedSessions: TaskScheduleSession[] = [];
     const newCalendarEvents: CalendarEvent[] = [];
 
+    let unconfirmedCount = 0;
+    let failCount = 0;
+
     for (const sess of initialSessions) {
       try {
         const created = await createGoogleCalendarEvent(token, {
@@ -532,12 +601,14 @@ export default function App() {
           description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
           startAt: sess.startAt,
           endAt: sess.endAt,
+          timezone: preferences.timezone,
         });
 
         const syncedSess = {
           ...sess,
           syncStatus: 'synced' as const,
           googleCalendarEventId: created.id,
+          htmlLink: created.htmlLink,
         };
         updatedSessions.push(syncedSess);
         newCalendarEvents.push({
@@ -547,6 +618,7 @@ export default function App() {
           description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions}`,
           startAt: sess.startAt,
           endAt: sess.endAt,
+          htmlLink: created.htmlLink,
           isEditable: false,
           syncStatus: 'synced',
           category: 'focus',
@@ -554,12 +626,24 @@ export default function App() {
         successCount++;
       } catch (err: any) {
         console.error('Single schedule Google push error:', err.message);
+        if (err.message?.includes('tidak dapat dikonfirmasi')) {
+          unconfirmedCount++;
+        } else {
+          failCount++;
+        }
         updatedSessions.push({
           ...sess,
           syncStatus: 'failed' as const,
         });
       }
     }
+
+    setDiagnosticInfo((prev) => ({
+      ...prev,
+      eventsCreatedCount: prev.eventsCreatedCount + successCount,
+      eventsFailedCount: prev.eventsFailedCount + failCount,
+      eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
+    }));
 
     let finalTaskObj: Task | null = null;
     setTasks((prev) =>
@@ -688,6 +772,8 @@ export default function App() {
 
     // Google Calendar active write
     let successCount = 0;
+    let failCount = 0;
+    let unconfirmedCount = 0;
     const updatedSessions: TaskScheduleSession[] = [];
     const newCalendarEvents: CalendarEvent[] = [];
 
@@ -698,12 +784,14 @@ export default function App() {
           description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
           startAt: sess.startAt,
           endAt: sess.endAt,
+          timezone: plan.timezone || preferences.timezone,
         });
 
         updatedSessions.push({
           ...sess,
           syncStatus: 'synced' as const,
           googleCalendarEventId: created.id,
+          htmlLink: created.htmlLink,
         });
 
         newCalendarEvents.push({
@@ -713,6 +801,7 @@ export default function App() {
           description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
           startAt: sess.startAt,
           endAt: sess.endAt,
+          htmlLink: created.htmlLink,
           isEditable: false,
           syncStatus: 'synced',
           category: 'focus',
@@ -720,12 +809,24 @@ export default function App() {
         successCount++;
       } catch (err: any) {
         console.error('AI Calendar event push error:', err.message);
+        if (err.message?.includes('tidak dapat dikonfirmasi')) {
+          unconfirmedCount++;
+        } else {
+          failCount++;
+        }
         updatedSessions.push({
           ...sess,
           syncStatus: 'failed' as const,
         });
       }
     }
+
+    setDiagnosticInfo((prev) => ({
+      ...prev,
+      eventsCreatedCount: prev.eventsCreatedCount + successCount,
+      eventsFailedCount: prev.eventsFailedCount + failCount,
+      eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
+    }));
 
     const newTask: Task = {
       id: taskId,
@@ -808,7 +909,7 @@ export default function App() {
   const handleConvertNoteToTask = (note: KeepNote) => {
     const candidate = convertKeepNoteToTask(note);
     setTaskToEdit({
-      id: '',
+      id: `task-keep-${note.id}-${Date.now()}`,
       userId: 'user-default',
       title: candidate.title || 'Tugas Baru',
       description: candidate.description,
@@ -1052,6 +1153,7 @@ export default function App() {
               hasGoogleAccessToken={hasGoogleAccessToken}
               onConnectCalendar={handleConnectCalendar}
               onDisconnectCalendar={handleDisconnectCalendar}
+              diagnosticInfo={diagnosticInfo}
             />
           )}
         </main>

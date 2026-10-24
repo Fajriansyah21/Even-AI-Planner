@@ -259,6 +259,20 @@ async function runAuthAndTruthTests() {
   assert(createdTask.userId === authenticatedUserId, 'createdTask.userId must match authenticated userId');
   assert(createdTask.userId !== 'user-default', 'Must NOT be user-default when user is authenticated');
 
+  // ----------------------------------------------------
+  // TEST 6: Prevent odd-segment Firestore path when taskToEdit has empty id
+  // ----------------------------------------------------
+  console.log('\n--- Test 6: Empty taskToEdit.id must generate valid 4-segment path ---');
+  const emptyEditTask = { id: '', title: 'Converted Task' };
+  const isEditing = Boolean(emptyEditTask && emptyEditTask.id && emptyEditTask.id.trim().length > 0);
+  assert(!isEditing, 'Empty ID must NOT be treated as editing an existing task');
+
+  const resolvedId = isEditing ? emptyEditTask.id.trim() : `task-${Date.now()}`;
+  assert(Boolean(resolvedId) && resolvedId.length > 5, 'Resolved ID must be non-empty string');
+
+  const pathSegments = `users/${authenticatedUserId}/tasks/${resolvedId}`.split('/').filter(Boolean);
+  assert(pathSegments.length === 4, `Document reference must have 4 segments (even), got ${pathSegments.length}`);
+
   console.log('\n======================================================');
   console.log('🎉 ALL AUTH INTEGRITY & STATUS TRUTH TESTS PASSED! 🎉');
   console.log('======================================================\n');

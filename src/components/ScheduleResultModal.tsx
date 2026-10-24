@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, CheckCircle2, AlertTriangle, Calendar, Clock, Check, ArrowRight } from 'lucide-react';
+import { X, CheckCircle2, AlertTriangle, Calendar, Clock, Check, ArrowRight, ShieldAlert } from 'lucide-react';
 import { ScheduleCalculationResult } from '../types';
 
 interface ScheduleResultModalProps {
@@ -7,6 +7,23 @@ interface ScheduleResultModalProps {
   result: ScheduleCalculationResult | null;
   onClose: () => void;
   onConfirmSchedule: (result: ScheduleCalculationResult) => void;
+}
+
+function getFailureCodeBadge(code?: string) {
+  switch (code) {
+    case 'TIME_CONFLICT':
+      return { label: 'Konflik Waktu Tetap', color: 'bg-red-50 text-[#C43D4B] border-red-200' };
+    case 'PREFERRED_WINDOW_FULL':
+      return { label: 'Jendela Waktu Penuh', color: 'bg-amber-50 text-[#B86B12] border-amber-200' };
+    case 'NO_SLOT_BEFORE_DEADLINE':
+      return { label: 'Tidak Ada Slot Sebelum Tenggat', color: 'bg-amber-50 text-[#B86B12] border-amber-200' };
+    case 'DEADLINE_PASSED':
+      return { label: 'Tenggat Waktu Lewat', color: 'bg-red-50 text-[#C43D4B] border-red-200' };
+    case 'INVALID_TIME_RANGE':
+      return { label: 'Rentang Waktu Tidak Valid', color: 'bg-red-50 text-[#C43D4B] border-red-200' };
+    default:
+      return { label: 'Perlu Penyesuaian', color: 'bg-slate-50 text-[#53657A] border-slate-200' };
+  }
 }
 
 export const ScheduleResultModal: React.FC<ScheduleResultModalProps> = ({
@@ -17,6 +34,8 @@ export const ScheduleResultModal: React.FC<ScheduleResultModalProps> = ({
 }) => {
   if (!isOpen || !result) return null;
 
+  const failureBadge = !result.success ? getFailureCodeBadge(result.failureCode) : null;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
       <div 
@@ -26,9 +45,14 @@ export const ScheduleResultModal: React.FC<ScheduleResultModalProps> = ({
       >
         <div className="px-6 py-4 flex items-center justify-between border-b border-[#D9E3EF]">
           <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-[#EAF3FC] text-[#2457A7]">
+            <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-[#EAF3FC] text-[#2457A7]">
               Kalkulasi Deterministik
             </span>
+            {failureBadge && (
+              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${failureBadge.color}`}>
+                {failureBadge.label}
+              </span>
+            )}
           </div>
           <button
             onClick={onClose}
@@ -40,6 +64,9 @@ export const ScheduleResultModal: React.FC<ScheduleResultModalProps> = ({
 
         <div className="p-6 space-y-4">
           <div>
+            <span className="text-[11px] font-semibold text-[#53657A] uppercase tracking-wider block mb-0.5">
+              Judul Kegiatan:
+            </span>
             <h3 className="text-base font-bold text-[#172B42]">
               {result.taskTitle}
             </h3>
@@ -50,7 +77,7 @@ export const ScheduleResultModal: React.FC<ScheduleResultModalProps> = ({
               <div className="p-3 bg-emerald-50 border border-[#16856B]/30 rounded-xl flex items-start gap-2.5 text-xs text-[#16856B]">
                 <CheckCircle2 size={16} className="shrink-0 mt-0.5" />
                 <div>
-                  <span className="font-bold block">Slot Kalender Ditemukan!</span>
+                  <span className="font-bold block">Slot Kalender Terkonfirmasi!</span>
                   <p className="mt-0.5 text-slate-700 leading-relaxed">
                     {result.explanation}
                   </p>
@@ -106,7 +133,11 @@ export const ScheduleResultModal: React.FC<ScheduleResultModalProps> = ({
               <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2.5 text-xs text-[#B86B12]">
                 <AlertTriangle size={18} className="shrink-0 mt-0.5" />
                 <div>
-                  <span className="font-bold block">Tidak Ada Slot yang Memenuhi Tenggat</span>
+                  <span className="font-bold block">
+                    {result.failureCode === 'TIME_CONFLICT'
+                      ? 'Benturan Jadwal Terdeteksi'
+                      : 'Slot Waktu Tidak Tersedia'}
+                  </span>
                   <p className="mt-1 text-slate-700 leading-relaxed">
                     {result.explanation}
                   </p>
@@ -117,6 +148,15 @@ export const ScheduleResultModal: React.FC<ScheduleResultModalProps> = ({
                 <div className="p-3 bg-slate-50 border border-[#D9E3EF] rounded-xl text-xs text-[#53657A]">
                   <strong className="text-[#172B42] block mb-0.5">Saran Tindakan:</strong>
                   {result.warning}
+                </div>
+              )}
+
+              {result.diagnostics && result.diagnostics.freeTimeCalculatedMinutes !== undefined && (
+                <div className="p-2.5 bg-[#F8FAFC] border border-[#D9E3EF] rounded-lg text-[11px] text-[#53657A] flex items-center justify-between">
+                  <span>Waktu luang terdeteksi pada rentang ini:</span>
+                  <span className="font-mono font-semibold text-[#172B42]">
+                    {result.diagnostics.freeTimeCalculatedMinutes} menit
+                  </span>
                 </div>
               )}
             </div>

@@ -1,20 +1,26 @@
 import { Task, CalendarEvent, UserPreferences, ScheduleCalculationResult } from '../types';
+import {
+  parseTimezoneString,
+  getPartsInTimezone,
+  createIsoInTimezone,
+  formatInTimezone,
+} from './timezone';
 
 interface TimeInterval {
   start: Date;
   end: Date;
 }
 
-function formatIndonesianDate(d: Date): string {
-  return d.toLocaleDateString('id-ID', {
+function formatIndonesianDate(d: Date, tz: string = 'Asia/Jakarta'): string {
+  return formatInTimezone(d, tz, {
     weekday: 'long',
     day: 'numeric',
     month: 'short',
   });
 }
 
-function formatTime(d: Date): string {
-  return d.toLocaleTimeString('id-ID', {
+function formatTime(d: Date, tz: string = 'Asia/Jakarta'): string {
+  return formatInTimezone(d, tz, {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
@@ -25,9 +31,10 @@ function formatTime(d: Date): string {
  * Deterministic Scheduler Engine for EVEN
  * Strictly respects:
  * 1. Fixed events: Cannot be shifted; placed precisely at requestedStartAt - requestedEndAt; checks collisions.
- * 2. Preferred time windows: Evening (19:00-23:00) or user-specified windows outside or inside standard work hours.
- * 3. Never confuses night (e.g. 21:00) with morning (09:00).
+ * 2. Preferred time windows: Evening (19:00-23:00) or user-specified windows.
+ * 3. Never confuses night (e.g. 21:00) with morning (05:00 or 09:00).
  * 4. Deterministic non-overlapping slot allocation with buffers and split session support.
+ * 5. Timezone-aware slot generation (Asia/Jakarta default).
  */
 export function scheduleTaskDeterministically(
   task: Task,
@@ -37,10 +44,13 @@ export function scheduleTaskDeterministically(
   referenceDate: Date = new Date()
 ): ScheduleCalculationResult {
   const durationNeeded = task.estimatedDurationMinutes || 60;
-  
+  const userTz = parseTimezoneString(task.timezone || preferences.timezone || 'Asia/Jakarta');
+
   // -------------------------------------------------------------
   // 1. HARD CONSTRAINT: FIXED COMMITMENT (fixed_event)
   // -------------------------------------------------------------
+  // CRITICAL: A task is ONLY a fixed event if its timeConstraintType is explicitly 'fixed_event'!
+  // A preferred_window task with an accidental requestedStartAt MUST NEVER be treated as fixed_event!
   const isFixedEvent =
     task.timeConstraintType === 'fixed_event' &&
     Boolean(task.requestedStartAt) &&
@@ -70,7 +80,7 @@ export function scheduleTaskDeterministically(
           taskId: task.id,
           taskTitle: task.title,
           proposedSessions: [],
-          explanation: `Konflik jadwal: Komitmen tetap (${formatTime(fixedStart)} - ${formatTime(fixedEnd)}) bertabrakan dengan acara kalender "${evt.title}" (${formatTime(eStart)} - ${formatTime(eEnd)}). Komitmen waktu tetap tidak dapat digeser secara otomatis.`,
+          explanation: `Konflik jadwal: Komitmen tetap (${formatTime(fixedStart, userTz)} - ${formatTime(fixedEnd, userTz)}) bertabrakan dengan acara kalender "${evt.title}" (${formatTime(eStart, userTz)} - ${formatTime(eEnd, userTz)}). Komitmen waktu tetap tidak dapat digeser secara otomatis.`,
           warning: 'Silakan sesuaikan jam komitmen atau pindahkan acara yang bertabrakan di Google Calendar.',
         };
       }
@@ -90,7 +100,7 @@ export function scheduleTaskDeterministically(
                 taskId: task.id,
                 taskTitle: task.title,
                 proposedSessions: [],
-                explanation: `Konflik jadwal: Komitmen tetap bertabrakan dengan tugas "${t.title}" sesi ${s.sessionIndex} (${formatTime(sStart)} - ${formatTime(sEnd)}).`,
+                explanation: `Konflik jadwal: Komitmen tetap bertabrakan dengan tugas "${t.title}" sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)}).`,
                 warning: 'Jadwal waktu tetap memerlukan slot kosong tanpa tabrakan tugas lain.',
               };
             }
@@ -101,8 +111,8 @@ export function scheduleTaskDeterministically(
 
     // No collision found! Place fixed event precisely
     const fixedDuration = Math.round((fixedEnd.getTime() - fixedStart.getTime()) / 60000);
-    const dayStr = formatIndonesianDate(fixedStart);
-    const timeStr = `${formatTime(fixedStart)} - ${formatTime(fixedEnd)}`;
+    const dayStr = formatIndonesianDate(fixedStart, userTz);
+    const timeStr = `${formatTime(fixedStart, userTz)} - ${formatTime(fixedEnd, userTz)}`;
 
     return {
       success: true,
@@ -126,10 +136,9 @@ export function scheduleTaskDeterministically(
   // -------------------------------------------------------------
   let deadline = new Date(task.deadlineAt);
   if (isNaN(deadline.getTime())) {
-    // If deadline is invalid, default to 3 days ahead at 23:59
-    deadline = new Date(referenceDate);
-    deadline.setDate(deadline.getDate() + 3);
-    deadline.setHours(23, 59, 59, 999);
+    deadline = new Date(referenceDate.getTime() + 3 * 86400000);
+    const dParts = getPartsInTimezone(deadline, userTz);
+    deadline = new Date(createIsoInTimezone(dParts.year, dParts.month, dParts.day, 23, 59, 59, userTz));
   }
 
   if (deadline.getTime() <= referenceDate.getTime()) {
@@ -138,7 +147,7 @@ export function scheduleTaskDeterministically(
       taskId: task.id,
       taskTitle: task.title,
       proposedSessions: [],
-      explanation: `Tenggat waktu (${formatIndonesianDate(deadline)}, ${formatTime(deadline)}) sudah lewat dari waktu saat ini.`,
+      explanation: `Tenggat waktu (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)}) sudah lewat dari waktu saat ini.`,
     };
   }
 
@@ -170,38 +179,36 @@ export function scheduleTaskDeterministically(
 
   busyWindows.sort((a, b) => a.start.getTime() - b.start.getTime());
 
-  // Build candidate days from referenceDate up to deadline (max 14 days)
+  // Build candidate days in target timezone
   const maxSearchDays = 14;
-  const candidateDays: Date[] = [];
+  const candidateDays: { year: number; month: number; day: number; dayOfWeek: number }[] = [];
   const searchStart = new Date(referenceDate);
-  searchStart.setSeconds(0, 0);
 
   for (let d = 0; d < maxSearchDays; d++) {
-    const day = new Date(searchStart);
-    day.setDate(day.getDate() + d);
-    day.setHours(0, 0, 0, 0);
-
-    const dayOfWeek = day.getDay();
-    // Allow weekends if user requested specific preferred window or if today is weekend
+    const dayObj = new Date(searchStart.getTime() + d * 86400000);
+    const parts = getPartsInTimezone(dayObj, userTz);
     const isPreferredWindowSpecified =
-      Boolean(task.preferredWindow) || task.preferredTimeOfDay === 'EVENING';
+      Boolean(task.preferredWindow) || task.preferredTimeOfDay === 'EVENING' || task.preferredTimeOfDay === 'MORNING';
 
-    if (preferences.workDays.includes(dayOfWeek) || (isPreferredWindowSpecified && d === 0)) {
-      candidateDays.push(day);
+    if (preferences.workDays.includes(parts.dayOfWeek) || (isPreferredWindowSpecified && d <= 1)) {
+      candidateDays.push(parts);
     }
   }
 
   // Determine user preferred time window (if any)
-  // CRITICAL: If task mentions evening / malam (e.g. 19:00 - 23:00), never restrict it to 09:00-18:00!
   const hasEveningPref =
     task.preferredTimeOfDay === 'EVENING' ||
     (task.preferredWindow && task.preferredWindow.startHour >= 18);
+
+  const hasMorningPref =
+    task.preferredTimeOfDay === 'MORNING' ||
+    (task.preferredWindow && task.preferredWindow.endHour <= 12);
 
   const preferredWindowStartHour = task.preferredWindow
     ? task.preferredWindow.startHour
     : hasEveningPref
     ? 19
-    : task.preferredTimeOfDay === 'MORNING'
+    : hasMorningPref
     ? 8
     : task.preferredTimeOfDay === 'AFTERNOON'
     ? 13
@@ -211,13 +218,13 @@ export function scheduleTaskDeterministically(
     ? task.preferredWindow.endHour
     : hasEveningPref
     ? 23
-    : task.preferredTimeOfDay === 'MORNING'
+    : hasMorningPref
     ? 12
     : task.preferredTimeOfDay === 'AFTERNOON'
     ? 18
     : null;
 
-  // Helper to subtract busy windows from an interval
+  // Helper to extract free blocks
   const extractFreeBlocks = (segments: TimeInterval[]): TimeInterval[] => {
     const free: TimeInterval[] = [];
 
@@ -269,11 +276,27 @@ export function scheduleTaskDeterministically(
     const preferredSegments: TimeInterval[] = [];
 
     for (const day of candidateDays) {
-      const pStart = new Date(day);
-      pStart.setHours(preferredWindowStartHour, task.preferredWindow?.startMinute || 0, 0, 0);
+      const pStartIso = createIsoInTimezone(
+        day.year,
+        day.month,
+        day.day,
+        preferredWindowStartHour,
+        task.preferredWindow?.startMinute || 0,
+        0,
+        userTz
+      );
+      const pEndIso = createIsoInTimezone(
+        day.year,
+        day.month,
+        day.day,
+        preferredWindowEndHour,
+        task.preferredWindow?.endMinute || 0,
+        0,
+        userTz
+      );
 
-      const pEnd = new Date(day);
-      pEnd.setHours(preferredWindowEndHour, task.preferredWindow?.endMinute || 0, 0, 0);
+      const pStart = new Date(pStartIso);
+      const pEnd = new Date(pEndIso);
 
       if (pEnd > pStart) {
         preferredSegments.push({ start: pStart, end: pEnd });
@@ -282,15 +305,15 @@ export function scheduleTaskDeterministically(
 
     const preferredFreeBlocks = extractFreeBlocks(preferredSegments);
 
-    // Try contiguous fit in preferred window
+    // Contiguous fit in preferred window
     for (const block of preferredFreeBlocks) {
       const blockDuration = (block.end.getTime() - block.start.getTime()) / 60000;
       if (blockDuration >= durationNeeded) {
         const slotStart = new Date(block.start);
         const slotEnd = new Date(slotStart.getTime() + durationNeeded * 60000);
 
-        const dayStr = formatIndonesianDate(slotStart);
-        const timeStr = `${formatTime(slotStart)} - ${formatTime(slotEnd)}`;
+        const dayStr = formatIndonesianDate(slotStart, userTz);
+        const timeStr = `${formatTime(slotStart, userTz)} - ${formatTime(slotEnd, userTz)}`;
         const windowDesc = task.preferredWindow?.label || (hasEveningPref ? 'malam' : 'pilihan');
 
         return {
@@ -311,7 +334,7 @@ export function scheduleTaskDeterministically(
       }
     }
 
-    // Try split sessions within preferred windows if allowed
+    // Split sessions in preferred window if allowed
     if (task.allowSplit) {
       const minSession = task.minimumSessionMinutes || 30;
       let remainingMinutes = durationNeeded;
@@ -350,43 +373,40 @@ export function scheduleTaskDeterministically(
           taskId: task.id,
           taskTitle: task.title,
           proposedSessions: splitSessions,
-          explanation: `Tugas dipecah menjadi ${total} sesi realistis di jendela waktu ${task.preferredWindow?.label || 'malam'} yang diminta. Sesi pertama mulai ${formatIndonesianDate(new Date(first.startAt))}, pukul ${formatTime(new Date(first.startAt))} WIB.`,
+          explanation: `Tugas dipecah menjadi ${total} sesi realistis di jendela waktu ${task.preferredWindow?.label || 'malam'} yang diminta. Sesi pertama mulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
         };
       }
     }
   }
 
-  // If task has explicit evening preference or preferred window, do NOT silently fall back to standard daytime work hours!
-  if (hasEveningPref || task.timeConstraintType === 'preferred_window') {
-    const windowName = task.preferredWindow?.label || 'malam (19:00 - 23:00)';
+  // If task has explicit evening preference or preferred window, do NOT silently fall back to daytime work hours!
+  if (hasEveningPref || task.timeConstraintType === 'preferred_window' || hasMorningPref) {
+    const windowName = task.preferredWindow?.label || (hasEveningPref ? 'malam (19:00 - 23:00)' : 'pagi (06:00 - 12:00)');
     return {
       success: false,
       taskId: task.id,
       taskTitle: task.title,
       proposedSessions: [],
-      explanation: `Tidak ditemukan slot waktu luang yang mencukupi (${durationNeeded} menit) di jendela waktu ${windowName} sebelum tenggat waktu (${formatIndonesianDate(deadline)}, ${formatTime(deadline)}). Jadwal pada jendela waktu tersebut penuh atau terhalang agenda lain.`,
+      explanation: `Tidak ditemukan slot waktu luang yang mencukupi (${durationNeeded} menit) di jendela waktu ${windowName} sebelum tenggat waktu (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)}). Jadwal pada jendela waktu tersebut penuh atau terhalang agenda lain.`,
       warning: task.allowSplit
         ? 'Pertimbangkan untuk memperpanjang batas tenggat atau mengurangi durasi tugas.'
         : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau memperpanjang tenggat waktu.',
     };
   }
 
-  // Phase B: Standard Work Hours Search
-  // (09:00 - 18:00, excluding lunch)
+  // Phase B: Standard Work Hours Search (09:00 - 18:00, excluding lunch)
   const standardSegments: TimeInterval[] = [];
 
   for (const day of candidateDays) {
-    const workStart = new Date(day);
-    workStart.setHours(preferences.workStartHour, 0, 0, 0);
+    const workStartIso = createIsoInTimezone(day.year, day.month, day.day, preferences.workStartHour, 0, 0, userTz);
+    const workEndIso = createIsoInTimezone(day.year, day.month, day.day, preferences.workEndHour, 0, 0, userTz);
+    const lunchStartIso = createIsoInTimezone(day.year, day.month, day.day, preferences.lunchStartHour, 0, 0, userTz);
+    const lunchEndIso = createIsoInTimezone(day.year, day.month, day.day, preferences.lunchEndHour, 0, 0, userTz);
 
-    const workEnd = new Date(day);
-    workEnd.setHours(preferences.workEndHour, 0, 0, 0);
-
-    const lunchStart = new Date(day);
-    lunchStart.setHours(preferences.lunchStartHour, 0, 0, 0);
-
-    const lunchEnd = new Date(day);
-    lunchEnd.setHours(preferences.lunchEndHour, 0, 0, 0);
+    const workStart = new Date(workStartIso);
+    const workEnd = new Date(workEndIso);
+    const lunchStart = new Date(lunchStartIso);
+    const lunchEnd = new Date(lunchEndIso);
 
     standardSegments.push({ start: workStart, end: lunchStart });
     standardSegments.push({ start: lunchEnd, end: workEnd });
@@ -401,13 +421,8 @@ export function scheduleTaskDeterministically(
       const slotStart = new Date(block.start);
       const slotEnd = new Date(slotStart.getTime() + durationNeeded * 60000);
 
-      const dayStr = formatIndonesianDate(slotStart);
-      const timeStr = `${formatTime(slotStart)} - ${formatTime(slotEnd)}`;
-
-      const fallbackNote =
-        preferredWindowStartHour !== null
-          ? ' (Catatan: Jendela waktu malam/khusus yang diminta penuh atau tidak mencukupi, sehingga dialihkan ke jam kerja produktif terdekat).'
-          : '';
+      const dayStr = formatIndonesianDate(slotStart, userTz);
+      const timeStr = `${formatTime(slotStart, userTz)} - ${formatTime(slotEnd, userTz)}`;
 
       return {
         success: true,
@@ -422,7 +437,7 @@ export function scheduleTaskDeterministically(
             totalSessions: 1,
           },
         ],
-        explanation: `Ditemukan waktu fokus penuh ${durationNeeded} menit pada ${dayStr}, pukul ${timeStr} WIB.${fallbackNote}`,
+        explanation: `Ditemukan waktu fokus penuh ${durationNeeded} menit pada ${dayStr}, pukul ${timeStr} WIB.`,
       };
     }
   }
@@ -466,12 +481,12 @@ export function scheduleTaskDeterministically(
         taskId: task.id,
         taskTitle: task.title,
         proposedSessions: splitSessions,
-        explanation: `Tugas dipecah menjadi ${total} sesi realistis (total ${durationNeeded} menit). Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt))}, pukul ${formatTime(new Date(first.startAt))} WIB.`,
+        explanation: `Tugas dipecah menjadi ${total} sesi realistis (total ${durationNeeded} menit). Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
       };
     }
   }
 
-  // Phase C: If all fail, return transparent Indonesian failure explanation
+  // Phase C: Transparent Indonesian failure explanation
   const totalFreeAvailable = standardFreeBlocks.reduce(
     (acc, b) => acc + (b.end.getTime() - b.start.getTime()) / 60000,
     0
@@ -482,7 +497,7 @@ export function scheduleTaskDeterministically(
     taskId: task.id,
     taskTitle: task.title,
     proposedSessions: [],
-    explanation: `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit) sebelum tenggat (${formatIndonesianDate(deadline)}, ${formatTime(deadline)}). Total waktu luang tersisa di kalender Anda hanya ${Math.round(totalFreeAvailable)} menit.`,
+    explanation: `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit) sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)}). Total waktu luang tersisa di kalender Anda hanya ${Math.round(totalFreeAvailable)} menit.`,
     warning: task.allowSplit
       ? 'Pertimbangkan untuk memperpanjang tenggat atau mengurangi durasi tugas.'
       : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau memperpanjang tenggat waktu.',
@@ -491,7 +506,6 @@ export function scheduleTaskDeterministically(
 
 /**
  * Batch schedules multiple tasks deterministically by priority, hard constraints, and deadline.
- * Fixed events and urgent tasks are scheduled first to guarantee non-displacement.
  */
 export function scheduleAllPendingTasks(
   tasks: Task[],
@@ -507,7 +521,6 @@ export function scheduleAllPendingTasks(
     LOW: 1,
   };
 
-  // Sort: Fixed events FIRST (score 100), then priority, then earliest deadline
   const sortedPending = [...pending].sort((a, b) => {
     const isFixedA = a.timeConstraintType === 'fixed_event' ? 100 : 0;
     const isFixedB = b.timeConstraintType === 'fixed_event' ? 100 : 0;

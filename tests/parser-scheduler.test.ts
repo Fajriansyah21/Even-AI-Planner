@@ -1,3 +1,5 @@
+process.env.TZ = 'Asia/Jakarta';
+
 import { parseIndonesianTemporalRules } from '../src/lib/temporalParser';
 import { scheduleTaskDeterministically } from '../src/lib/scheduler';
 import { Task, CalendarEvent, UserPreferences } from '../src/types';

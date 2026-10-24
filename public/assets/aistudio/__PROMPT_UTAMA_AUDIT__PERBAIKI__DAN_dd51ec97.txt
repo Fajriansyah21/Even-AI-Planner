@@ -1,0 +1,429 @@
+# PROMPT UTAMA: AUDIT, PERBAIKI, DAN UJI SELURUH BUG EVEN AI PLANNER
+
+Bertindaklah sebagai senior software engineer yang bertanggung jawab memperbaiki aplikasi **EVEN AI Planner** secara menyeluruh. Jangan hanya memberikan saran, contoh kode, atau daftar perubahan. Periksa kode proyek yang tersedia, lakukan perubahan langsung pada file yang relevan, jalankan pemeriksaan yang dapat dilakukan, dan laporkan hasilnya secara jujur.
+
+Repositori proyek:
+https://github.com/Fajriansyah21/Even-AI-Planner
+
+## 1. ATURAN ARSITEKTUR WAJIB
+
+**Gunakan React, bukan Next.js.**
+
+Target arsitektur:
+- Frontend: React dengan TypeScript.
+- Build tool frontend: Vite.
+- Routing frontend: React Router jika routing diperlukan.
+- Backend: gunakan backend yang kompatibel, seperti Express dengan TypeScript, hanya jika fitur membutuhkan server.
+- Integrasi Google Calendar dan Firebase harus tetap berfungsi.
+- Integrasi Gemini API harus tetap berfungsi tanpa mengekspos API key di browser.
+- Pertahankan desain, identitas visual, fitur, dan alur penggunaan EVEN yang sudah ada.
+
+Larangan:
+- Jangan menggunakan Next.js.
+- Jangan menggunakan Next.js App Router, Next.js Pages Router, `next/server`, atau API route khusus Next.js.
+- Jangan mempertahankan `app/api/.../route.ts` sebagai backend Next.js. Pindahkan logika backend yang diperlukan ke backend yang kompatibel, misalnya Express, atau gunakan layanan backend yang memang sudah tersedia.
+- Jangan sekadar mengganti nama file Next.js menjadi file React. Sesuaikan implementasi, routing, konfigurasi, environment variables, dan deployment.
+- Jangan menghapus fitur lama hanya untuk mempermudah migrasi.
+- Jangan menulis ulang seluruh aplikasi jika perbaikan terarah sudah cukup.
+- Jangan menyatakan migrasi selesai sebelum memeriksa `package.json`, konfigurasi build, dependensi, entry point, routing, dan seluruh pemanggilan API.
+
+Jika lingkungan Google AI Studio tidak memberikan akses untuk mengubah repositori GitHub secara langsung, kerjakan file yang tersedia di workspace. Jika ada file atau akses yang tidak tersedia, jelaskan batasannya. Jangan mengaku telah mengubah atau menguji file yang sebenarnya tidak dapat diakses.
+
+## 2. AUDIT PROYEK SEBELUM MENGUBAH KODE
+
+Periksa struktur proyek dan pahami alur data terlebih dahulu.
+
+Minimal audit file atau modul berikut jika tersedia:
+- `src/components/AuthModal.tsx`
+- `src/lib/firebase.ts`
+- `src/lib/googleCalendar.ts`
+- `src/lib/temporalParser.ts`
+- `src/lib/scheduler.ts`
+- `src/App.tsx`
+- `src/components/SettingsView.tsx`
+- `app/api/gemini/plan/route.ts`
+- konfigurasi `package.json`, TypeScript, Vite, testing, dan environment variables.
+
+Nama dan lokasi file dapat berbeda. Cari implementasi yang benar berdasarkan fungsi, bukan mengasumsikan semua file pasti sama dengan daftar ini.
+
+Sebelum mengubah kode:
+1. Telusuri alur autentikasi pengguna.
+2. Telusuri alur pembuatan rencana AI sampai menjadi jadwal.
+3. Telusuri alur penulisan dan pembacaan Google Calendar.
+4. Identifikasi bagaimana status koneksi, status sinkronisasi, dan identitas akun ditentukan.
+5. Identifikasi semua lokasi yang memproses tanggal, zona waktu, jendela waktu, dan batasan jadwal.
+6. Catat risiko regresi dan buat rencana pengujian.
+
+Jangan mengandalkan status visual UI sebagai bukti bahwa backend atau Google API benar-benar berhasil.
+
+## 3. PERBAIKI BUG PENJADWALAN WAKTU MALAM
+
+### Masalah
+
+Parser waktu dapat mengenali kata "malam" sebagai jendela waktu sekitar pukul 19.00 sampai 23.00. Namun, model AI bisa mengembalikan `requestedStartAt` dan `requestedEndAt` yang keliru, misalnya pukul 05.00.
+
+Validasi hasil AI saat ini tidak selalu membuang waktu yang keliru. Scheduler kemudian dapat memperlakukan waktu tersebut sebagai jadwal tetap karena kedua properti waktu terisi.
+
+### Perbaikan wajib
+
+1. Jadikan batasan waktu eksplisit dari pengguna sebagai sumber kebenaran utama.
+2. Hasil Gemini harus dianggap sebagai usulan, bukan fakta yang tidak boleh dikoreksi.
+3. Bedakan dengan jelas:
+   - Jadwal dengan waktu pasti, seperti "rapat pukul 20.00".
+   - Tugas fleksibel dengan preferensi waktu, seperti "belajar malam".
+   - Tugas dengan deadline.
+   - Tugas yang boleh dipecah menjadi beberapa sesi.
+4. Jika pengguna hanya menyebut "malam" tanpa jam pasti, jangan mengubahnya menjadi jadwal tetap pada pukul 05.00.
+5. Jika parser menentukan tugas fleksibel dengan jendela malam, jangan membiarkan `requestedStartAt` atau `requestedEndAt` hasil AI yang bertentangan mengubahnya menjadi `fixed_event`.
+6. Validasi hasil AI terhadap hasil parser sebelum menyerahkannya ke scheduler.
+7. Pastikan waktu mulai lebih awal daripada waktu selesai dan durasi valid.
+8. Jangan menggunakan `new Date()` atau metode tanggal lokal tanpa mempertimbangkan zona waktu pengguna.
+9. Gunakan zona waktu pengguna secara konsisten. Untuk pengguna Indonesia, dukung setidaknya `Asia/Jakarta`, serta jangan mengasumsikan zona waktu server sama dengan zona waktu pengguna.
+10. Jangan mengubah jadwal fleksibel menjadi jadwal pagi hanya karena jendela malam penuh. Jika tidak ada slot yang sesuai, tampilkan kegagalan penjadwalan yang jelas atau minta persetujuan pengguna untuk alternatif.
+11. Jangan mengubah waktu tetap yang secara eksplisit diberikan pengguna, kecuali ada konflik valid yang dijelaskan kepada pengguna.
+12. Pastikan tanggal juga benar. Jangan sampai waktu malam pada satu tanggal berubah menjadi pagi pada tanggal yang sama atau hari berikutnya tanpa alasan yang valid.
+
+### Buat pengujian untuk kasus berikut
+
+- "Tidur malam" tidak dijadwalkan pukul 05.00.
+- "Belajar malam selama 2 jam" ditempatkan di jendela malam yang tersedia.
+- "Tidur pukul 22.00" mempertahankan waktu pasti yang diminta.
+- "Rapat besok pukul 20.00 sampai 21.00" mempertahankan tanggal dan waktu yang benar.
+- "Olahraga pagi" tidak dialihkan ke malam tanpa persetujuan.
+- Jendela malam penuh tidak menyebabkan tugas diam-diam dipindahkan ke jam kerja.
+- Jadwal melintasi tengah malam ditangani dengan benar.
+- Hasil Gemini yang bertentangan dengan parser ditolak atau dikoreksi secara deterministik.
+- Tanggal dan waktu tetap benar pada zona waktu `Asia/Jakarta`.
+
+## 4. HAPUS JALUR LOGIN GOOGLE PALSU
+
+### Masalah
+
+Di `AuthModal.tsx`, terdapat jalur fallback yang memanggil `onSuccess()` menggunakan nama dan email bawaan ketika autentikasi gagal. Ini dapat membuat UI menganggap login berhasil tanpa kredensial yang valid.
+
+### Perbaikan wajib
+
+1. Hapus seluruh fallback yang membuat login terlihat berhasil tanpa autentikasi nyata.
+2. Jangan menggunakan email atau nama pengguna hard-coded sebagai bukti login.
+3. Hanya tandai pengguna berhasil login setelah Firebase atau mekanisme autentikasi yang digunakan benar-benar mengonfirmasi keberhasilan.
+4. Jika popup ditutup pengguna, tangani sebagai pembatalan, bukan login sukses.
+5. Jika konfigurasi OAuth salah, tampilkan pesan yang relevan.
+6. Jika akses ditolak, tampilkan pesan yang relevan.
+7. Jangan menelan exception dengan `catch` kosong.
+8. Jangan menyimpan status login palsu di state, local storage, atau konteks aplikasi.
+9. Pastikan pengguna yang belum terautentikasi tidak memperoleh akses ke fungsi yang memerlukan identitas atau token.
+10. Pisahkan identitas Firebase dari identitas akun Google Calendar. Login ke aplikasi tidak otomatis berarti Google Calendar sudah terhubung.
+
+Uji login sukses, login dibatalkan, popup gagal, konfigurasi salah, dan kredensial tidak tersedia. Kegagalan harus tetap menjadi kegagalan yang terlihat dengan jelas.
+
+## 5. PERBAIKI GOOGLE CALENDAR CREATE DAN READ
+
+Periksa implementasi pembuatan, pembacaan, penghapusan, dan sinkronisasi event.
+
+### A. Pembuatan event
+
+Setiap event yang dikirim ke Google Calendar harus:
+- Memiliki judul yang valid.
+- Memiliki waktu mulai dan selesai yang valid.
+- Menggunakan format tanggal dan waktu yang sesuai.
+- Menghormati zona waktu pengguna.
+- Memakai token akses yang sah.
+- Ditujukan ke kalender yang benar.
+
+Setelah POST ke Google Calendar:
+1. Periksa `response.ok`.
+2. Tangani respons non-2xx sebagai kegagalan.
+3. Parse JSON dengan aman.
+4. Validasi bahwa respons memiliki `id` event yang tidak kosong.
+5. Jika tersedia, simpan `htmlLink` untuk membuka event di Google Calendar.
+6. Jangan membuat event lokal seolah-olah sudah tersinkron jika Google API gagal.
+7. Jangan menetapkan status `synced` sebelum respons Google tervalidasi.
+8. Jika respons sukses tetapi tidak memiliki ID yang valid, perlakukan hasil sebagai tidak terkonfirmasi. Jangan mengklaim sinkronisasi berhasil.
+9. Pastikan semua alur pembuatan event, termasuk penjadwalan tunggal dan penerapan rencana AI, menggunakan validasi yang sama.
+10. Cegah duplikasi event jika pengguna mengulangi operasi akibat timeout atau respons yang tidak pasti. Gunakan strategi idempotensi yang benar-benar didukung oleh implementasi Google Calendar API, dan jangan mengasumsikan Google otomatis mencegah duplikasi.
+
+### B. Pembacaan event
+
+1. Periksa `response.ok` sebelum membaca hasil.
+2. Tangani pagination secara benar.
+3. Tangani event yang dibatalkan dan event sepanjang hari.
+4. Jangan menggabungkan event dari akun atau kalender berbeda tanpa identitas yang jelas.
+5. Validasi batas tanggal pencarian.
+6. Tampilkan pesan berbeda untuk daftar kosong, kegagalan autentikasi, izin ditolak, dan gangguan jaringan.
+7. Jangan menandai sinkronisasi sukses jika permintaan gagal.
+8. Jika rentang waktu yang diminta tidak mencakup tanggal event, jelaskan rentang tersebut, bukan menyimpulkan event tidak ada di Google Calendar.
+
+### C. Penanganan HTTP 401 dan 403
+
+Buat penanganan yang konsisten untuk operasi READ, CREATE, dan DELETE.
+
+- `401 Unauthorized`: jelaskan bahwa token tidak valid, kedaluwarsa, atau autentikasi perlu diperbarui. Arahkan pengguna untuk menyambungkan kembali akun.
+- `403 Forbidden`: jelaskan bahwa akses ditolak. Periksa izin, OAuth scopes, kebijakan akun, dan apakah API atau resource yang dibutuhkan tersedia.
+- Kesalahan jaringan: jelaskan bahwa server tidak dapat dihubungi.
+- Respons tidak valid: jelaskan bahwa hasil dari Google tidak dapat diverifikasi.
+- Kesalahan lainnya: tampilkan pesan aman dan informatif tanpa membocorkan token atau informasi sensitif.
+
+Jangan menganggap setiap `403` pasti disebabkan oleh token kedaluwarsa. Bedakan berdasarkan kode dan isi respons yang tersedia.
+
+Jangan menampilkan access token, refresh token, API key, atau kredensial di log maupun pesan kepada pengguna.
+
+## 6. PASTIKAN STATUS SINKRONISASI AKURAT
+
+Buat satu mekanisme status yang konsisten. Bedakan setidaknya:
+
+- Belum terhubung.
+- Sedang menghubungkan.
+- Terhubung, tetapi belum melakukan sinkronisasi.
+- Sedang menyinkronkan.
+- Sinkronisasi berhasil.
+- Sinkronisasi gagal.
+- Perlu autentikasi ulang.
+- Hasil operasi belum dapat dikonfirmasi.
+
+Ketentuan:
+
+1. Status koneksi tidak boleh ditentukan hanya dari nilai boolean lokal.
+2. Status seperti "Live API Token Aktif" tidak boleh dianggap sebagai bukti bahwa token masih valid di Google API.
+3. Jangan menetapkan `googleCalendarConnected = true` hanya karena tombol koneksi diklik atau token pernah tersedia.
+4. Jangan menetapkan status `synced` sebelum hasil operasi terverifikasi.
+5. Jangan menghapus event lokal secara otomatis hanya karena pembacaan Google gagal.
+6. Jangan menampilkan data demo atau data lokal seolah-olah berasal dari Google Calendar.
+7. Jika aplikasi memakai cache, bedakan data cache dari data hasil sinkronisasi terbaru.
+8. Pastikan perubahan status konsisten di halaman utama, pengaturan, dan dialog autentikasi.
+
+Periksa pula mekanisme token setelah halaman dimuat ulang. Jika token akses hanya tersedia di memori dan hilang setelah reload, rancang pemulihan autentikasi yang aman sesuai dukungan Firebase dan Google OAuth. Jangan menyimpan token sensitif di local storage hanya untuk mengatasi masalah tersebut.
+
+## 7. TAMPILKAN AKUN, RENTANG TANGGAL, DAN JUMLAH EVENT
+
+Tambahkan informasi diagnostik yang berguna di bagian Google Calendar pada pengaturan atau panel sinkronisasi.
+
+Tampilkan:
+- Status koneksi Google Calendar.
+- Akun Google yang benar-benar digunakan untuk sinkronisasi, jika identitasnya dapat diverifikasi.
+- Kalender target, misalnya `primary`, beserta nama atau ID kalender jika tersedia.
+- Rentang tanggal yang sedang dibaca.
+- Waktu sinkronisasi terakhir.
+- Jumlah event yang diterima dari Google.
+- Jumlah event lokal yang akan atau telah dikirim.
+- Jumlah event yang berhasil dibuat, gagal dibuat, atau belum terkonfirmasi.
+- Pesan kesalahan yang dapat dipahami pengguna.
+
+Ketentuan:
+1. Jangan menampilkan email hard-coded sebagai akun aktif.
+2. Jangan menyamakan akun Firebase dengan akun Google Calendar tanpa verifikasi.
+3. Jangan menyebut jumlah event sebagai jumlah seluruh event di akun jika yang dibaca hanya rentang tanggal terbatas.
+4. Tampilkan rentang tanggal secara eksplisit beserta zona waktunya.
+5. Jika daftar kosong, jelaskan rentang yang diperiksa dan berikan tindakan berikutnya.
+6. Berikan akses ke `htmlLink` event yang berhasil dibuat jika URL tersedia.
+7. Jangan menampilkan token atau kredensial dalam panel diagnostik.
+
+## 8. PERBAIKI INTEGRASI GEMINI TANPA MEMBOCORKAN API KEY
+
+Audit seluruh pemanggilan Gemini API, termasuk pembuatan rencana dan suggestion chips.
+
+1. Identifikasi penyebab respons `401` dan `403` secara terpisah.
+2. Pastikan API key hanya berada di sisi server.
+3. Jangan menaruh secret dalam variabel frontend dengan awalan `VITE_` atau variabel lain yang diekspos ke browser.
+4. Pastikan konfigurasi environment terdokumentasi.
+5. Jika backend saat ini menggunakan route Next.js, pindahkan logikanya ke backend non-Next.js yang sesuai, misalnya Express.
+6. Validasi input dan output AI.
+7. Jangan mempercayai hasil AI tanpa validasi aturan waktu dan skema data.
+8. Jika Gemini gagal, tampilkan kegagalan yang jelas. Jangan mengembalikan hasil palsu seolah-olah permintaan berhasil.
+9. Bedakan masalah konfigurasi API key, izin, kuota, rate limit, dan jaringan jika informasi respons memungkinkan.
+10. Tambahkan pengujian untuk respons sukses, respons error, JSON tidak valid, dan output yang melanggar batasan waktu.
+
+## 9. AUDIT DAN PERBAIKI KOMPONEN SETTINGS
+
+Periksa `SettingsView.tsx` dan semua mekanisme koneksi Google Calendar.
+
+- Jangan menganggap perubahan toggle lokal sebagai koneksi Google yang nyata.
+- Tombol koneksi harus menjalankan alur autentikasi yang benar.
+- Tombol sinkronisasi harus menjalankan permintaan nyata dan menunggu hasilnya.
+- Tombol putuskan koneksi harus memperbarui status dengan benar.
+- Jangan menghapus event Google Calendar saat pengguna hanya memutuskan koneksi, kecuali pengguna secara eksplisit meminta penghapusan.
+- Jangan menampilkan pesan sukses sebelum operasi selesai.
+- Pastikan loading, error, empty state, dan success state ditampilkan secara konsisten.
+- Pastikan semua kontrol benar-benar menjalankan aksi yang sesuai.
+
+## 10. TESTING WAJIB
+
+Tambahkan atau perbaiki pengujian sesuai test framework yang digunakan. Jika belum ada, gunakan Vitest untuk proyek React/Vite dan alat pengujian yang sesuai untuk backend.
+
+Buat pengujian unit dan integrasi untuk:
+
+### Autentikasi
+- Login sukses.
+- Login gagal.
+- Popup dibatalkan.
+- Token tidak tersedia.
+- Sesi dimuat ulang.
+- Login aplikasi tidak otomatis dianggap sebagai koneksi Google Calendar.
+
+### Penjadwalan
+- Tugas malam tidak bergeser menjadi pukul 05.00.
+- Jadwal dengan jam eksplisit tetap benar.
+- Output Gemini yang salah ditolak atau dikoreksi.
+- Jendela waktu penuh tidak memindahkan tugas diam-diam.
+- Zona waktu dan tanggal tetap benar.
+
+### Google Calendar
+- GET sukses dengan event.
+- GET sukses tanpa event.
+- GET gagal dengan 401.
+- GET gagal dengan 403.
+- POST sukses dengan ID valid.
+- POST gagal.
+- POST sukses tetapi JSON tidak memiliki ID.
+- DELETE sukses dan gagal.
+- Respons jaringan timeout.
+- Pagination.
+- Event sepanjang hari.
+- Event dibatalkan.
+- Rentang tanggal yang tidak mencakup event.
+- Token tidak valid atau kedaluwarsa.
+
+### Status UI
+- Status tidak berubah menjadi sukses sebelum operasi selesai.
+- Kegagalan tidak disamarkan sebagai sukses.
+- Akun, kalender, rentang tanggal, dan jumlah event sesuai data yang sebenarnya.
+
+Gunakan mock API pada pengujian otomatis. Jangan mengirim event nyata ke akun pengguna selama pengujian otomatis biasa.
+
+## 11. PENGUJIAN INTEGRASI GOOGLE CALENDAR YANG NYATA
+
+Buat opsi pengujian integrasi terpisah yang dapat dijalankan secara sengaja oleh developer dengan akun Google pengujian.
+
+Alur yang diharapkan:
+1. Pastikan kredensial dan izin yang diperlukan tersedia.
+2. Catat kalender target dan identitas akun pengujian.
+3. Buat event uji dengan judul unik, misalnya `[EVEN TEST] Calendar Integration`.
+4. Validasi respons Google dan pastikan ID event valid.
+5. Baca ulang kalender target menggunakan rentang tanggal yang mencakup event.
+6. Pastikan event uji ditemukan berdasarkan ID atau identitas unik yang tepat.
+7. Validasi judul, waktu mulai, waktu selesai, dan zona waktu.
+8. Hapus event uji jika penghapusan memang diaktifkan dalam konfigurasi pengujian.
+9. Laporkan hasil setiap langkah.
+
+Keamanan pengujian:
+- Jangan pernah memakai akun pribadi pengguna sebagai target default untuk pengujian destruktif.
+- Gunakan akun atau kalender pengujian khusus.
+- Pengujian yang membuat atau menghapus event nyata harus memerlukan opt-in eksplisit.
+- Simpan secret di environment server yang aman.
+- Jangan menulis token ke log.
+- Jika kredensial Google tidak tersedia, tandai pengujian sebagai `SKIPPED` atau belum dijalankan.
+- Jangan mengklaim pengujian integrasi nyata berhasil jika hanya menjalankan mock.
+
+## 12. MIGRASI DAN VALIDASI REACT/VITE
+
+Pastikan hasil akhir menggunakan React, bukan Next.js.
+
+Periksa dan sesuaikan:
+- `package.json`
+- `vite.config.ts`
+- `tsconfig.json`
+- entry point React
+- konfigurasi routing
+- konfigurasi build
+- pemanggilan API frontend
+- backend dan endpoint
+- konfigurasi environment
+- scripts untuk development, build, lint, dan test
+- instruksi deployment.
+
+Jika backend diperlukan, buat konfigurasi backend terpisah yang kompatibel dengan React/Vite, misalnya Express. Pastikan frontend dan backend dapat dijalankan serta dihubungkan dengan benar.
+
+Jangan mengasumsikan bahwa memindahkan frontend otomatis membuat semua endpoint berfungsi. Audit seluruh endpoint dan perbarui URL serta pemanggilannya.
+
+Periksa bahwa:
+- Tidak ada dependensi Next.js yang masih diperlukan.
+- Tidak ada import dari modul Next.js.
+- Tidak ada route handler Next.js yang masih menjadi satu-satunya implementasi backend.
+- API key dan secret tidak dikirim ke bundle frontend.
+- Build frontend berjalan.
+- Backend dapat dijalankan jika memang diperlukan.
+- Fitur autentikasi, Gemini, penjadwalan, dan Google Calendar tetap terintegrasi.
+
+Jangan menghapus konfigurasi deployment lama sebelum konfigurasi penggantinya siap dan telah diverifikasi.
+
+## 13. JANGAN MENGEJAR WARNING YANG TIDAK BERKAITAN
+
+Jangan menganggap semua pesan Console sebagai akar masalah.
+
+Prioritaskan:
+- Error HTTP 401 dan 403 yang berasal dari API relevan.
+- Kegagalan autentikasi.
+- Respons Google Calendar yang tidak valid.
+- Kesalahan pemrosesan waktu.
+- Error React atau TypeScript.
+- Kegagalan build dan test.
+
+Jangan membuang waktu memperbaiki warning Origin Trial, preload, iklan, ekstensi browser, atau `ERR_BLOCKED_BY_CLIENT` kecuali dapat dibuktikan bahwa pesan tersebut berhubungan langsung dengan bug aplikasi.
+
+HTTP 200 pada permintaan pembuatan event merupakan bukti bahwa permintaan tersebut berhasil di sisi Google untuk operasi itu. Namun, keberhasilan satu POST tidak membuktikan bahwa proses pembacaan, autentikasi setelah reload, rentang tanggal, dan seluruh alur sinkronisasi juga benar.
+
+## 14. STANDAR IMPLEMENTASI
+
+- Gunakan TypeScript dengan tipe yang jelas.
+- Hindari `any` jika tipe yang tepat dapat dibuat.
+- Hindari duplikasi logika penanganan error.
+- Buat fungsi bersama untuk validasi respons Google Calendar jika sesuai.
+- Gunakan pesan error yang aman dan dapat ditindaklanjuti.
+- Jangan menelan exception.
+- Jangan membuat data palsu untuk menyamarkan kegagalan.
+- Jangan mengubah UI atau perilaku yang tidak berkaitan tanpa alasan teknis.
+- Jangan menambahkan dependensi besar tanpa kebutuhan yang jelas.
+- Jangan menghapus fitur yang ada.
+- Perhatikan race condition saat pengguna melakukan sinkronisasi berulang.
+- Pastikan perubahan tidak menyebabkan event lokal hilang ketika Google API gagal.
+- Dokumentasikan perubahan arsitektur dan konfigurasi environment yang diperlukan.
+
+## 15. URUTAN PELAKSANAAN
+
+Kerjakan dengan urutan berikut:
+
+1. Audit kode dan dependensi yang benar-benar tersedia.
+2. Identifikasi akar masalah dan file yang harus diubah.
+3. Perbaiki autentikasi palsu.
+4. Perbaiki validasi waktu dan scheduler.
+5. Perbaiki Google Calendar read/write/delete dan penanganan error.
+6. Perbaiki status sinkronisasi serta informasi diagnostik.
+7. Perbaiki integrasi Gemini.
+8. Migrasikan bagian yang masih menggunakan Next.js ke arsitektur React/Vite dan backend non-Next.js.
+9. Tambahkan pengujian.
+10. Jalankan test, lint, type-check, dan build yang tersedia.
+11. Periksa regresi pada alur utama aplikasi.
+12. Buat ringkasan hasil beserta masalah yang masih tersisa.
+
+Jika ada langkah yang terhalang akses, konfigurasi, atau kredensial, lanjutkan bagian lain yang dapat dikerjakan. Jangan mengarang hasil pengujian atau menghentikan seluruh pekerjaan hanya karena pengujian integrasi nyata tidak bisa dijalankan.
+
+## 16. FORMAT LAPORAN AKHIR
+
+Setelah implementasi, berikan laporan dengan format:
+
+### A. Perubahan yang benar-benar dilakukan
+Sebutkan file yang diubah dan fungsi perubahannya.
+
+### B. Akar masalah
+Jelaskan mengapa bug terjadi dan bagaimana perubahan memperbaikinya.
+
+### C. Status arsitektur
+Nyatakan apakah aplikasi sudah menggunakan React/Vite dan apakah masih ada bagian Next.js. Jangan menyatakan selesai jika masih ada bagian yang belum dimigrasikan.
+
+### D. Hasil pengujian
+Buat tabel dengan kolom:
+- Pengujian.
+- Hasil: `PASS`, `FAIL`, atau `SKIPPED`.
+- Bukti atau alasan.
+
+Pisahkan pengujian unit, integrasi dengan mock, dan integrasi Google Calendar nyata.
+
+### E. Konfigurasi yang masih dibutuhkan
+Cantumkan environment variables, OAuth scopes, konfigurasi Firebase/Google Cloud, dan langkah manual yang memang diperlukan. Jangan mencantumkan nilai secret.
+
+### F. Risiko dan pekerjaan tersisa
+Tuliskan masalah yang belum terselesaikan, batasan akses, dan langkah yang masih harus dilakukan.
+
+### G. Cara menjalankan aplikasi
+Berikan perintah yang benar untuk menjalankan frontend React/Vite, backend jika ada, dan test.
+
+**Kriteria keberhasilan akhir:** EVEN tidak boleh menganggap login berhasil tanpa autentikasi nyata, tidak boleh menggeser tugas malam ke pukul 05.00 akibat output AI yang salah, tidak boleh mengklaim sinkronisasi berhasil tanpa respons Google yang valid, dan harus menggunakan React tanpa Next.js. Semua klaim keberhasilan harus didukung oleh kode yang diubah atau pengujian yang benar-benar dijalankan.

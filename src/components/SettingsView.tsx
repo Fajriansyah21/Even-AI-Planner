@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import {
   Calendar,
   Clock,
-  ShieldCheck,
   RefreshCw,
   CheckCircle2,
   AlertTriangle,
@@ -12,8 +11,35 @@ import {
   User,
   Database,
   StickyNote,
+  AlertCircle,
+  HelpCircle,
+  ExternalLink,
 } from 'lucide-react';
 import { UserPreferences } from '../types';
+
+export interface CalendarDiagnosticInfo {
+  connectionStatus:
+    | 'unconnected'
+    | 'connecting'
+    | 'connected_unsynced'
+    | 'syncing'
+    | 'sync_success'
+    | 'sync_failed'
+    | 'needs_reauth'
+    | 'unconfirmed';
+  accountEmail: string | null;
+  targetCalendar: string;
+  queryRangeStart: string;
+  queryRangeEnd: string;
+  queryTimezone: string;
+  lastSyncedAt: string | null;
+  eventsGoogleCount: number;
+  eventsLocalCount: number;
+  eventsCreatedCount: number;
+  eventsFailedCount: number;
+  eventsUnconfirmedCount: number;
+  lastErrorMessage?: string;
+}
 
 interface SettingsViewProps {
   preferences: UserPreferences;
@@ -24,6 +50,7 @@ interface SettingsViewProps {
   hasGoogleAccessToken: boolean;
   onConnectCalendar: () => void;
   onDisconnectCalendar: () => void;
+  diagnosticInfo?: CalendarDiagnosticInfo;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -35,6 +62,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   hasGoogleAccessToken,
   onConnectCalendar,
   onDisconnectCalendar,
+  diagnosticInfo,
 }) => {
   const [displayName, setDisplayName] = useState(preferences.displayName);
   const [timezone, setTimezone] = useState(preferences.timezone);
@@ -85,6 +113,54 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setTimeout(() => setSaveSuccess(false), 2500);
   };
 
+  // Status mapping
+  const statusConfig = {
+    unconnected: {
+      label: 'Belum Terhubung',
+      color: 'bg-slate-100 text-[#53657A] border-slate-200',
+      icon: AlertCircle,
+    },
+    connecting: {
+      label: 'Sedang Menghubungkan...',
+      color: 'bg-blue-50 text-[#2457A7] border-blue-200 animate-pulse',
+      icon: RefreshCw,
+    },
+    connected_unsynced: {
+      label: 'Terhubung (Belum Sinkron)',
+      color: 'bg-amber-50 text-[#B86B12] border-amber-200',
+      icon: AlertTriangle,
+    },
+    syncing: {
+      label: 'Sedang Menyinkronkan...',
+      color: 'bg-blue-50 text-[#2457A7] border-blue-200 animate-pulse',
+      icon: RefreshCw,
+    },
+    sync_success: {
+      label: 'Sinkronisasi Berhasil',
+      color: 'bg-emerald-50 text-[#16856B] border-emerald-200',
+      icon: CheckCircle2,
+    },
+    sync_failed: {
+      label: 'Sinkronisasi Gagal',
+      color: 'bg-red-50 text-[#C43D4B] border-red-200',
+      icon: AlertCircle,
+    },
+    needs_reauth: {
+      label: 'Perlu Autentikasi Ulang',
+      color: 'bg-orange-50 text-[#B86B12] border-orange-200',
+      icon: AlertTriangle,
+    },
+    unconfirmed: {
+      label: 'Hasil Belum Terkonfirmasi',
+      color: 'bg-amber-50 text-[#B86B12] border-amber-200',
+      icon: HelpCircle,
+    },
+  };
+
+  const currentStatus = diagnosticInfo?.connectionStatus || (hasGoogleAccessToken ? 'connected_unsynced' : 'unconnected');
+  const badgeConfig = statusConfig[currentStatus] || statusConfig.unconnected;
+  const BadgeIcon = badgeConfig.icon;
+
   return (
     <div className="flex-1 flex flex-col h-full bg-[#F8FAFC] overflow-y-auto p-4 sm:p-6">
       <div className="max-w-3xl mx-auto w-full space-y-6">
@@ -120,11 +196,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
               <div>
                 <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                  Email Akun Google
+                  Email Akun Terautentikasi
                 </label>
                 <input
                   type="email"
-                  value={preferences.email}
+                  value={preferences.email || 'Belum masuk'}
                   disabled
                   className="w-full px-3.5 py-2 rounded-xl border border-[#D9E3EF] bg-slate-50 text-sm text-[#53657A] cursor-not-allowed"
                 />
@@ -164,53 +240,94 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          {/* Google Calendar Integration Card */}
+          {/* Google Calendar Integration & Diagnostics Card */}
           <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-4">
-            <div className="flex items-start justify-between">
+            <div className="flex items-start justify-between flex-wrap gap-2">
               <div>
                 <h3 className="text-sm font-bold text-[#172B42] flex items-center gap-2">
                   <Calendar size={16} className="text-[#2457A7]" />
-                  Integrasi Google Calendar
+                  Integrasi Google Calendar & Panel Diagnostik
                 </h3>
                 <p className="text-xs text-[#53657A] mt-0.5">
-                  Izin membaca rapat untuk mendeteksi waktu luang dan menulis sesi tugas terjadwal.
+                  Izin membaca agenda untuk mendeteksi waktu luang dan menulis sesi tugas terencana.
                 </p>
               </div>
 
-              {hasGoogleAccessToken ? (
-                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-[#16856B] border border-emerald-200">
-                  <CheckCircle2 size={12} /> Terhubung (Live OAuth)
-                </span>
-              ) : (
-                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-50 text-[#B86B12] border border-amber-200">
-                  <AlertTriangle size={12} /> Belum Terhubung
-                </span>
-              )}
+              <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold border ${badgeConfig.color}`}>
+                <BadgeIcon size={13} className={isSyncing ? 'animate-spin' : ''} />
+                <span>{badgeConfig.label}</span>
+              </span>
             </div>
 
+            {/* Diagnostic Information Panel */}
             <div className="p-4 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs space-y-2.5">
               <div className="flex items-center justify-between">
                 <span className="text-[#53657A]">Akun Google Kalender:</span>
-                <span className="font-semibold text-[#172B42]">{preferences.email}</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-[#53657A]">Cakupan Scope OAuth:</span>
-                <span className="font-mono text-[10px] bg-white border border-[#D9E3EF] px-2 py-0.5 rounded-sm text-[#2457A7]">
-                  calendar, calendar.events, calendar.readonly
+                <span className="font-semibold text-[#172B42]">
+                  {diagnosticInfo?.accountEmail || (hasGoogleAccessToken ? preferences.email : 'Belum terhubung')}
                 </span>
               </div>
+
               <div className="flex items-center justify-between">
-                <span className="text-[#53657A]">Sinkronisasi Terakhir:</span>
+                <span className="text-[#53657A]">Kalender Target:</span>
+                <span className="font-mono text-xs text-[#2457A7] font-semibold">
+                  {diagnosticInfo?.targetCalendar || 'primary'} (Kalender Utama)
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Rentang Tanggal Pencarian:</span>
+                <span className="text-[#172B42] font-medium">
+                  {diagnosticInfo?.queryRangeStart
+                    ? `${new Date(diagnosticInfo.queryRangeStart).toLocaleDateString('id-ID')} s/d ${new Date(diagnosticInfo.queryRangeEnd).toLocaleDateString('id-ID')} (${diagnosticInfo.queryTimezone || 'Asia/Jakarta'})`
+                    : `-7 hari s/d +30 hari (${timezone})`}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <span className="text-[#53657A]">Waktu Sinkronisasi Terakhir:</span>
                 <span className="text-[#172B42]">
-                  {preferences.lastSyncedAt
+                  {diagnosticInfo?.lastSyncedAt
+                    ? new Date(diagnosticInfo.lastSyncedAt).toLocaleTimeString('id-ID', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                      }) + ' WIB'
+                    : preferences.lastSyncedAt
                     ? new Date(preferences.lastSyncedAt).toLocaleTimeString('id-ID', {
                         hour: '2-digit',
                         minute: '2-digit',
                         second: '2-digit',
-                      })
-                    : 'Belum pernah'}
+                      }) + ' WIB'
+                    : 'Belum pernah sinkron'}
                 </span>
               </div>
+
+              <div className="pt-2 border-t border-[#D9E3EF]/70 grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                <div className="p-2 bg-white rounded-lg border border-[#D9E3EF]">
+                  <p className="text-[10px] text-[#53657A]">Agenda Google</p>
+                  <p className="text-sm font-bold text-[#172B42]">{diagnosticInfo?.eventsGoogleCount ?? 0}</p>
+                </div>
+                <div className="p-2 bg-white rounded-lg border border-[#D9E3EF]">
+                  <p className="text-[10px] text-[#53657A]">Tugas Terjadwal</p>
+                  <p className="text-sm font-bold text-[#2457A7]">{diagnosticInfo?.eventsLocalCount ?? 0}</p>
+                </div>
+                <div className="p-2 bg-white rounded-lg border border-[#D9E3EF]">
+                  <p className="text-[10px] text-[#53657A]">Berhasil Dibuat</p>
+                  <p className="text-sm font-bold text-[#16856B]">{diagnosticInfo?.eventsCreatedCount ?? 0}</p>
+                </div>
+                <div className="p-2 bg-white rounded-lg border border-[#D9E3EF]">
+                  <p className="text-[10px] text-[#53657A]">Belum Terkonfirmasi</p>
+                  <p className="text-sm font-bold text-[#B86B12]">{diagnosticInfo?.eventsUnconfirmedCount ?? 0}</p>
+                </div>
+              </div>
+
+              {diagnosticInfo?.lastErrorMessage && (
+                <div className="p-2.5 bg-red-50 border border-red-200 rounded-lg text-xs text-[#C43D4B] flex items-start gap-2">
+                  <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                  <span>{diagnosticInfo.lastErrorMessage}</span>
+                </div>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center gap-3 pt-1">
@@ -218,7 +335,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="button"
                 onClick={onSyncCalendar}
                 disabled={isSyncing || !hasGoogleAccessToken}
-                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#2457A7] bg-[#EAF3FC] hover:bg-[#d8ebfd] rounded-xl transition-colors disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#2457A7] bg-[#EAF3FC] hover:bg-[#d8ebfd] rounded-xl transition-colors disabled:opacity-50 cursor-pointer"
               >
                 <RefreshCw size={13} className={isSyncing ? 'animate-spin' : ''} />
                 <span>{isSyncing ? 'Menyinkronkan...' : 'Sinkronkan Sekarang'}</span>
@@ -233,7 +350,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onConnectCalendar();
                   }
                 }}
-                className={`px-3.5 py-2 text-xs font-semibold rounded-xl transition-colors ${
+                className={`px-3.5 py-2 text-xs font-semibold rounded-xl transition-colors cursor-pointer ${
                   hasGoogleAccessToken
                     ? 'text-[#C43D4B] hover:bg-red-50 border border-red-200'
                     : 'text-white bg-[#2457A7] hover:bg-[#1E4889]'
@@ -384,7 +501,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <button
               type="button"
               onClick={onResetData}
-              className="px-3.5 py-2 text-xs font-medium text-[#53657A] hover:text-[#172B42] border border-[#D9E3EF] rounded-xl hover:bg-slate-50 transition-colors"
+              className="px-3.5 py-2 text-xs font-medium text-[#53657A] hover:text-[#172B42] border border-[#D9E3EF] rounded-xl hover:bg-slate-50 transition-colors cursor-pointer"
             >
               Kembalikan ke Data Awal
             </button>
@@ -402,7 +519,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             <button
               type="submit"
-              className="flex items-center gap-1.5 px-6 py-2.5 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs"
+              className="flex items-center gap-1.5 px-6 py-2.5 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs cursor-pointer"
             >
               <Save size={14} />
               <span>Simpan Perubahan</span>

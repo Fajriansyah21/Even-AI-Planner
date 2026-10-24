@@ -16,6 +16,7 @@ export interface TaskScheduleSession {
   status: 'SCHEDULED' | 'COMPLETED' | 'CANCELLED';
   syncStatus: SyncStatus;
   googleCalendarEventId?: string;
+  htmlLink?: string;
 }
 
 export type TimeConstraintType = 'fixed_event' | 'preferred_window' | 'deadline_only';
@@ -60,6 +61,7 @@ export interface CalendarEvent {
   attendees?: string[];
   location?: string;
   meetUrl?: string;
+  htmlLink?: string;
   isEditable: boolean;
   isRecurring?: boolean;
   syncStatus: SyncStatus;

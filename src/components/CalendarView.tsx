@@ -594,16 +594,29 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               )}
             </div>
 
-            {selectedEventDetails.meetUrl && (
-              <a
-                href={selectedEventDetails.meetUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="w-full flex items-center justify-center gap-2 bg-[#2457A7] hover:bg-[#1E4889] text-white py-2.5 px-4 rounded-xl text-xs font-semibold transition-colors"
-              >
-                <Video size={14} /> Buka Google Meet
-              </a>
-            )}
+            <div className="flex flex-col gap-2 pt-2">
+              {selectedEventDetails.meetUrl && (
+                <a
+                  href={selectedEventDetails.meetUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="w-full flex items-center justify-center gap-2 bg-[#2457A7] hover:bg-[#1E4889] text-white py-2.5 px-4 rounded-xl text-xs font-semibold transition-colors"
+                >
+                  <Video size={14} /> Buka Google Meet
+                </a>
+              )}
+
+              {selectedEventDetails.htmlLink && (
+                <a
+                  href={selectedEventDetails.htmlLink}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="w-full flex items-center justify-center gap-2 bg-slate-50 hover:bg-slate-100 border border-[#D9E3EF] text-[#2457A7] py-2 px-4 rounded-xl text-xs font-semibold transition-colors"
+                >
+                  <ExternalLink size={13} /> Buka di Google Calendar
+                </a>
+              )}
+            </div>
           </div>
         </div>
       )}

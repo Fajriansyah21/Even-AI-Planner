@@ -1,0 +1,406 @@
+# PERBAIKAN MENYELURUH EVEN AI PLANNER: PENJADWALAN MANUAL, AI, ZONA WAKTU, DEADLINE, DAN GOOGLE CALENDAR
+
+Repositori: https://github.com/Fajriansyah21/Even-AI-Planner
+
+Bertindaklah sebagai senior engineer yang memperbaiki aplikasi secara langsung. Audit implementasi yang tersedia, ubah kode yang diperlukan, tambahkan pengujian, lalu jalankan pemeriksaan proyek.
+
+Jangan berhenti pada analisis atau memberikan contoh kode saja. Jangan mengklaim perubahan selesai jika belum benar-benar dilakukan dan diuji.
+
+## 1. Konteks produk yang harus dipertahankan
+
+EVEN adalah personal planner yang mempunyai dua cara utama untuk membuat jadwal:
+
+**Mode manual:** pengguna menentukan waktu jadwal secara langsung.
+
+**Mode AI:** pengguna menjelaskan kebutuhannya lewat percakapan, kemudian EVEN menafsirkan permintaan dan membantu memilih slot waktu jika pengguna belum menentukan jam pasti.
+
+Prinsip utama:
+
+* Jika pengguna menentukan jam mulai dan selesai secara eksplisit, pertahankan waktu tersebut.
+* Jika pengguna meminta AI memilih waktu, gunakan durasi, deadline, preferensi waktu, hari kerja, dan konflik kalender untuk mencari slot yang sesuai.
+* Jangan pernah diam-diam mengganti waktu eksplisit pengguna.
+* Jangan menganggap kalender penuh jika data kalender sebenarnya tidak tersedia atau gagal dibaca.
+* Jangan membuat autentikasi, sinkronisasi, atau status keberhasilan palsu.
+
+## 2. Temuan kode yang harus diperiksa dan ditindaklanjuti
+
+Repositori saat ini sudah memiliki:
+
+* `src/lib/temporalParser.ts`
+* `app/api/gemini/plan/route.ts`
+* `src/lib/scheduler.ts`
+* `src/components/TaskModal.tsx`
+* `src/components/ScheduleResultModal.tsx`
+* `src/components/BatchScheduleModal.tsx`
+* `src/lib/googleCalendar.ts`
+* `src/lib/firebase.ts`
+* `src/App.tsx`
+* `src/components/AuthModal.tsx`
+* `src/components/SettingsView.tsx`
+* Pengujian dalam direktori `tests/`
+
+Jangan mengasumsikan kode masih sama dengan versi sebelumnya. Baca ulang versi aktual sebelum mengedit.
+
+Temuan yang perlu diverifikasi:
+
+1. Parser temporal membangun waktu menggunakan `Date.setHours()` dan `toISOString()`, sementara konteks zona waktu pengguna tersedia. Pastikan konversi jam lokal ke timestamp tidak bergantung pada zona waktu mesin yang menjalankan server.
+2. `TaskModal.tsx` mewajibkan deadline dan menyediakan preferensi waktu, tetapi UI saat ini tidak menyediakan kontrol tanggal mulai dan selesai yang jelas untuk membuat jadwal manual secara eksplisit.
+3. `TaskModal.tsx` menyimpan `deadlineAt`, `preferredTimeOfDay`, `timeConstraintType`, `requestedStartAt`, dan `requestedEndAt`, tetapi nilai awal dan kontrol form perlu diperiksa agar pengguna tidak diberi kesan memilih waktu manual jika input waktu tersebut tidak benar-benar tersedia.
+4. `scheduler.ts` menolak deadline yang telah lewat dan dapat menghasilkan pesan bahwa tidak ada slot yang memenuhi tenggat. Pastikan alasan kegagalan dibedakan dengan tepat.
+5. Scheduler mempunyai logika pencarian slot berdasarkan hari kerja, jendela preferensi, konflik kalender, buffer, dan sesi terpisah. Uji semua jalur tersebut sebelum mengubah aturan.
+6. `fetchGoogleCalendarEvents()` membaca kalender `primary` dalam rentang default tujuh hari sebelumnya hingga 30 hari berikutnya dan membatasi pagination sampai 10 halaman. UI perlu menjelaskan cakupan tersebut dengan benar.
+7. `createGoogleCalendarEvent()` memeriksa status HTTP tetapi perlu memvalidasi ID event dalam respons sebelum menganggap pembuatan berhasil.
+8. `AuthModal.tsx` harus tetap gagal secara eksplisit jika autentikasi Google gagal. Jangan menambahkan fallback identitas statis.
+9. `app/api/gemini/plan/route.ts` sudah berusaha menjadikan hasil parser deterministik sebagai sumber kebenaran. Pertahankan prinsip ini dan perkuat validasinya.
+10. Periksa apakah test yang ada benar-benar menguji implementasi produksi atau hanya mensimulasikan ulang logikanya. Prioritaskan pengujian fungsi nyata.
+
+## 3. Perbaiki zona waktu terlebih dahulu
+
+Audit keseluruhan alur waktu dari:
+
+* Input pengguna.
+* Parser Indonesia.
+* Respons Gemini.
+* Validasi server.
+* Scheduler.
+* Form manual.
+* Penyimpanan lokal dan Firestore.
+* Google Calendar API.
+* Tampilan kalender dan hasil penjadwalan.
+
+Persyaratan:
+
+1. Gunakan zona waktu IANA pengguna, misalnya `Asia/Jakarta`, secara konsisten.
+2. Jangan memperlakukan waktu lokal pengguna sebagai waktu lokal server.
+3. Jangan menyimpan timestamp yang sudah dikonversi secara keliru.
+4. Jangan mengganti tanggal hanya karena konversi UTC.
+5. Pastikan format ISO yang dikirim ke Google Calendar merepresentasikan instan yang benar.
+6. Gunakan library tanggal yang sudah ada jika tersedia. Jika tidak ada, pilih solusi yang sesuai dengan dependensi proyek dan jangan menambah ketergantungan besar tanpa alasan.
+7. Audit format zona waktu dalam preferences. Jangan menganggap string tampilan seperti `Asia/Jakarta (WIB)` otomatis menjadi ID IANA valid tanpa normalisasi.
+
+Buat pengujian deterministik untuk:
+
+* `Asia/Jakarta`
+* Perbedaan UTC dan WIB.
+* Waktu malam pukul 19.00 sampai 22.00.
+* Waktu pagi pukul 07.00 sampai 10.00.
+* Event lintas tengah malam.
+* Mesin pengujian yang menggunakan zona waktu berbeda.
+* Waktu lokal yang ditampilkan sama dengan waktu lokal yang diminta pengguna.
+
+## 4. Rancang ulang penjadwalan manual agar benar-benar manual
+
+Perbaiki `src/components/TaskModal.tsx` dan jalur penyimpanannya di `src/App.tsx`.
+
+Form saat ini berisi judul, deskripsi, durasi, prioritas, deadline, preferensi waktu, dan opsi split. Bentuk ini lebih menyerupai form perencanaan tugas fleksibel daripada form penjadwalan manual.
+
+Pisahkan konsep tugas dan jadwal secara jelas.
+
+### Mode penjadwalan manual
+
+Tambahkan pilihan cara penjadwalan yang jelas:
+
+* `Tentukan waktu sendiri`
+* `Bantu pilih waktu dengan AI`
+
+Jika pengguna memilih `Tentukan waktu sendiri`, tampilkan kontrol untuk:
+
+* Tanggal jadwal.
+* Jam mulai.
+* Jam selesai.
+* Durasi dapat dihitung otomatis dari rentang jam, atau pengguna dapat mengisi durasi jika desain data memerlukannya.
+* Validasi konflik kalender.
+
+Jangan menjadikan deadline sebagai pengganti jam mulai dan selesai.
+
+Perilaku manual:
+
+1. Jika pengguna memilih Kamis, 22 Oktober 2026, pukul 19.00–22.00, sistem harus mempertahankan tanggal dan rentang tersebut.
+2. Jangan menggeser jadwal manual ke Jumat pukul 02.00 atau jam lain.
+3. Jika waktu mulai atau selesai tidak valid, jelaskan masalahnya.
+4. Waktu selesai harus lebih besar daripada waktu mulai, kecuali dukungan rentang lintas tengah malam dirancang secara eksplisit.
+5. Periksa konflik kalender dan tugas lain.
+6. Jika ada konflik, tampilkan informasi konflik yang relevan dan berikan keputusan yang jelas kepada pengguna.
+7. Jangan menyimpan atau menampilkan status tersinkronisasi ke Google Calendar sebelum penulisan berhasil diverifikasi.
+8. Pertahankan jadwal lokal yang valid jika pengguna memilih menyimpan secara lokal ketika Google Calendar tidak terhubung, tetapi tampilkan status yang jujur.
+
+Jangan menggunakan `fixed_event` sebagai pengganti pilihan manual tanpa memastikan tanggal dan rentang waktunya lengkap.
+
+### Mode bantuan AI
+
+Mode ini digunakan ketika pengguna ingin EVEN mencari slot.
+
+Pengguna dapat mengisi:
+
+* Judul tugas.
+* Estimasi durasi.
+* Deadline jika memang ada tenggat.
+* Preferensi waktu opsional.
+* Opsi membagi sesi jika diperbolehkan.
+
+Form tidak boleh memaksa pengguna menggunakan preferensi waktu jika pengguna sudah menentukan jam pasti.
+
+## 5. Perjelas fungsi deadline
+
+Deadline berarti waktu paling akhir tugas harus selesai. Deadline bukan waktu mulai dan bukan jadwal yang dipakai secara otomatis.
+
+Perbaiki validasi dan UI agar:
+
+1. Deadline dapat bersifat opsional untuk tugas yang memang tidak membutuhkan tenggat, jika model produk dan jenis tugas mengizinkannya.
+2. Jika aplikasi tetap membutuhkan deadline untuk pencarian slot otomatis, jadikan kewajiban itu khusus pada mode yang memang membutuhkannya, bukan aturan universal tanpa penjelasan.
+3. Jika deadline ditentukan, pastikan nilainya valid dan tidak berada di masa lalu ketika penjadwalan diminta.
+4. Jangan memberikan default deadline yang menyebabkan tugas gagal tanpa penjelasan.
+5. Pisahkan deadline tugas fleksibel dari waktu selesai event manual.
+6. Untuk event manual pukul 19.00–22.00, waktu selesai event adalah pukul 22.00. Jangan membuat deadline pukul 05.00 sebagai hasil sampingan.
+7. Jika deadline terlewati, tampilkan pesan "Tenggat sudah lewat" dan berikan langkah berikutnya yang relevan.
+8. Periksa kalkulasi deadline dari `parseIndonesianTemporalRules()`, terutama default pukul 18.00 atau 23.00.
+
+Pertahankan deadline sebagai fitur yang berguna untuk pengelolaan tugas, tetapi jangan mewajibkannya dalam semua konteks hanya karena tipe data saat ini mensyaratkannya.
+
+Jika mengubah `Task.deadlineAt` menjadi opsional, audit semua penggunaan di scheduler, UI, Firestore, AI schema, tes, dan sinkronisasi. Jangan sekadar menghapus tanda wajib di form tanpa memperbaiki seluruh alurnya.
+
+## 6. Perjelas fungsi preferensi waktu
+
+Preferensi waktu adalah waktu yang disukai saat sistem memilih slot, bukan waktu jadwal yang sudah diputuskan.
+
+Perilaku:
+
+* `ANY`: tidak ada preferensi khusus. Gunakan kebijakan pencarian yang dijelaskan produk.
+* `MORNING`: prioritaskan pagi.
+* `AFTERNOON`: prioritaskan siang atau sore sesuai definisi UI yang konsisten.
+* `EVENING`: prioritaskan malam, misalnya 19.00–23.00.
+* Rentang jam eksplisit dari pengguna: perlakukan sebagai batasan waktu yang harus dipertahankan.
+
+Preferensi harus bersifat opsional jika pengguna ingin memilih waktu secara manual.
+
+Jika jendela pilihan penuh:
+
+* Jangan mengubahnya secara diam-diam.
+* Jelaskan bahwa tidak ditemukan slot pada jendela tersebut.
+* Tawarkan pencarian waktu alternatif hanya jika pengguna menyetujui, atau sediakan tindakan eksplisit untuk melihat alternatif.
+
+Pastikan label UI sesuai perilaku scheduler. Jangan menamai rentang 13.00–18.00 sebagai "Sore" jika definisi produk mengharapkan arti yang berbeda.
+
+## 7. Perbaiki jadwal kelas malam 19.00–22.00
+
+Gunakan kasus berikut sebagai regression test:
+
+Input:
+"Kelas dari jam 7 malam sampai jam 10 malam."
+
+Tanggal referensi:
+Kamis, 22 Oktober 2026.
+
+Zona waktu:
+Asia/Jakarta.
+
+Hasil yang benar:
+
+* Jenis: komitmen waktu tetap.
+* Mulai: Kamis, 22 Oktober 2026, pukul 19.00 WIB.
+* Selesai: Kamis, 22 Oktober 2026, pukul 22.00 WIB.
+* Durasi: 180 menit.
+* Tidak boleh berubah menjadi Jumat pukul 02.00–05.00.
+* Tidak boleh digeser oleh pencarian slot fleksibel.
+* Jika terjadi konflik, hasil harus berupa konflik, bukan jadwal pengganti.
+* Label hasil harus sesuai dengan waktu aktual yang disimpan.
+
+Tambahkan regression test yang menguji implementasi `parseIndonesianTemporalRules()` secara nyata, lalu uji hasilnya di `scheduleTaskDeterministically()` dan fungsi konversi waktu yang dipakai aplikasi.
+
+Jangan hanya menguji salinan logika parser atau membuat test yang mengulang asumsi implementasi lama.
+
+## 8. Perbaiki pesan "Tidak Ada Slot yang Memenuhi Tenggat"
+
+`ScheduleResultModal.tsx` saat ini menggunakan pesan umum "Tidak Ada Slot yang Memenuhi Tenggat" untuk kegagalan penjadwalan.
+
+Perbarui agar alasan kegagalan terstruktur dan akurat, minimal mencakup:
+
+* `DEADLINE_PASSED`: deadline telah lewat.
+* `CALENDAR_NOT_CONNECTED`: kalender belum terhubung sehingga pemeriksaan kalender eksternal belum bisa dilakukan.
+* `CALENDAR_READ_FAILED`: pembacaan kalender gagal.
+* `TIME_CONFLICT`: waktu eksplisit bertabrakan dengan agenda lain.
+* `NO_SLOT_BEFORE_DEADLINE`: tidak ada slot yang cukup sebelum deadline.
+* `PREFERRED_WINDOW_FULL`: jendela preferensi tidak menyediakan waktu yang cukup.
+* `INVALID_TIME_RANGE`: rentang tanggal atau jam tidak valid.
+* `CALENDAR_WRITE_FAILED`: penulisan ke Google Calendar gagal.
+* `SYNC_PENDING`: jadwal disimpan secara lokal tetapi sinkronisasi belum terverifikasi.
+
+Sesuaikan enum atau tipe hasil dengan arsitektur aplikasi.
+
+Jangan hanya memeriksa teks `explanation` untuk menentukan jenis kesalahan.
+
+Jika kalender belum tersambung, jangan menyebut kalender penuh. Jika deadline telah lewat, jangan menyarankan membagi sesi sebelum menjelaskan fakta tersebut.
+
+## 9. Perbaiki algoritma scheduler dan pemeriksaan kalender
+
+Audit penuh `src/lib/scheduler.ts`.
+
+Persyaratan:
+
+1. Gunakan jam referensi dan zona waktu yang konsisten.
+2. Bedakan event kalender, sesi tugas, dan jadwal manual yang belum tersimpan.
+3. Jangan membuat jadwal bertabrakan dengan event yang telah terverifikasi.
+4. Periksa apakah event yang dibaca dari Google Calendar mencakup rentang pencarian yang diperlukan.
+5. Jangan menggunakan data contoh lokal sebagai bukti bahwa kalender Google penuh.
+6. Jangan memasukkan event Google duplikat ketika penggabungan sinkronisasi dilakukan.
+7. Periksa apakah event sepanjang hari diblokir dengan rentang tanggal yang benar, termasuk aturan end-date eksklusif dari Google Calendar.
+8. Jangan menggunakan buffer secara tidak konsisten.
+9. Pastikan kandidat slot tidak melewati deadline.
+10. Pastikan slot manual yang valid tidak dipindahkan oleh algoritma pencarian fleksibel.
+11. Periksa apakah hari kerja, akhir pekan, dan preferensi waktu diproses secara konsisten dengan zona waktu pengguna.
+12. Ketika tidak ada slot, tampilkan ringkasan diagnostik: periode yang diperiksa, durasi yang diperlukan, deadline, jendela waktu, dan apakah data kalender berhasil dimuat.
+
+### Menghitung ulang ketersediaan
+
+Pada gambar pengguna, EVEN melaporkan total waktu luang 0 menit. Audit cara angka tersebut dihitung.
+
+Jangan menampilkan "0 menit waktu luang" jika algoritma tidak benar-benar menghitung seluruh rentang yang relevan dengan benar.
+
+Periksa:
+
+* Apakah deadline telah lewat.
+* Apakah waktu mulai pencarian lebih besar dari deadline.
+* Apakah semua event dipetakan dengan benar.
+* Apakah event berulang dan event sepanjang hari ditangani.
+* Apakah waktu lokal dibandingkan dengan UTC secara konsisten.
+* Apakah kalender yang digunakan benar-benar berhasil dibaca.
+* Apakah rentang pencarian berhenti sebelum seluruh kandidat hari diproses.
+
+## 10. Perbaiki parser temporal dan validasi Gemini
+
+Audit `src/lib/temporalParser.ts` dan `app/api/gemini/plan/route.ts`.
+
+Pertahankan prinsip bahwa aturan temporal deterministik menjadi sumber validasi atas interpretasi AI.
+
+Untuk rentang eksplisit:
+
+* "dari jam 7 malam sampai jam 10 malam"
+* "pukul 19.00–22.00"
+* "besok pukul 07.00 sampai 10.00"
+* "kelas Jumat jam 19.00–22.00"
+
+Parser harus mengekstrak waktu dan tanggal secara tepat.
+
+Jangan:
+
+* Menafsirkan pukul 7 malam sebagai 07.00.
+* Menentukan `fixed_event` tanpa waktu lengkap.
+* Mengubah tanggal menjadi hari berikutnya tanpa alasan.
+* Menggunakan waktu saat ini dari server sebagai waktu lokal tanpa konversi yang benar.
+* Mengizinkan `requestedStartAt` dari AI menimpa preferensi fleksibel.
+* Menganggap semua tugas yang mempunyai kata "kelas" pasti memiliki waktu lengkap.
+
+Untuk tugas fleksibel:
+
+* "Belajar malam 60 menit" berarti pencarian slot malam, bukan komitmen pada jam yang ditebak AI.
+* Jika pengguna menyebut jam pasti, rentang tersebut harus mengalahkan preferensi umum.
+* Jika parser tidak dapat memastikan tanggal atau jam, jangan berpura-pura bahwa interpretasinya pasti.
+
+Uji kasus dengan tanggal tetap dan zona waktu Asia/Jakarta. Perbaiki parser kata angka hanya jika memang dibutuhkan oleh sintaks pengguna yang didukung.
+
+## 11. Perbaiki autentikasi dan status koneksi
+
+Audit:
+
+* `src/components/AuthModal.tsx`
+* `src/lib/firebase.ts`
+* `src/App.tsx`
+* `src/components/SettingsView.tsx`
+
+Ketentuan:
+
+1. Tidak boleh ada fallback login yang menggunakan identitas statis.
+2. `onSuccess` hanya dipanggil setelah autentikasi nyata berhasil.
+3. Firebase Auth dan access token Google Calendar adalah status yang berbeda.
+4. Jangan menyatakan Calendar terhubung hanya karena token berada di memori.
+5. Jika token tidak tersedia, gagal atau kedaluwarsa, minta autentikasi ulang secara tepat.
+6. Jangan menyimpan access token sensitif ke localStorage.
+7. Tangani `401` dan `403` dengan penjelasan yang berbeda.
+8. Jangan menyatakan kalender kosong jika permintaan pembacaan sebenarnya gagal.
+9. Jangan menganggap toggle lokal sebagai bukti integrasi aktif.
+
+## 12. Perbaiki pembacaan dan penulisan Google Calendar
+
+Audit `src/lib/googleCalendar.ts` dan pemanggilannya di `src/App.tsx`.
+
+Pembuatan event:
+
+1. Validasi respons API dan pastikan `id` event tersedia dan tidak kosong.
+2. Hanya setelah ID valid diterima, tandai event sebagai tersimpan di Google Calendar.
+3. Pastikan event lokal diberi status yang benar jika penulisan gagal.
+4. Tangani `401`, `403`, `400`, `429`, `5xx`, dan timeout.
+5. Jangan membocorkan token ke log.
+6. Hindari event duplikat ketika respons timeout tetapi Google mungkin sudah membuat event.
+7. Jangan menyatakan sinkronisasi berhasil jika event hanya ada secara lokal.
+
+Pembacaan event:
+
+1. Tampilkan akun Google yang terverifikasi.
+2. Jelaskan kalender tujuan, saat ini `primary`.
+3. Tampilkan rentang tanggal yang dibaca.
+4. Tampilkan jumlah event hasil API dan jumlah event yang digunakan dalam penjadwalan.
+5. Pastikan pagination dan batas maksimum halaman terlihat dalam diagnostik.
+6. Jika pagination berhenti karena batas maksimum halaman masih ada `nextPageToken`, jangan menyatakan semua event pada rentang tersebut sudah dimuat.
+7. Pastikan event sepanjang hari memiliki waktu awal dan akhir yang benar.
+8. Jangan menganggap `lastSyncedAt` berarti semua event sudah diperiksa di Google jika operasi terakhir hanya berhasil sebagian.
+
+Jangan mengejar Origin trial warning, preload warning, Google Ads `ERR_BLOCKED_BY_CLIENT`, atau peringatan dari ekstensi browser tanpa bukti bahwa pesan tersebut menyebabkan kegagalan penjadwalan atau Calendar API.
+
+## 13. Perbaiki pengalaman pengguna pada kedua mode
+
+Pastikan antarmuka membedakan secara jelas:
+
+**Jadwal manual**
+
+* Pengguna memilih tanggal dan jam.
+* Durasi dapat dihitung dari waktu mulai dan selesai.
+* Sistem memvalidasi konflik.
+* Sistem tidak berpindah jam otomatis.
+* Jika konflik terjadi, pengguna dapat mengubah waktu atau secara eksplisit memilih alternatif.
+
+**Bantuan AI**
+
+* Pengguna memberikan niat, durasi, tenggat, dan preferensi yang relevan.
+* AI dapat mencari slot yang layak.
+* Pengguna meninjau waktu yang diusulkan sebelum menerapkan jadwal.
+* Sistem tidak mengubah rentang eksplisit pengguna tanpa persetujuan.
+
+Jangan memaksa pengguna mengisi banyak pilihan yang tidak relevan. Jika pengguna sudah menentukan tanggal dan jam, sembunyikan atau nonaktifkan preferensi waktu untuk pemilihan slot fleksibel.
+
+Jika diperlukan perubahan UX yang cukup besar, pertahankan bahasa Indonesia baku dan gaya desain aplikasi saat ini.
+
+## 14. Pengujian regresi wajib
+
+Gunakan test runner yang sudah ada di `package.json`. Jalankan test yang nyata, jangan hanya memeriksa bahwa file test berisi assertion.
+
+Tambahkan atau perbaiki pengujian berikut:
+
+### A. Rentang eksplisit dan zona waktu
+
+* Kamis, 22 Oktober 2026 pukul 19.00–22.00 Asia/Jakarta tetap pada tanggal dan jam tersebut.
+* "Jadwalkan pukul 07.00–10.00" tetap pada rentang yang diminta.
+* Durasi kelas 180 menit tetap benar.
+* Tidak ada pergeseran menjadi Jumat pukul 02.00–05.00.
+* Perilaku benar pada runtime UTC dan zona waktu lain.
+* Kasus lintas tengah malam diuji secara eksplisit.
+
+### B. Deadline dan preferensi
+
+* Deadline yang lewat memberikan kesalahan khusus.
+* Deadline yang masih berlaku memungkinkan pencarian slot.
+* Preferensi malam tidak diganti ke jam kerja secara diam-diam.
+* Preferensi yang penuh menghasilkan kegagalan yang tepat.
+* Deadline tidak disamakan dengan waktu mulai.
+* Jadwal manual tidak memerlukan preferensi waktu.
+
+### C. Manual scheduling
+
+* Rentang manual yang bebas konflik diterima tanpa perubahan waktu.
+* Rentang manual yang konflik menghasilkan `TIME_CONFLICT`.
+* Event yang belum terverifikasi tidak diperlakukan sebagai kalender yang telah tervalidasi.
+* Waktu selesai sebelum waktu mulai ditolak.
+* Jika kalender tidak tersedia, status dan pesan tetap jujur.
+
+### D. Google Calendar
+
+* Respon
