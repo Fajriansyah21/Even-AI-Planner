@@ -64,7 +64,6 @@ export default function App() {
   const [userId, setUserId] = useState<string | null>(null);
 
   const [preferences, setPreferences] = useState<UserPreferences>(() => {
-    if (typeof window === 'undefined') return INITIAL_PREFERENCES;
     try {
       const saved = localStorage.getItem('even_preferences');
       return saved ? JSON.parse(saved) : INITIAL_PREFERENCES;
@@ -75,7 +74,6 @@ export default function App() {
 
   // Tasks state
   const [tasks, setTasks] = useState<Task[]>(() => {
-    if (typeof window === 'undefined') return getInitialTasks();
     try {
       const saved = localStorage.getItem('even_tasks');
       return saved ? JSON.parse(saved) : getInitialTasks();
@@ -86,7 +84,6 @@ export default function App() {
 
   // Calendar Events state
   const [events, setEvents] = useState<CalendarEvent[]>(() => {
-    if (typeof window === 'undefined') return getInitialEvents();
     try {
       const saved = localStorage.getItem('even_events');
       return saved ? JSON.parse(saved) : getInitialEvents();
@@ -97,7 +94,6 @@ export default function App() {
 
   // Google Keep Notes state
   const [keepNotes, setKeepNotes] = useState<KeepNote[]>(() => {
-    if (typeof window === 'undefined') return getInitialKeepNotes();
     try {
       const saved = localStorage.getItem('even_keep_notes');
       return saved ? JSON.parse(saved) : getInitialKeepNotes();
@@ -777,45 +773,19 @@ export default function App() {
   };
 
   // Google Keep Handlers
-  const handleCreateKeepNote = async (noteData: Omit<KeepNote, 'id' | 'createdAt' | 'updatedAt'>) => {
-    const currentUserId = userId || 'user-default';
-    const noteId = `keep-${Date.now()}`;
+  const handleCreateKeepNote = (noteData: Omit<KeepNote, 'id' | 'createdAt' | 'updatedAt'>) => {
     const newNote: KeepNote = {
       ...noteData,
-      id: noteId,
-      userId: currentUserId,
+      id: `keep-${Date.now()}`,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     setKeepNotes((prev) => [newNote, ...prev]);
     showToast('Catatan Google Keep berhasil disimpan.');
-
-    if (userId && userId !== 'user-default') {
-      try {
-        await setDoc(doc(db, 'users', userId, 'keep_notes', noteId), sanitizeForFirestore(newNote));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.CREATE, `users/${userId}/keep_notes/${noteId}`);
-      }
-    }
   };
 
-  const handleUpdateKeepNote = async (updatedNote: KeepNote) => {
-    const currentUserId = userId || updatedNote.userId || 'user-default';
-    const noteToSave: KeepNote = {
-      ...updatedNote,
-      userId: currentUserId,
-      updatedAt: new Date().toISOString(),
-    };
-    setKeepNotes((prev) => prev.map((n) => (n.id === updatedNote.id ? noteToSave : n)));
-    showToast('Perubahan catatan berhasil disimpan.');
-
-    if (userId && userId !== 'user-default') {
-      try {
-        await setDoc(doc(db, 'users', userId, 'keep_notes', updatedNote.id), sanitizeForFirestore(noteToSave));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/keep_notes/${updatedNote.id}`);
-      }
-    }
+  const handleUpdateKeepNote = (updatedNote: KeepNote) => {
+    setKeepNotes((prev) => prev.map((n) => (n.id === updatedNote.id ? updatedNote : n)));
   };
 
   const handleDeleteKeepNote = (noteId: string) => {
@@ -827,18 +797,10 @@ export default function App() {
       title: 'Hapus Catatan Keep?',
       description: `Apakah Anda yakin ingin menghapus catatan "${noteToDelete.title || 'Tanpa Judul'}"? Tindakan ini tidak dapat dibatalkan.`,
       actionLabel: 'Hapus Catatan',
-      onConfirm: async () => {
+      onConfirm: () => {
         setKeepNotes((prev) => prev.filter((n) => n.id !== noteId));
         showToast('Catatan Keep dihapus.', 'info');
         setConfirmModal((prev) => ({ ...prev, isOpen: false }));
-
-        if (userId && userId !== 'user-default') {
-          try {
-            await deleteDoc(doc(db, 'users', userId, 'keep_notes', noteId));
-          } catch (err) {
-            handleFirestoreError(err, OperationType.DELETE, `users/${userId}/keep_notes/${noteId}`);
-          }
-        }
       },
     });
   };
@@ -1123,7 +1085,6 @@ export default function App() {
         }}
         onSave={handleSaveTask}
         userId={userId}
-        userTimezone={preferences.timezone}
       />
 
       <ScheduleResultModal

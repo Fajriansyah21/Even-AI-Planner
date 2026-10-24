@@ -40,13 +40,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [timezone, setTimezone] = useState(preferences.timezone);
   const [workStartHour, setWorkStartHour] = useState(preferences.workStartHour);
   const [workEndHour, setWorkEndHour] = useState(preferences.workEndHour);
-  const [lunchBreakEnabled, setLunchBreakEnabled] = useState(preferences.lunchBreakEnabled !== false);
-  const [lunchStartHour, setLunchStartHour] = useState(typeof preferences.lunchStartHour === 'number' ? preferences.lunchStartHour : 12);
-  const [lunchEndHour, setLunchEndHour] = useState(typeof preferences.lunchEndHour === 'number' ? preferences.lunchEndHour : 13);
+  const [lunchStartHour, setLunchStartHour] = useState(preferences.lunchStartHour);
+  const [lunchEndHour, setLunchEndHour] = useState(preferences.lunchEndHour);
   const [bufferMinutes, setBufferMinutes] = useState(preferences.bufferMinutes);
   const [workDays, setWorkDays] = useState<number[]>(preferences.workDays);
   const [allowAutoSplit, setAllowAutoSplit] = useState(preferences.allowAutoSplit);
-  const [errorMessage, setErrorMessage] = useState('');
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   const daysLabels = [
@@ -71,39 +69,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
-    setErrorMessage('');
-
-    const startH = Number(workStartHour);
-    const endH = Number(workEndHour);
-
-    if (endH <= startH) {
-      setErrorMessage('Waktu selesai kerja harus lebih akhir dari waktu mulai kerja pada hari yang sama.');
-      return;
-    }
-
-    if (lunchBreakEnabled) {
-      const lStart = Number(lunchStartHour);
-      const lEnd = Number(lunchEndHour);
-
-      if (lEnd <= lStart) {
-        setErrorMessage('Waktu mulai istirahat makan siang harus lebih awal dari waktu selesai.');
-        return;
-      }
-
-      if (lStart < startH || lEnd > endH) {
-        setErrorMessage('Rentang waktu makan siang harus berada di dalam jam kerja Anda.');
-        return;
-      }
-    }
-
     onUpdatePreferences({
       displayName,
       timezone,
-      workStartHour: startH,
-      workEndHour: endH,
-      lunchBreakEnabled,
-      lunchStartHour: lunchBreakEnabled ? Number(lunchStartHour) : undefined,
-      lunchEndHour: lunchBreakEnabled ? Number(lunchEndHour) : undefined,
+      workStartHour: Number(workStartHour),
+      workEndHour: Number(workEndHour),
+      lunchStartHour: Number(lunchStartHour),
+      lunchEndHour: Number(lunchEndHour),
       bufferMinutes: Number(bufferMinutes),
       workDays,
       allowAutoSplit,
@@ -306,126 +278,71 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </select>
             </div>
 
-            {errorMessage && (
-              <div className="p-3 bg-red-50 border border-[#C43D4B]/30 rounded-xl text-xs text-[#C43D4B] animate-in fade-in">
-                {errorMessage}
-              </div>
-            )}
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-1">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
               <div>
                 <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                  Mulai Jam Kerja
+                  Mulai Kerja
                 </label>
                 <select
                   value={workStartHour}
                   onChange={(e) => setWorkStartHour(Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white"
+                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm"
                 >
-                  {Array.from({ length: 18 }, (_, i) => i + 7).map((h) => (
-                    <option key={h} value={h}>
-                      {h === 24 ? '24:00 (Akhir Hari)' : `${String(h).padStart(2, '0')}:00`}
-                    </option>
+                  {[7, 8, 9, 10].map((h) => (
+                    <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
                   ))}
                 </select>
               </div>
 
               <div>
                 <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                  Selesai Jam Kerja
+                  Selesai Kerja
                 </label>
                 <select
                   value={workEndHour}
                   onChange={(e) => setWorkEndHour(Number(e.target.value))}
-                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white"
+                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm"
                 >
-                  {Array.from({ length: 18 }, (_, i) => i + 7).map((h) => (
-                    <option key={h} value={h}>
-                      {h === 24 ? '24:00 (Akhir Hari / Tengah Malam)' : `${String(h).padStart(2, '0')}:00`}
-                    </option>
+                  {[16, 17, 18, 19, 20, 21].map((h) => (
+                    <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
                   ))}
                 </select>
               </div>
-            </div>
 
-            {/* Lunch Break Section */}
-            <div className="p-4 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <span className="text-xs font-bold text-[#172B42] block">
-                    Istirahat Makan Siang
-                  </span>
-                  <p className="text-[11px] text-[#53657A]">
-                    Tentukan waktu blokir makan siang, atau kosongkan jika tidak ingin memblokir slot.
-                  </p>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={lunchBreakEnabled}
-                    onChange={(e) => setLunchBreakEnabled(e.target.checked)}
-                    className="sr-only peer"
-                  />
-                  <div className="w-9 h-5 bg-slate-200 peer-focus:outline-hidden rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#2457A7]"></div>
+              <div>
+                <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                  Makan Siang
                 </label>
+                <select
+                  value={lunchStartHour}
+                  onChange={(e) => {
+                    const start = Number(e.target.value);
+                    setLunchStartHour(start);
+                    setLunchEndHour(start + 1);
+                  }}
+                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm"
+                >
+                  <option value={11}>11:00 - 12:00</option>
+                  <option value={12}>12:00 - 13:00</option>
+                  <option value={13}>13:00 - 14:00</option>
+                </select>
               </div>
 
-              {lunchBreakEnabled ? (
-                <div className="grid grid-cols-2 gap-3 pt-2">
-                  <div>
-                    <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                      Mulai Makan Siang
-                    </label>
-                    <select
-                      value={lunchStartHour}
-                      onChange={(e) => setLunchStartHour(Number(e.target.value))}
-                      className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white"
-                    >
-                      {Array.from({ length: 18 }, (_, i) => i + 7).map((h) => (
-                        <option key={h} value={h}>
-                          {h === 24 ? '24:00' : `${String(h).padStart(2, '0')}:00`}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                      Selesai Makan Siang
-                    </label>
-                    <select
-                      value={lunchEndHour}
-                      onChange={(e) => setLunchEndHour(Number(e.target.value))}
-                      className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white"
-                    >
-                      {Array.from({ length: 18 }, (_, i) => i + 7).map((h) => (
-                        <option key={h} value={h}>
-                          {h === 24 ? '24:00' : `${String(h).padStart(2, '0')}:00`}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-              ) : (
-                <div className="p-2.5 bg-sky-50/60 border border-sky-200/60 rounded-lg text-[11px] text-[#2457A7]">
-                  Waktu makan siang dikosongkan: scheduler bebas mencari slot tugas di tengah hari tanpa memblokir jam makan siang.
-                </div>
-              )}
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-[#172B42] mb-1">
-                Jeda Buffer Antar Sesi (Menit)
-              </label>
-              <select
-                value={bufferMinutes}
-                onChange={(e) => setBufferMinutes(Number(e.target.value))}
-                className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm bg-white"
-              >
-                <option value={0}>0 menit (tanpa jeda)</option>
-                <option value={10}>10 menit</option>
-                <option value={15}>15 menit (direkomendasikan)</option>
-                <option value={30}>30 menit</option>
-              </select>
+              <div>
+                <label className="block text-xs font-semibold text-[#172B42] mb-1">
+                  Buffer Antar Sesi
+                </label>
+                <select
+                  value={bufferMinutes}
+                  onChange={(e) => setBufferMinutes(Number(e.target.value))}
+                  className="w-full px-3 py-2 rounded-xl border border-[#D9E3EF] text-sm"
+                >
+                  <option value={0}>0 menit</option>
+                  <option value={10}>10 menit</option>
+                  <option value={15}>15 menit</option>
+                  <option value={30}>30 menit</option>
+                </select>
+              </div>
             </div>
 
             {/* Workdays */}

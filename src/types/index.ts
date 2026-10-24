@@ -70,13 +70,10 @@ export interface UserPreferences {
   displayName: string;
   email: string;
   timezone: string;
-  workStartHour: number; // e.g., 9 (range 7 to 24)
-  workEndHour: number;   // e.g., 18 (range 7 to 24)
-  lunchBreakEnabled?: boolean; // If false or omitted, lunch break is not deducted
-  lunchStartHour?: number; // e.g., 12
-  lunchEndHour?: number;   // e.g., 13
-  lunchBreakStartHour?: number; // synonym for lunchStartHour
-  lunchBreakEndHour?: number;   // synonym for lunchEndHour
+  workStartHour: number; // e.g., 9
+  workEndHour: number;   // e.g., 18
+  lunchStartHour: number; // e.g., 12
+  lunchEndHour: number;   // e.g., 13
   bufferMinutes: number;  // e.g., 15
   workDays: number[];     // [1,2,3,4,5] (Senin = 1, Minggu = 0)
   googleCalendarConnected: boolean;
@@ -85,22 +82,10 @@ export interface UserPreferences {
   allowAutoSplit: boolean;
 }
 
-export type ScheduleFailureCode =
-  | 'DEADLINE_PASSED'
-  | 'CALENDAR_NOT_CONNECTED'
-  | 'CALENDAR_READ_FAILED'
-  | 'TIME_CONFLICT'
-  | 'NO_SLOT_BEFORE_DEADLINE'
-  | 'PREFERRED_WINDOW_FULL'
-  | 'INVALID_TIME_RANGE'
-  | 'CALENDAR_WRITE_FAILED'
-  | 'SYNC_PENDING';
-
 export interface ScheduleCalculationResult {
   success: boolean;
   taskId: string;
   taskTitle: string;
-  failureCode?: ScheduleFailureCode;
   proposedSessions: {
     startAt: string;
     endAt: string;
@@ -110,13 +95,6 @@ export interface ScheduleCalculationResult {
   }[];
   explanation: string;
   warning?: string;
-  diagnostics?: {
-    freeTimeCalculatedMinutes?: number;
-    totalSlotsEvaluated?: number;
-    calendarEventsCount?: number;
-    conflictingEvents?: string[];
-    [key: string]: unknown;
-  };
 }
 
 export interface AIPlanDraft {
