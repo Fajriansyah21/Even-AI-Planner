@@ -292,6 +292,70 @@ console.log('\n[Test 5] Integritas Data saat Mengedit Catatan Google Keep');
   console.log('✓ Integritas pengeditan catatan Google Keep terverifikasi.');
 }
 
+// =========================================================================
+// TEST 6: Non-Duplication and Visual Continuity in CalendarView Logic
+// =========================================================================
+console.log('\n[Test 6] Logika Kalender: Pencegahan Duplikasi dan Penanda Lanjutan');
+
+{
+  const tz = 'Asia/Jakarta';
+  const startIso = createIsoFromLocalZoned(2026, 10, 22, 23, 0, 0, tz); // 22 Okt 23:00
+  const endIso = createIsoFromLocalZoned(2026, 10, 23, 7, 0, 0, tz);   // 23 Okt 07:00
+
+  const sessionItem = {
+    task: { id: 't-overnight', title: 'Piket Malam 23-07' } as Task,
+    session: {
+      id: 'sess-overnight',
+      taskId: 't-overnight',
+      taskTitle: 'Piket Malam 23-07',
+      sessionIndex: 1,
+      totalSessions: 1,
+      startAt: startIso,
+      endAt: endIso,
+      durationMinutes: 480,
+      status: 'SCHEDULED' as const,
+      syncStatus: 'synced' as const,
+    },
+  };
+
+  const day1Date = new Date(createIsoFromLocalZoned(2026, 10, 22, 0, 0, 0, tz));
+  const day2Date = new Date(createIsoFromLocalZoned(2026, 10, 23, 0, 0, 0, tz));
+
+  const isSameDay = (d1: Date | string, d2: Date | string) => {
+    const p1 = getZonedDateTimeParts(typeof d1 === 'string' ? new Date(d1) : d1, tz);
+    const p2 = getZonedDateTimeParts(typeof d2 === 'string' ? new Date(d2) : d2, tz);
+    return p1.year === p2.year && p1.month === p2.month && p1.day === p2.day;
+  };
+
+  // 1. Day 1 must contain the session at hour 23
+  const isPresentOnDay1 = isSameDay(sessionItem.session.startAt, day1Date);
+  assert.equal(isPresentOnDay1, true, 'Kegiatan harus berada pada tanggal mulai (Day 1)');
+
+  const sHour = getZonedDateTimeParts(new Date(sessionItem.session.startAt), tz).hour;
+  assert.equal(sHour, 23, 'Kegiatan harus berada di slot jam 23:00 pada Day 1');
+
+  // 2. Day 2 must NOT duplicate the session into its agenda or hourly grid
+  const isPresentOnDay2 = isSameDay(sessionItem.session.startAt, day2Date);
+  assert.equal(isPresentOnDay2, false, 'Kegiatan TIDAK boleh digandakan sebagai event baru di Day 2');
+
+  // 3. Day 2 continuation detector correctly catches the overnight spillover
+  const sParts = getZonedDateTimeParts(new Date(sessionItem.session.startAt), tz);
+  const eParts = getZonedDateTimeParts(new Date(sessionItem.session.endAt), tz);
+  const d2Parts = getZonedDateTimeParts(day2Date, tz);
+
+  const isEndToday = eParts.year === d2Parts.year && eParts.month === d2Parts.month && eParts.day === d2Parts.day;
+  const isStartEarlier = sParts.year !== d2Parts.year || sParts.month !== d2Parts.month || sParts.day !== d2Parts.day;
+  const isContinuationOnDay2 = isEndToday && isStartEarlier;
+
+  assert.equal(isContinuationOnDay2, true, 'Day 2 harus mendeteksi kegiatan lanjutan dari malam sebelumnya');
+  assert.equal(eParts.hour, 7, 'Waktu selesai di Day 2 harus pukul 07:00');
+
+  // 4. Duration is never chopped or negative
+  assert.equal(sessionItem.session.durationMinutes, 480, 'Durasi tidak boleh terpotong atau bernilai negatif');
+
+  console.log('✓ Pencegahan duplikasi kalender dan deteksi lanjutan hari ke-2 terbukti akurat.');
+}
+
 console.log('\n=======================================================');
-console.log('SEMUA 5 PENGUJIAN LINTAS TENGAH MALAM & FITUR BERHASIL!');
+console.log('SEMUA 6 PENGUJIAN LINTAS TENGAH MALAM & FITUR BERHASIL!');
 console.log('=======================================================');

@@ -209,7 +209,7 @@ export function scheduleTaskDeterministically(
         warning: 'Silakan sesuaikan jam komitmen atau pindahkan agenda yang bertabrakan di kalender.',
         diagnostics: {
           conflictingEvents,
-          calendarEventsCount: existingEvents.length,
+          calendarEventsCount: safeEvents.length,
         },
       };
     }
@@ -240,7 +240,7 @@ export function scheduleTaskDeterministically(
       ],
       explanation: `Komitmen waktu tetap berhasil ditempatkan pada ${dayStr}, pukul ${timeStr}. Jadwal ini dikunci tepat sesuai waktu yang Anda minta.`,
       diagnostics: {
-        calendarEventsCount: existingEvents.length,
+        calendarEventsCount: safeEvents.length,
         conflictingEvents: [],
       },
     };

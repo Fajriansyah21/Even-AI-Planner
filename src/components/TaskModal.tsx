@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { X, Calendar, Clock, AlertCircle, Layers, Sparkles, UserCheck } from 'lucide-react';
 import { Task, Priority } from '../types';
 import {
@@ -73,8 +73,7 @@ function getInitialFormState(taskToEdit: Task | null | undefined, tz: string) {
   };
 }
 
-export const TaskModal: React.FC<TaskModalProps> = ({
-  isOpen,
+const TaskModalInner: React.FC<TaskModalProps> = ({
   taskToEdit,
   onClose,
   onSave,
@@ -105,8 +104,6 @@ export const TaskModal: React.FC<TaskModalProps> = ({
   const [minimumSessionMinutes, setMinimumSessionMinutes] = useState(initial.minimumSessionMinutes);
 
   const [errorMsg, setErrorMsg] = useState('');
-
-  if (!isOpen) return null;
 
   // Auto-calculated manual timestamps & duration
   const getManualTimeMeta = () => {
@@ -541,3 +538,9 @@ export const TaskModal: React.FC<TaskModalProps> = ({
     </div>
   );
 };
+
+export const TaskModal: React.FC<TaskModalProps> = (props) => {
+  if (!props.isOpen) return null;
+  return <TaskModalInner key={props.taskToEdit?.id || 'new-task'} {...props} />;
+};
+

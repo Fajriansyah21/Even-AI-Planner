@@ -4,11 +4,12 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "build": "NODE_ENV=production next build",
+    "start": "node server.js",
     "lint": "eslint .",
     "test": "tsx tests/timezone.test.ts && tsx tests/cross-midnight-and-features.test.ts && tsx tests/parser-scheduler.test.ts && tsx tests/gemini-error-handling.test.ts && tsx tests/auth-and-truth.test.ts",
-    "clean": "next clean"
+    "clean": "next clean",
+    "postinstall": "node scripts/patch-devtools.js"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

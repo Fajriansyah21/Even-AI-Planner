@@ -64,6 +64,7 @@ export default function App() {
   const [userId, setUserId] = useState<string | null>(null);
 
   const [preferences, setPreferences] = useState<UserPreferences>(() => {
+    if (typeof window === 'undefined') return INITIAL_PREFERENCES;
     try {
       const saved = localStorage.getItem('even_preferences');
       return saved ? JSON.parse(saved) : INITIAL_PREFERENCES;
@@ -74,6 +75,7 @@ export default function App() {
 
   // Tasks state
   const [tasks, setTasks] = useState<Task[]>(() => {
+    if (typeof window === 'undefined') return getInitialTasks();
     try {
       const saved = localStorage.getItem('even_tasks');
       return saved ? JSON.parse(saved) : getInitialTasks();
@@ -84,6 +86,7 @@ export default function App() {
 
   // Calendar Events state
   const [events, setEvents] = useState<CalendarEvent[]>(() => {
+    if (typeof window === 'undefined') return getInitialEvents();
     try {
       const saved = localStorage.getItem('even_events');
       return saved ? JSON.parse(saved) : getInitialEvents();
@@ -94,6 +97,7 @@ export default function App() {
 
   // Google Keep Notes state
   const [keepNotes, setKeepNotes] = useState<KeepNote[]>(() => {
+    if (typeof window === 'undefined') return getInitialKeepNotes();
     try {
       const saved = localStorage.getItem('even_keep_notes');
       return saved ? JSON.parse(saved) : getInitialKeepNotes();

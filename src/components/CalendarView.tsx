@@ -221,6 +221,22 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                 const today = isToday(date);
                 const dayName = new Intl.DateTimeFormat('id-ID', { weekday: 'short' }).format(date);
 
+                // Check if any overnight event or task from previous day finishes on this day
+                const dParts = getZonedDateTimeParts(date, tz);
+                const hasContinuingOvernight = scheduledSessions.some(({ session }) => {
+                  const sParts = getZonedDateTimeParts(new Date(session.startAt), tz);
+                  const eParts = getZonedDateTimeParts(new Date(session.endAt), tz);
+                  const isEndToday = eParts.year === dParts.year && eParts.month === dParts.month && eParts.day === dParts.day;
+                  const isStartEarlier = sParts.year !== dParts.year || sParts.month !== dParts.month || sParts.day !== dParts.day;
+                  return isEndToday && isStartEarlier;
+                }) || events.some((evt) => {
+                  const sParts = getZonedDateTimeParts(new Date(evt.startAt), tz);
+                  const eParts = getZonedDateTimeParts(new Date(evt.endAt), tz);
+                  const isEndToday = eParts.year === dParts.year && eParts.month === dParts.month && eParts.day === dParts.day;
+                  const isStartEarlier = sParts.year !== dParts.year || sParts.month !== dParts.month || sParts.day !== dParts.day;
+                  return isEndToday && isStartEarlier;
+                });
+
                 return (
                   <div
                     key={idx}
@@ -240,6 +256,14 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                     >
                       {date.getDate()}
                     </span>
+                    {hasContinuingOvernight && (
+                      <span
+                        className="block mx-auto mt-1 text-[9px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200/80 px-1.5 py-0.2 rounded-full w-fit leading-tight"
+                        title="Ada kegiatan malam yang berlanjut hingga pagi hari ini"
+                      >
+                        🌙 Lanjutan
+                      </span>
+                    )}
                   </div>
                 );
               })}
@@ -296,43 +320,54 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                           )}
 
                           {/* Render Google Calendar Events */}
-                          {hourEvents.map((evt) => (
-                            <div
-                              key={evt.id}
-                              onClick={() => setSelectedEventDetails(evt)}
-                              className="mb-1 p-2 bg-[#2457A7]/10 hover:bg-[#2457A7]/15 border-l-3 border-[#2457A7] rounded-md cursor-pointer transition-all shadow-2xs text-left"
-                            >
-                              <div className="flex items-center justify-between gap-1">
-                                <span className="text-xs font-semibold text-[#172B42] truncate">
-                                  {evt.title}
-                                </span>
-                                <span title="Read-only Google Event">
-                                  <Lock size={10} className="text-[#53657A] shrink-0" />
-                                </span>
-                              </div>
-                              <div className="flex items-center gap-1.5 mt-0.5 text-[10px] text-[#53657A]">
-                                <span className="font-mono">
-                                  {formatInUserTimezone(evt.startAt, tz, {
-                                    hour: '2-digit',
-                                    minute: '2-digit',
-                                    hour12: false,
-                                  })}
-                                </span>
-                                {evt.meetUrl && (
-                                  <span className="flex items-center gap-0.5 text-[#2457A7] font-medium">
-                                    <Video size={10} /> Meet
+                          {hourEvents.map((evt) => {
+                            const sParts = getZonedDateTimeParts(new Date(evt.startAt), tz);
+                            const eParts = getZonedDateTimeParts(new Date(evt.endAt), tz);
+                            const isCross = eParts.day !== sParts.day || eParts.month !== sParts.month || eParts.year !== sParts.year;
+                            const startStr = formatInUserTimezone(evt.startAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false });
+                            const endStr = formatInUserTimezone(evt.endAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false });
+
+                            return (
+                              <div
+                                key={evt.id}
+                                onClick={() => setSelectedEventDetails(evt)}
+                                className="mb-1 p-2 bg-[#2457A7]/10 hover:bg-[#2457A7]/15 border-l-3 border-[#2457A7] rounded-md cursor-pointer transition-all shadow-2xs text-left"
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="text-xs font-semibold text-[#172B42] truncate" title={evt.title}>
+                                    {evt.title}
                                   </span>
-                                )}
+                                  <span title="Read-only Google Event">
+                                    <Lock size={10} className="text-[#53657A] shrink-0" />
+                                  </span>
+                                </div>
+                                <div className="flex items-center justify-between gap-1 mt-0.5 text-[10px] text-[#53657A]">
+                                  <span className="font-mono">
+                                    {startStr} - {endStr}
+                                  </span>
+                                  {isCross && (
+                                    <span className="bg-indigo-100 text-indigo-800 text-[9px] px-1 py-0.2 rounded font-semibold shrink-0">
+                                      🌙 +1 hr
+                                    </span>
+                                  )}
+                                  {evt.meetUrl && (
+                                    <span className="flex items-center gap-0.5 text-[#2457A7] font-medium shrink-0">
+                                      <Video size={10} /> Meet
+                                    </span>
+                                  )}
+                                </div>
                               </div>
-                            </div>
-                          ))}
+                            );
+                          })}
 
                           {/* Render EVEN Scheduled Task Sessions */}
                           {hourSessions.map(({ task, session }) => {
                             const isDone = session.status === 'COMPLETED';
                             const sParts = getZonedDateTimeParts(new Date(session.startAt), tz);
                             const eParts = getZonedDateTimeParts(new Date(session.endAt), tz);
-                            const isCross = eParts.day !== sParts.day || eParts.month !== sParts.month;
+                            const isCross = eParts.day !== sParts.day || eParts.month !== sParts.month || eParts.year !== sParts.year;
+                            const startStr = formatInUserTimezone(session.startAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false });
+                            const endStr = formatInUserTimezone(session.endAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false });
 
                             return (
                               <div
@@ -345,7 +380,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                                 }`}
                               >
                                 <div className="flex items-start justify-between gap-1">
-                                  <span className="text-xs font-semibold truncate leading-tight">
+                                  <span className="text-xs font-semibold truncate leading-tight" title={session.taskTitle}>
                                     {session.taskTitle}
                                   </span>
                                   <button
@@ -362,13 +397,21 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                                     />
                                   </button>
                                 </div>
+                                <div className="flex items-center justify-between gap-1 mt-0.5 text-[10px] text-[#53657A] font-mono">
+                                  <span>{startStr} - {endStr}</span>
+                                  {isCross && (
+                                    <span className="bg-indigo-100 text-indigo-800 text-[9px] px-1.5 py-0.2 rounded font-semibold font-sans shrink-0">
+                                      🌙 +1 hr
+                                    </span>
+                                  )}
+                                </div>
                                 <div className="flex flex-wrap items-center gap-1.5 mt-1 text-[10px] text-[#53657A]">
                                   <span className="font-mono">
                                     {session.durationMinutes} mnt
                                   </span>
                                   {isCross && (
-                                    <span className="bg-indigo-100 text-indigo-800 text-[9px] px-1 py-0.2 rounded font-medium">
-                                      🌙 +1 hari
+                                    <span className="text-indigo-700 text-[9px] font-medium">
+                                      (Selesai esok {endStr})
                                     </span>
                                   )}
                                   {session.totalSessions > 1 && (
@@ -408,24 +451,105 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
         )}
 
         {/* Daily Agenda View (Mobile priority) */}
-        {viewMode === 'day' && (
-          <div className="max-w-2xl mx-auto space-y-3">
-            <div className="p-4 bg-white border border-[#D9E3EF] rounded-2xl shadow-xs">
-              <h3 className="font-bold text-[#172B42] text-sm mb-3 flex items-center justify-between">
-                <span>Agenda Hari Ini</span>
-                <span className="text-xs text-[#53657A] font-normal">
-                  {new Intl.DateTimeFormat('id-ID', { dateStyle: 'full' }).format(currentDate)}
-                </span>
-              </h3>
+        {viewMode === 'day' && (() => {
+          const curParts = getZonedDateTimeParts(currentDate, tz);
+          const dayEvents = getEventsForDay(currentDate);
+          const daySessions = getSessionsForDay(currentDate);
 
-              {getEventsForDay(currentDate).length === 0 && getSessionsForDay(currentDate).length === 0 ? (
-                <div className="py-10 text-center text-[#53657A]">
-                  <CalendarIcon className="w-8 h-8 mx-auto text-[#8DBCEB] mb-2 opacity-60" />
-                  <p className="text-xs font-medium text-[#172B42]">Tidak ada agenda atau tugas hari ini.</p>
-                  <p className="text-[11px] mt-1">Gunakan tombol &ldquo;+ Tugas Baru&rdquo; atau minta AI merencanakan hari Anda.</p>
-                </div>
-              ) : (
-                <div className="space-y-2.5">
+          // Find activities from yesterday night that continue into today
+          const continuingIntoToday = [
+            ...scheduledSessions
+              .filter(({ session }) => {
+                const sParts = getZonedDateTimeParts(new Date(session.startAt), tz);
+                const eParts = getZonedDateTimeParts(new Date(session.endAt), tz);
+                const isEndToday = eParts.year === curParts.year && eParts.month === curParts.month && eParts.day === curParts.day;
+                const isStartEarlier = sParts.year !== curParts.year || sParts.month !== curParts.month || sParts.day !== curParts.day;
+                return isEndToday && isStartEarlier;
+              })
+              .map(({ session, task }) => ({
+                id: session.id,
+                title: session.taskTitle,
+                type: 'Fokus EVEN',
+                startTime: formatInUserTimezone(session.startAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false }),
+                endTime: formatInUserTimezone(session.endAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false }),
+                duration: session.durationMinutes,
+                task,
+                session,
+              })),
+            ...events
+              .filter((evt) => {
+                const sParts = getZonedDateTimeParts(new Date(evt.startAt), tz);
+                const eParts = getZonedDateTimeParts(new Date(evt.endAt), tz);
+                const isEndToday = eParts.year === curParts.year && eParts.month === curParts.month && eParts.day === curParts.day;
+                const isStartEarlier = sParts.year !== curParts.year || sParts.month !== curParts.month || sParts.day !== curParts.day;
+                return isEndToday && isStartEarlier;
+              })
+              .map((evt) => ({
+                id: evt.id,
+                title: evt.title,
+                type: 'Rapat Google',
+                startTime: formatInUserTimezone(evt.startAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false }),
+                endTime: formatInUserTimezone(evt.endAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false }),
+                duration: Math.round((new Date(evt.endAt).getTime() - new Date(evt.startAt).getTime()) / 60000),
+                evt,
+              })),
+          ];
+
+          const isDayEmpty = dayEvents.length === 0 && daySessions.length === 0 && continuingIntoToday.length === 0;
+
+          return (
+            <div className="max-w-2xl mx-auto space-y-3">
+              <div className="p-4 bg-white border border-[#D9E3EF] rounded-2xl shadow-xs">
+                <h3 className="font-bold text-[#172B42] text-sm mb-3 flex items-center justify-between">
+                  <span>Agenda Hari Ini</span>
+                  <span className="text-xs text-[#53657A] font-normal">
+                    {new Intl.DateTimeFormat('id-ID', { dateStyle: 'full' }).format(currentDate)}
+                  </span>
+                </h3>
+
+                {/* Overnight continuation banner if activities from yesterday continue into today */}
+                {continuingIntoToday.length > 0 && (
+                  <div className="p-3 bg-indigo-50/80 border border-indigo-200/80 rounded-xl space-y-2 mb-3">
+                    <div className="flex items-center gap-1.5 font-bold text-indigo-900 text-[11px] uppercase tracking-wider">
+                      <Clock size={13} className="text-indigo-600" />
+                      <span>Lanjutan Kegiatan dari Kemarin Malam</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {continuingIntoToday.map((c) => (
+                        <div
+                          key={c.id}
+                          onClick={() => {
+                            if ('session' in c && c.task && c.session) {
+                              setSelectedSessionDetails({ task: c.task, session: c.session });
+                            } else if ('evt' in c && c.evt) {
+                              setSelectedEventDetails(c.evt);
+                            }
+                          }}
+                          className="flex items-center justify-between text-xs bg-white/90 p-2.5 rounded-lg border border-indigo-100 hover:border-indigo-300 transition-colors cursor-pointer"
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] bg-indigo-100 text-indigo-800 px-1.5 py-0.2 rounded font-medium">
+                              🌙 Lanjutan
+                            </span>
+                            <span className="font-semibold text-[#172B42]">{c.title}</span>
+                          </div>
+                          <span className="text-[11px] font-mono text-[#53657A]">
+                            Mulai kemarin {c.startTime} → Selesai hari ini pukul {c.endTime} WIB
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {isDayEmpty ? (
+                  <div className="py-10 text-center text-[#53657A]">
+                    <CalendarIcon className="w-8 h-8 mx-auto text-[#8DBCEB] mb-2 opacity-60" />
+                    <p className="text-xs font-medium text-[#172B42]">Tidak ada agenda atau tugas hari ini.</p>
+                    <p className="text-[11px] mt-1">Gunakan tombol &ldquo;+ Tugas Baru&rdquo; atau minta AI merencanakan hari Anda.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
                   {/* Google Events */}
                   {getEventsForDay(currentDate).map((evt) => (
                     <div
@@ -515,7 +639,8 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               )}
             </div>
           </div>
-        )}
+        );
+      })()}
 
         {/* Monthly View */}
         {viewMode === 'month' && (
@@ -588,7 +713,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
 
             <div className="text-xs text-[#53657A] space-y-2">
               <div className="flex items-center gap-2">
-                <Clock size={14} className="text-[#2457A7]" />
+                <Clock size={14} className="text-[#2457A7] shrink-0" />
                 <span>
                   {formatInUserTimezone(selectedEventDetails.startAt, tz, {
                     weekday: 'long',
@@ -600,12 +725,31 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                   })}
                   {' — '}
                   {formatInUserTimezone(selectedEventDetails.endAt, tz, {
+                    weekday: 'long',
+                    day: 'numeric',
+                    month: 'long',
                     hour: '2-digit',
                     minute: '2-digit',
                     hour12: false,
                   })} WIB
                 </span>
               </div>
+
+              {(() => {
+                const sParts = getZonedDateTimeParts(new Date(selectedEventDetails.startAt), tz);
+                const eParts = getZonedDateTimeParts(new Date(selectedEventDetails.endAt), tz);
+                const isCross = eParts.day !== sParts.day || eParts.month !== sParts.month || eParts.year !== sParts.year;
+                if (!isCross) return null;
+                return (
+                  <div className="p-2.5 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center gap-2 text-xs text-indigo-900">
+                    <Clock size={14} className="text-indigo-600 shrink-0" />
+                    <span>
+                      Rapat ini berlangsung melintasi tengah malam hingga pagi hari berikutnya (berakhir pukul{' '}
+                      {formatInUserTimezone(selectedEventDetails.endAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false })} WIB).
+                    </span>
+                  </div>
+                );
+              })()}
 
               {selectedEventDetails.attendees && (
                 <div className="flex items-start gap-2 pt-1">
@@ -659,7 +803,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
 
             <div className="text-xs text-[#53657A] space-y-2">
               <div className="flex items-center gap-2">
-                <Clock size={14} className="text-[#2457A7]" />
+                <Clock size={14} className="text-[#2457A7] shrink-0" />
                 <span>
                   {formatInUserTimezone(selectedSessionDetails.session.startAt, tz, {
                     weekday: 'long',
@@ -680,6 +824,23 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                   })} WIB
                 </span>
               </div>
+
+              {(() => {
+                const sParts = getZonedDateTimeParts(new Date(selectedSessionDetails.session.startAt), tz);
+                const eParts = getZonedDateTimeParts(new Date(selectedSessionDetails.session.endAt), tz);
+                const isCross = eParts.day !== sParts.day || eParts.month !== sParts.month || eParts.year !== sParts.year;
+                if (!isCross) return null;
+                return (
+                  <div className="p-2.5 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center gap-2 text-xs text-indigo-900">
+                    <Clock size={14} className="text-indigo-600 shrink-0" />
+                    <span>
+                      Kegiatan ini berlangsung melintasi tengah malam hingga pagi hari berikutnya (berakhir pukul{' '}
+                      {formatInUserTimezone(selectedSessionDetails.session.endAt, tz, { hour: '2-digit', minute: '2-digit', hour12: false })} WIB).
+                    </span>
+                  </div>
+                );
+              })()}
+
               <p>
                 Durasi pengerjaan: <strong className="text-[#172B42]">{selectedSessionDetails.session.durationMinutes} menit</strong>
                 {selectedSessionDetails.session.totalSessions > 1 && ` (Bagian ${selectedSessionDetails.session.sessionIndex} dari ${selectedSessionDetails.session.totalSessions} sesi)`}
