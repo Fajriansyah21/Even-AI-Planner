@@ -1,8 +1,29 @@
 export type Priority = 'LOW' | 'MEDIUM' | 'HIGH' | 'URGENT';
 
-export type TaskStatus = 'UNSCHEDULED' | 'SCHEDULED' | 'IN_PROGRESS' | 'COMPLETED';
+export type TaskStatus =
+  | 'UNSCHEDULED'
+  | 'SCHEDULED'
+  | 'IN_PROGRESS'
+  | 'COMPLETED'
+  | 'completed_manual'
+  | 'missed_auto';
+
+export type SessionStatus =
+  | 'SCHEDULED'
+  | 'COMPLETED'
+  | 'CANCELLED'
+  | 'completed_manual'
+  | 'missed_auto';
 
 export type SyncStatus = 'synced' | 'pending' | 'failed' | 'needs_reconciliation';
+
+export type RescheduleDecision = 'pending' | 'rescheduled' | 'dismissed';
+
+export interface StatusHistoryEntry {
+  status: TaskStatus;
+  changedAt: string; // ISO date string
+  reason?: string;
+}
 
 export interface TaskScheduleSession {
   id: string;
@@ -13,10 +34,12 @@ export interface TaskScheduleSession {
   startAt: string; // ISO date string
   endAt: string;   // ISO date string
   durationMinutes: number;
-  status: 'SCHEDULED' | 'COMPLETED' | 'CANCELLED';
+  status: SessionStatus;
   syncStatus: SyncStatus;
   googleCalendarEventId?: string;
   htmlLink?: string;
+  completedAt?: string;
+  missedAt?: string;
 }
 
 export type TimeConstraintType = 'fixed_event' | 'preferred_window' | 'deadline_only';
@@ -50,6 +73,14 @@ export interface Task {
   timezone?: string;
   createdAt: string;
   scheduledSessions?: TaskScheduleSession[];
+  // History & Reschedule Fields
+  completedAt?: string;
+  missedAt?: string;
+  rescheduleDecision?: RescheduleDecision;
+  rescheduledToTaskId?: string;
+  rescheduledFromTaskId?: string;
+  dismissedAt?: string;
+  statusHistory?: StatusHistoryEntry[];
 }
 
 export interface CalendarEvent {

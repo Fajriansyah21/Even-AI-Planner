@@ -11,6 +11,14 @@ import { OnboardingModal } from './components/OnboardingModal';
 import { TaskModal } from './components/TaskModal';
 import { ScheduleResultModal } from './components/ScheduleResultModal';
 import { BatchScheduleModal } from './components/BatchScheduleModal';
+import { HistoryView } from './components/HistoryView';
+import { RescheduleModal } from './components/RescheduleModal';
+import {
+  auditAndTransitionOverdueTasks,
+  completeTaskManually,
+  dismissMissedTask,
+  prepareRescheduledTask,
+} from './lib/activityStatusManager';
 import {
   Task,
   CalendarEvent,
@@ -54,7 +62,8 @@ import { doc, setDoc, deleteDoc } from 'firebase/firestore';
 
 export default function App() {
   // Navigation tab
-  const [currentTab, setCurrentTab] = useState<'calendar' | 'tasks' | 'keep' | 'ai' | 'settings'>('calendar');
+  const [currentTab, setCurrentTab] = useState<'calendar' | 'tasks' | 'keep' | 'ai' | 'settings' | 'history'>('calendar');
+  const [rescheduleTaskTarget, setRescheduleTaskTarget] = useState<Task | null>(null);
 
   // User state - starts unauthenticated until verified
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -221,6 +230,41 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('even_keep_notes', JSON.stringify(keepNotes));
   }, [keepNotes]);
+
+  // Automated audit to transition overdue tasks to missed_auto
+  useEffect(() => {
+    const runAudit = () => {
+      setTasks((prevTasks) => {
+        const { updatedTasks, transitionedCount } = auditAndTransitionOverdueTasks(prevTasks);
+        if (transitionedCount > 0) {
+          if (userId && userId !== 'user-default') {
+            for (const t of updatedTasks) {
+              const old = prevTasks.find((p) => p.id === t.id);
+              if (old && (old.status !== t.status || old.missedAt !== t.missedAt)) {
+                setDoc(doc(db, 'users', userId, 'tasks', t.id), sanitizeForFirestore(t)).catch((err) => {
+                  handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${t.id}`);
+                });
+              }
+            }
+          }
+          return updatedTasks;
+        }
+        return prevTasks;
+      });
+    };
+
+    runAudit();
+    const interval = setInterval(runAudit, 30000);
+    const handleFocus = () => runAudit();
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleFocus);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleFocus);
+    };
+  }, [userId]);
 
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'success') => {
     setNotification({ message, type });
@@ -403,7 +447,7 @@ export default function App() {
       setTasks((prev) =>
         prev.map((t) => (t.id === editTaskId ? updatedTask : t))
       );
-      showToast(`Tugas "${taskData.title}" berhasil diperbarui.`);
+      showToast(`Kegiatan "${taskData.title}" berhasil diperbarui.`);
 
       // Persist to Firestore if user is authenticated and document id is valid
       if (userId && userId !== 'user-default' && editTaskId) {
@@ -424,7 +468,7 @@ export default function App() {
         scheduledSessions: [],
       };
       setTasks((prev) => [newTask, ...prev]);
-      showToast(`Tugas baru "${newTask.title}" berhasil dibuat.`);
+      showToast(`Kegiatan baru "${newTask.title}" berhasil dibuat.`);
 
       // Persist to Firestore if user is authenticated and document id is valid
       if (userId && userId !== 'user-default' && newTaskId) {
@@ -445,12 +489,12 @@ export default function App() {
 
     setConfirmModal({
       isOpen: true,
-      title: 'Hapus Tugas?',
-      description: `Apakah Anda yakin ingin menghapus tugas "${taskToDelete.title}"? Sesi pengerjaan yang sudah dijadwalkan juga akan dibatalkan. Tindakan ini tidak dapat dibatalkan.`,
-      actionLabel: 'Hapus Tugas',
+      title: 'Hapus Kegiatan?',
+      description: `Apakah Anda yakin ingin menghapus kegiatan "${taskToDelete.title}"? Sesi pengerjaan yang sudah dijadwalkan juga akan dibatalkan. Tindakan ini tidak dapat dibatalkan.`,
+      actionLabel: 'Hapus Kegiatan',
       onConfirm: async () => {
         setTasks((prev) => prev.filter((t) => t.id !== taskId));
-        showToast(`Tugas "${taskToDelete.title}" telah dihapus.`, 'info');
+        showToast(`Kegiatan "${taskToDelete.title}" telah dihapus.`, 'info');
         setConfirmModal((prev) => ({ ...prev, isOpen: false }));
 
         if (userId && userId !== 'user-default') {
@@ -469,17 +513,25 @@ export default function App() {
     setTasks((prev) =>
       prev.map((t) => {
         if (t.id === taskId) {
-          const isDone = t.status === 'COMPLETED';
-          const nextStatus = isDone ? 'UNSCHEDULED' : 'COMPLETED';
-          changedTask = {
-            ...t,
-            userId: userId || t.userId || 'user-default',
-            status: nextStatus,
-            scheduledSessions: t.scheduledSessions?.map((s) => ({
-              ...s,
-              status: isDone ? 'SCHEDULED' : 'COMPLETED',
-            })),
-          };
+          const isDone = t.status === 'completed_manual' || t.status === 'COMPLETED';
+          if (isDone) {
+            const hasSessions = t.scheduledSessions && t.scheduledSessions.length > 0;
+            changedTask = {
+              ...t,
+              userId: userId || t.userId || 'user-default',
+              status: hasSessions ? 'SCHEDULED' : 'UNSCHEDULED',
+              completedAt: undefined,
+              scheduledSessions: t.scheduledSessions?.map((s) => ({
+                ...s,
+                status: 'SCHEDULED',
+              })),
+            };
+          } else {
+            changedTask = {
+              ...completeTaskManually(t),
+              userId: userId || t.userId || 'user-default',
+            };
+          }
           return changedTask;
         }
         return t;
@@ -499,24 +551,10 @@ export default function App() {
     let changedTask: Task | null = null;
     setTasks((prev) =>
       prev.map((t) => {
-        if (t.id === taskId && t.scheduledSessions) {
-          const updatedSessions = t.scheduledSessions.map((s) => {
-            if (s.id === sessionId) {
-              const isDone = s.status === 'COMPLETED';
-              return {
-                ...s,
-                status: isDone ? ('SCHEDULED' as const) : ('COMPLETED' as const),
-              };
-            }
-            return s;
-          });
-
-          const allDone = updatedSessions.every((s) => s.status === 'COMPLETED');
+        if (t.id === taskId) {
           changedTask = {
-            ...t,
+            ...completeTaskManually(t, new Date(), sessionId),
             userId: userId || t.userId || 'user-default',
-            status: allDone ? 'COMPLETED' : 'IN_PROGRESS',
-            scheduledSessions: updatedSessions,
           };
           return changedTask;
         }
@@ -531,6 +569,109 @@ export default function App() {
         handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
       }
     }
+  };
+
+  const handleDismissMissedTask = async (taskId: string) => {
+    const targetTask = tasks.find((t) => t.id === taskId);
+    if (!targetTask) return;
+
+    const dismissed = dismissMissedTask(targetTask);
+    const updatedWithUser: Task = {
+      ...dismissed,
+      userId: userId || targetTask.userId || 'user-default',
+    };
+
+    setTasks((prev) => prev.map((t) => (t.id === taskId ? updatedWithUser : t)));
+
+    if (userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'tasks', taskId), sanitizeForFirestore(updatedWithUser));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
+      }
+    }
+
+    showToast(`Kegiatan "${targetTask.title}" diabaikan dan disimpan di Riwayat.`, 'info');
+  };
+
+  const handleConfirmReschedule = async (
+    originalTask: Task,
+    newDeadlineAt: string | null,
+    manualTime?: { startAt: string; endAt: string }
+  ) => {
+    const currentUserId = userId || originalTask.userId || 'user-default';
+
+    let scheduleResult: ScheduleCalculationResult;
+
+    if (manualTime) {
+      const dur = Math.round(
+        (new Date(manualTime.endAt).getTime() - new Date(manualTime.startAt).getTime()) / 60000
+      );
+      scheduleResult = {
+        success: true,
+        taskId: originalTask.id,
+        taskTitle: originalTask.title,
+        proposedSessions: [
+          {
+            sessionIndex: 1,
+            totalSessions: 1,
+            startAt: manualTime.startAt,
+            endAt: manualTime.endAt,
+            durationMinutes: dur > 0 ? dur : originalTask.estimatedDurationMinutes,
+          },
+        ],
+      };
+    } else {
+      const candidateTask: Task = {
+        ...originalTask,
+        deadlineAt: newDeadlineAt,
+        status: 'UNSCHEDULED',
+      };
+      scheduleResult = scheduleTaskDeterministically(
+        candidateTask,
+        events,
+        tasks.filter((t) => t.id !== originalTask.id),
+        preferences
+      );
+    }
+
+    if (!scheduleResult.success || scheduleResult.proposedSessions.length === 0) {
+      showToast(
+        scheduleResult.failureReason ||
+          'Tidak ditemukan slot waktu luang yang cocok. Periksa jam kerja atau tenggat waktu.',
+        'error'
+      );
+      return;
+    }
+
+    const { newTask, updatedOriginalTask } = prepareRescheduledTask(
+      originalTask,
+      scheduleResult,
+      newDeadlineAt
+    );
+
+    newTask.userId = currentUserId;
+    updatedOriginalTask.userId = currentUserId;
+
+    setTasks((prev) => [
+      newTask,
+      ...prev.map((t) => (t.id === originalTask.id ? updatedOriginalTask : t)),
+    ]);
+
+    if (userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'tasks', originalTask.id), sanitizeForFirestore(updatedOriginalTask));
+        await setDoc(doc(db, 'users', userId, 'tasks', newTask.id), sanitizeForFirestore(newTask));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks`);
+      }
+    }
+
+    setRescheduleTaskTarget(null);
+    showToast(
+      `Kegiatan "${originalTask.title}" berhasil dijadwalkan ulang!`,
+      'success'
+    );
   };
 
   // Schedule Single Task
@@ -581,7 +722,7 @@ export default function App() {
         }
       }
 
-      showToast(`Jadwal tugas "${res.taskTitle}" berhasil ditempatkan ke kalender lokal (Google Calendar belum terhubung).`, 'info');
+      showToast(`Jadwal kegiatan "${res.taskTitle}" berhasil ditempatkan ke kalender lokal (Google Calendar belum terhubung).`, 'info');
       setSingleScheduleResult(null);
       return;
     }
@@ -674,9 +815,9 @@ export default function App() {
     }
 
     if (successCount === initialSessions.length) {
-      showToast(`Tugas "${res.taskTitle}" dijadwalkan dan disimpan ke Google Calendar Anda!`, 'success');
+      showToast(`Kegiatan "${res.taskTitle}" dijadwalkan dan disimpan ke Google Calendar Anda!`, 'success');
     } else if (successCount > 0) {
-      showToast(`Tugas "${res.taskTitle}": ${successCount} dari ${initialSessions.length} sesi tersimpan ke Google Calendar, sebagian gagal.`, 'info');
+      showToast(`Kegiatan "${res.taskTitle}": ${successCount} dari ${initialSessions.length} sesi tersimpan ke Google Calendar, sebagian gagal.`, 'info');
     } else {
       showToast(`Jadwal disimpan secara lokal, namun gagal terkirim ke Google Calendar.`, 'error');
     }
@@ -699,7 +840,7 @@ export default function App() {
     }));
     setTasks(batchWithUser);
     const countSuccess = batchScheduleResults.filter((r) => r.success).length;
-    showToast(`${countSuccess} tugas berhasil dijadwalkan ke kalender.`);
+    showToast(`${countSuccess} kegiatan berhasil dijadwalkan ke kalender.`);
 
     if (userId && userId !== 'user-default') {
       for (const t of batchWithUser) {
@@ -714,10 +855,10 @@ export default function App() {
 
   // AI Assistant Plan application
   const handleApplyAIPlan = async (plan: AIPlanDraft, scheduleResult: ScheduleCalculationResult) => {
-    let deadlineIso = plan.deadlineAt;
-    if (!deadlineIso) {
+    let deadlineIso: string | null = plan.deadlineAt || null;
+    if (!deadlineIso && typeof plan.deadlineDaysFromNow === 'number') {
       const deadlineDate = new Date();
-      deadlineDate.setDate(deadlineDate.getDate() + (plan.deadlineDaysFromNow || 1));
+      deadlineDate.setDate(deadlineDate.getDate() + plan.deadlineDaysFromNow);
       deadlineDate.setHours(plan.preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
       deadlineIso = deadlineDate.toISOString();
     }
@@ -765,7 +906,7 @@ export default function App() {
       if (initialSessions.length > 0) {
         showToast(`Rencana "${plan.title}" dijadwalkan secara internal (Google Calendar belum terhubung).`, 'info');
       } else {
-        showToast(`Tugas "${plan.title}" disimpan sebagai tugas belum terjadwal.`);
+        showToast(`Kegiatan "${plan.title}" disimpan sebagai kegiatan belum terjadwal.`);
       }
       return;
     }
@@ -911,10 +1052,10 @@ export default function App() {
     setTaskToEdit({
       id: `task-keep-${note.id}-${Date.now()}`,
       userId: 'user-default',
-      title: candidate.title || 'Tugas Baru',
+      title: candidate.title || 'Kegiatan Baru',
       description: candidate.description,
       estimatedDurationMinutes: candidate.estimatedDurationMinutes || 45,
-      deadlineAt: candidate.deadlineAt || new Date().toISOString(),
+      deadlineAt: candidate.deadlineAt || null,
       priority: 'MEDIUM',
       status: 'UNSCHEDULED',
       allowSplit: true,
@@ -965,6 +1106,9 @@ export default function App() {
   };
 
   const pendingCount = tasks.filter((t) => t.status === 'UNSCHEDULED').length;
+  const missedTasksCount = tasks.filter(
+    (t) => t.status === 'missed_auto' && t.rescheduleDecision === 'pending'
+  ).length;
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#F8FAFC]">
@@ -997,7 +1141,7 @@ export default function App() {
                 <AlertTriangle size={20} />
               </div>
               <div className="space-y-1">
-                <h3 className="text-base font-bold text-[#172B42]">{confirmModal.title}</h3>
+                <h3 className="text-base font-bold text-[#172B42] font-editorial">{confirmModal.title}</h3>
                 <p className="text-xs text-[#53657A] leading-relaxed">
                   {confirmModal.description}
                 </p>
@@ -1029,6 +1173,7 @@ export default function App() {
           onSelectTab={setCurrentTab}
           pendingTasksCount={pendingCount}
           keepNotesCount={keepNotes.length}
+          missedTasksCount={missedTasksCount}
           preferences={preferences}
           onOpenAuth={(mode) => {
             setAuthModalMode(mode);
@@ -1056,6 +1201,7 @@ export default function App() {
               }}
               pendingTasksCount={pendingCount}
               keepNotesCount={keepNotes.length}
+              missedTasksCount={missedTasksCount}
               preferences={preferences}
               onOpenAuth={(mode) => {
                 setAuthModalMode(mode);
@@ -1117,6 +1263,24 @@ export default function App() {
               onScheduleSingleTask={handleScheduleSingleTask}
               onScheduleAllTasks={handleScheduleAllTasks}
               onToggleTaskComplete={handleToggleTaskComplete}
+            />
+          )}
+
+          {currentTab === 'history' && (
+            <HistoryView
+              tasks={tasks}
+              preferences={preferences}
+              onOpenReschedule={(task) => setRescheduleTaskTarget(task)}
+              onDismissTask={handleDismissMissedTask}
+              onRefreshAudit={() => {
+                const { updatedTasks, transitionedCount } = auditAndTransitionOverdueTasks(tasks);
+                if (transitionedCount > 0) {
+                  setTasks(updatedTasks);
+                  showToast(`${transitionedCount} kegiatan terlewat dipindahkan ke riwayat.`, 'info');
+                } else {
+                  showToast('Riwayat kegiatan sudah mutakhir.', 'info');
+                }
+              }}
             />
           )}
 
@@ -1201,6 +1365,14 @@ export default function App() {
         results={batchScheduleResults}
         onClose={() => setBatchScheduleResults([])}
         onApplyBatch={handleApplyBatch}
+      />
+
+      <RescheduleModal
+        isOpen={rescheduleTaskTarget !== null}
+        task={rescheduleTaskTarget}
+        onClose={() => setRescheduleTaskTarget(null)}
+        onConfirmReschedule={handleConfirmReschedule}
+        preferences={preferences}
       />
     </div>
   );

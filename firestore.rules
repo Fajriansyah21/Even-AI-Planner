@@ -54,9 +54,9 @@ service cloud.firestore {
           && incoming().userId == userId
           && incoming().title is string && incoming().title.size() > 0 && incoming().title.size() <= 200
           && incoming().estimatedDurationMinutes is number
-          && incoming().deadlineAt is string
+          && (incoming().deadlineAt == null || incoming().deadlineAt is string)
           && incoming().priority in ['LOW', 'MEDIUM', 'HIGH', 'URGENT']
-          && incoming().status in ['UNSCHEDULED', 'SCHEDULED', 'IN_PROGRESS', 'COMPLETED'];
+          && incoming().status in ['UNSCHEDULED', 'SCHEDULED', 'IN_PROGRESS', 'COMPLETED', 'completed_manual', 'missed_auto'];
         allow delete: if isOwner(userId);
       }
 

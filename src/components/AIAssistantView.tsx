@@ -137,13 +137,13 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       // Phase 2: Memeriksa waktu kosong via scheduler
       setLoadingPhase('checking_slots');
 
-      // Construct deadline date
-      let deadlineDate = new Date();
-      if (plan.deadlineAt) {
-        deadlineDate = new Date(plan.deadlineAt);
-      } else {
-        deadlineDate.setDate(deadlineDate.getDate() + (plan.deadlineDaysFromNow || 1));
+      // Construct deadline date if specified
+      let calculatedDeadlineAt: string | null = plan.deadlineAt || null;
+      if (!calculatedDeadlineAt && typeof plan.deadlineDaysFromNow === 'number') {
+        const deadlineDate = new Date();
+        deadlineDate.setDate(deadlineDate.getDate() + plan.deadlineDaysFromNow);
         deadlineDate.setHours(plan.preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
+        calculatedDeadlineAt = deadlineDate.toISOString();
       }
 
       // Pre-flight check via deterministic scheduler
@@ -153,7 +153,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         title: plan.title,
         description: plan.description,
         estimatedDurationMinutes: plan.estimatedDurationMinutes,
-        deadlineAt: deadlineDate.toISOString(),
+        deadlineAt: calculatedDeadlineAt,
         priority: plan.priority,
         status: 'UNSCHEDULED',
         allowSplit: plan.allowSplit,

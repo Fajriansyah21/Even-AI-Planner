@@ -30,7 +30,7 @@ export const BatchScheduleModal: React.FC<BatchScheduleModalProps> = ({
         <div className="px-6 py-4 flex items-center justify-between border-b border-[#D9E3EF]">
           <div className="flex items-center gap-2">
             <Zap size={16} className="text-[#2457A7]" />
-            <h3 className="text-base font-bold text-[#172B42]">
+            <h3 className="text-base font-bold text-[#172B42] font-editorial">
               Hasil Penjadwalan Otomatis ({results.length} Kegiatan)
             </h3>
           </div>

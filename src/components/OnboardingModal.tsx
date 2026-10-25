@@ -17,6 +17,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   const [timezone, setTimezone] = useState(preferences.timezone);
   const [workStartHour, setWorkStartHour] = useState(preferences.workStartHour);
   const [workEndHour, setWorkEndHour] = useState(preferences.workEndHour);
+  const [enableLunchBreak, setEnableLunchBreak] = useState(preferences.enableLunchBreak ?? true);
   const [lunchStartHour, setLunchStartHour] = useState(preferences.lunchStartHour);
   const [lunchEndHour, setLunchEndHour] = useState(preferences.lunchEndHour);
   const [connectCalendar, setConnectCalendar] = useState(true);
@@ -28,6 +29,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       timezone,
       workStartHour,
       workEndHour,
+      enableLunchBreak,
       lunchStartHour,
       lunchEndHour,
       googleCalendarConnected: connectCalendar,
@@ -35,6 +37,8 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       lastSyncedAt: connectCalendar ? new Date().toISOString() : null,
     });
   };
+
+  const isNightShift = workEndHour < workStartHour;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-xs">
@@ -65,9 +69,9 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   <Clock size={20} />
                 </div>
                 <div>
-                  <h3 className="font-bold text-[#172B42] text-lg">Zona Waktu Anda</h3>
+                  <h3 className="font-bold text-[#172B42] text-lg font-editorial">Zona Waktu Anda</h3>
                   <p className="text-xs text-[#53657A]">
-                    EVEN menjamin setiap durasi dan tenggat tugas valid sesuai waktu setempat.
+                    EVEN menjamin setiap durasi dan jadwal kegiatan valid sesuai waktu setempat.
                   </p>
                 </div>
               </div>
@@ -100,9 +104,9 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   <Clock size={20} />
                 </div>
                 <div>
-                  <h3 className="font-bold text-[#172B42] text-lg">Jam Kerja & Istirahat</h3>
+                  <h3 className="font-bold text-[#172B42] text-lg font-editorial">Jam Kerja & Istirahat</h3>
                   <p className="text-xs text-[#53657A]">
-                    Tugas hanya akan dijadwalkan di dalam rentang waktu yang Anda izinkan.
+                    Kegiatan fleksibel hanya akan dijadwalkan di dalam rentang jam aktif Anda (01:00 - 24:00).
                   </p>
                 </div>
               </div>
@@ -115,7 +119,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     onChange={(e) => setWorkStartHour(Number(e.target.value))}
                     className="w-full p-2.5 rounded-xl border border-[#D9E3EF] bg-white text-sm"
                   >
-                    {[7, 8, 9, 10].map(h => (
+                    {Array.from({ length: 24 }, (_, i) => i + 1).map(h => (
                       <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
                     ))}
                   </select>
@@ -127,21 +131,37 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     onChange={(e) => setWorkEndHour(Number(e.target.value))}
                     className="w-full p-2.5 rounded-xl border border-[#D9E3EF] bg-white text-sm"
                   >
-                    {[16, 17, 18, 19, 20].map(h => (
+                    {Array.from({ length: 24 }, (_, i) => i + 1).map(h => (
                       <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
                     ))}
                   </select>
                 </div>
               </div>
 
-              <div className="p-3 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs space-y-2">
-                <span className="font-medium text-[#172B42] block">Jeda Istirahat Terlindungi:</span>
-                <div className="flex items-center justify-between text-[#53657A]">
-                  <span>Makan siang & istirahat:</span>
-                  <span className="font-semibold text-[#172B42]">12:00 - 13:00</span>
+              {isNightShift && (
+                <div className="p-2.5 bg-indigo-50 border border-indigo-200 rounded-xl text-xs text-indigo-800">
+                  <span className="font-semibold">Shift Malam / Lintas Tengah Malam:</span> Jadwal aktif dari {String(workStartHour).padStart(2, '0')}:00 malam hingga {String(workEndHour).padStart(2, '0')}:00 pagi hari berikutnya.
                 </div>
+              )}
+
+              <div className="p-3 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-medium text-[#172B42]">Lindungi Jeda Istirahat:</span>
+                  <input
+                    type="checkbox"
+                    checked={enableLunchBreak}
+                    onChange={(e) => setEnableLunchBreak(e.target.checked)}
+                    className="w-4 h-4 rounded text-[#2457A7] accent-[#2457A7]"
+                  />
+                </div>
+                {enableLunchBreak && (
+                  <div className="flex items-center justify-between text-[#53657A] pt-1 border-t border-[#D9E3EF]">
+                    <span>Waktu jeda istirahat:</span>
+                    <span className="font-semibold text-[#172B42]">{String(lunchStartHour).padStart(2, '0')}:00 - {String(lunchEndHour).padStart(2, '0')}:00</span>
+                  </div>
+                )}
                 <div className="flex items-center justify-between text-[#53657A]">
-                  <span>Jeda buffer antar tugas:</span>
+                  <span>Jeda buffer antar kegiatan:</span>
                   <span className="font-semibold text-[#172B42]">15 menit</span>
                 </div>
               </div>
@@ -155,9 +175,9 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   <Calendar size={20} />
                 </div>
                 <div>
-                  <h3 className="font-bold text-[#172B42] text-lg">Hubungkan Google Calendar</h3>
+                  <h3 className="font-bold text-[#172B42] text-lg font-editorial">Hubungkan Google Calendar</h3>
                   <p className="text-xs text-[#53657A]">
-                    EVEN membaca rapat Anda agar tugas ditempatkan di waktu kosong tanpa tumpang tindih.
+                    EVEN membaca rapat Anda agar kegiatan ditempatkan di waktu kosong tanpa tumpang tindih.
                   </p>
                 </div>
               </div>
@@ -175,7 +195,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   </span>
                 </div>
                 <p className="text-xs text-[#53657A] leading-relaxed">
-                  Cakupan: Membaca jadwal rapat agar tidak bentrok, dan menyimpan sesi tugas terjadwal ke kalender pribadi Anda setelah persetujuan Anda.
+                  Cakupan: Membaca jadwal rapat agar tidak bentrok, dan menyimpan sesi kegiatan terjadwal ke kalender pribadi Anda setelah persetujuan Anda.
                 </p>
                 <label className="flex items-center gap-2.5 pt-2 cursor-pointer">
                   <input

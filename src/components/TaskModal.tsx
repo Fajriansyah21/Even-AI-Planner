@@ -305,7 +305,7 @@ const TaskModalInner: React.FC<TaskModalProps> = ({
       >
         {/* Modal Header */}
         <div className="px-6 py-4 flex items-center justify-between border-b border-[#D9E3EF]">
-          <h2 className="text-base font-bold text-[#172B42]">
+          <h2 className="text-base sm:text-lg font-bold text-[#172B42] font-editorial">
             {taskToEdit && taskToEdit.id ? 'Ubah Rincian Kegiatan' : 'Tambah Kegiatan Baru'}
           </h2>
           <button

@@ -67,7 +67,7 @@ export const ScheduleResultModal: React.FC<ScheduleResultModalProps> = ({
             <span className="text-[11px] font-semibold text-[#53657A] uppercase tracking-wider block mb-0.5">
               Judul Kegiatan:
             </span>
-            <h3 className="text-base font-bold text-[#172B42]">
+            <h3 className="text-base font-bold text-[#172B42] font-editorial">
               {result.taskTitle}
             </h3>
           </div>

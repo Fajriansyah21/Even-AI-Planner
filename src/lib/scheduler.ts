@@ -89,9 +89,16 @@ export function scheduleTaskDeterministically(
     // Check collision against other scheduled task sessions
     for (const t of existingTasks) {
       if (t.id === task.id) continue;
+      // Skip tasks that have moved to history
+      if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
       if (t.scheduledSessions && t.scheduledSessions.length > 0) {
         for (const s of t.scheduledSessions) {
-          if (s.status !== 'CANCELLED') {
+          if (
+            s.status !== 'CANCELLED' &&
+            s.status !== 'completed_manual' &&
+            s.status !== 'missed_auto' &&
+            s.status !== 'COMPLETED'
+          ) {
             const sStart = new Date(s.startAt);
             const sEnd = new Date(s.endAt);
             if (fixedStart < sEnd && fixedEnd > sStart) {
@@ -169,9 +176,16 @@ export function scheduleTaskDeterministically(
 
   for (const t of existingTasks) {
     if (t.id === task.id) continue;
+    // Skip tasks that have moved to history - they must not block future slots
+    if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
     if (t.scheduledSessions) {
       for (const session of t.scheduledSessions) {
-        if (session.status !== 'CANCELLED') {
+        if (
+          session.status !== 'CANCELLED' &&
+          session.status !== 'completed_manual' &&
+          session.status !== 'missed_auto' &&
+          session.status !== 'COMPLETED'
+        ) {
           const s = new Date(session.startAt);
           const e = new Date(session.endAt);
           if (!isNaN(s.getTime()) && !isNaN(e.getTime()) && e > s) {
@@ -195,7 +209,8 @@ export function scheduleTaskDeterministically(
     const isPreferredWindowSpecified =
       Boolean(task.preferredWindow) || task.preferredTimeOfDay === 'EVENING' || task.preferredTimeOfDay === 'MORNING';
 
-    if (preferences.workDays.includes(parts.dayOfWeek) || (isPreferredWindowSpecified && d <= 1)) {
+    const activeWorkDays = preferences.workDays || [1, 2, 3, 4, 5];
+    if (activeWorkDays.includes(parts.dayOfWeek) || (isPreferredWindowSpecified && d <= 1)) {
       candidateDays.push({ ...parts, dateObj: dayObj });
     }
   }

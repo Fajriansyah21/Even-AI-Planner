@@ -1,4 +1,3 @@
-import React from 'react';
 import {
   Calendar,
   CheckSquare,
@@ -9,14 +8,16 @@ import {
   AlertCircle,
   LogOut,
   StickyNote,
+  History,
 } from 'lucide-react';
 import { UserPreferences } from '../types';
 
 interface SidebarProps {
-  currentTab: 'calendar' | 'tasks' | 'keep' | 'ai' | 'settings';
-  onSelectTab: (tab: 'calendar' | 'tasks' | 'keep' | 'ai' | 'settings') => void;
+  currentTab: 'calendar' | 'tasks' | 'keep' | 'ai' | 'settings' | 'history';
+  onSelectTab: (tab: 'calendar' | 'tasks' | 'keep' | 'ai' | 'settings' | 'history') => void;
   pendingTasksCount: number;
   keepNotesCount: number;
+  missedTasksCount?: number;
   preferences: UserPreferences;
   onOpenAuth: (mode: 'login' | 'register') => void;
   onLogout: () => void;
@@ -29,6 +30,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSelectTab,
   pendingTasksCount,
   keepNotesCount,
+  missedTasksCount = 0,
   preferences,
   onOpenAuth,
   onLogout,
@@ -49,6 +51,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
       icon: CheckSquare,
       badge: pendingTasksCount > 0 ? pendingTasksCount : null,
       subtitle: 'Durasi & Jadwal',
+    },
+    {
+      id: 'history' as const,
+      label: 'Riwayat Kegiatan',
+      icon: History,
+      badge: missedTasksCount > 0 ? missedTasksCount : null,
+      badgeClass: 'bg-amber-100 text-[#B86B12]',
+      subtitle: 'Selesai & Terlewat',
     },
     {
       id: 'keep' as const,
@@ -80,11 +90,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
       {/* Top Branding & Product Identity */}
       <div>
         <div className="flex items-center gap-3 px-2 py-3 mb-5">
-          <div className="w-9 h-9 rounded-xl bg-[#2457A7] text-white flex items-center justify-center font-editorial text-2xl font-bold shadow-xs">
+          <div className="w-9 h-9 rounded-xl bg-[#2457A7] text-white flex items-center justify-center font-logo text-2xl font-bold shadow-xs">
             E
           </div>
           <div>
-            <h1 className="font-editorial text-2xl font-bold text-[#172B42] tracking-tight leading-none">
+            <h1 className="font-logo text-2xl font-bold text-[#172B42] tracking-tight leading-none">
               EVEN
             </h1>
             <p className="text-[11px] font-sans-ui text-[#53657A] tracking-wide mt-0.5">

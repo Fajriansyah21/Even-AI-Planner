@@ -12,8 +12,9 @@ import {
   Edit2,
   ArrowRight,
   Zap,
+  ExternalLink,
 } from 'lucide-react';
-import { Task, Priority, ScheduleCalculationResult, TaskStatus } from '../types';
+import { Task, Priority, ScheduleCalculationResult, TaskStatus, TaskScheduleSession, SyncStatus } from '../types';
 
 interface TaskListViewProps {
   tasks: Task[];
@@ -44,10 +45,75 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
     URGENT: { label: 'Mendesak', badgeClass: 'bg-red-50 text-[#C43D4B] border-red-200 font-semibold' },
   };
 
+  const getSyncStatusMeta = (sessions?: TaskScheduleSession[]) => {
+    if (!sessions || sessions.length === 0) return null;
+
+    const hasFailed = sessions.some((s) => s.syncStatus === 'failed');
+    const allSynced = sessions.every((s) => s.syncStatus === 'synced');
+
+    if (hasFailed) {
+      return {
+        status: 'failed' as const,
+        label: 'Gagal Sinkron',
+        badgeClass: 'bg-[#FCEBEB] text-[#A32D2D] border-[#F7C1C1]',
+        icon: AlertCircle,
+        tooltip: 'Sebagian atau seluruh sesi gagal disinkronkan ke Google Calendar.',
+      };
+    }
+
+    if (allSynced) {
+      return {
+        status: 'synced' as const,
+        label: 'Tersinkron Google Calendar',
+        badgeClass: 'bg-[#E1F5EE] text-[#0F6B56] border-[#9FE1D0]',
+        icon: CheckCircle2,
+        tooltip: 'Semua sesi kegiatan telah berhasil disinkronkan ke Google Calendar.',
+      };
+    }
+
+    return {
+      status: 'pending' as const,
+      label: 'Sinkronisasi Tertunda (Lokal)',
+      badgeClass: 'bg-[#FEF7EC] text-[#8F520A] border-[#FBDCA8]',
+      icon: Clock,
+      tooltip: 'Sesi tersimpan di kalender lokal dan belum tersinkron ke Google Calendar.',
+    };
+  };
+
+  const getSessionSyncBadge = (syncStatus?: SyncStatus) => {
+    switch (syncStatus) {
+      case 'synced':
+        return {
+          label: 'Tersinkron',
+          badgeClass: 'bg-[#E1F5EE] text-[#0F6B56] border-[#9FE1D0]',
+          icon: CheckCircle2,
+          tooltip: 'Tersinkron ke Google Calendar',
+        };
+      case 'failed':
+        return {
+          label: 'Gagal',
+          badgeClass: 'bg-[#FCEBEB] text-[#A32D2D] border-[#F7C1C1]',
+          icon: AlertCircle,
+          tooltip: 'Gagal sinkronisasi ke Google Calendar',
+        };
+      case 'pending':
+      default:
+        return {
+          label: 'Tertunda',
+          badgeClass: 'bg-[#FEF7EC] text-[#8F520A] border-[#FBDCA8]',
+          icon: Clock,
+          tooltip: 'Tersimpan lokal (sinkronisasi tertunda)',
+        };
+    }
+  };
+
   const filteredTasks = tasks.filter((t) => {
+    // missed_auto tasks are archived into Riwayat Kegiatan
+    if (t.status === 'missed_auto') return false;
+
     if (filter === 'UNSCHEDULED' && t.status !== 'UNSCHEDULED') return false;
     if (filter === 'SCHEDULED' && t.status !== 'SCHEDULED') return false;
-    if (filter === 'COMPLETED' && t.status !== 'COMPLETED') return false;
+    if (filter === 'COMPLETED' && t.status !== 'COMPLETED' && t.status !== 'completed_manual') return false;
 
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
@@ -164,10 +230,12 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
         ) : (
           <div className="space-y-3">
             {filteredTasks.map((task) => {
-              const isDone = task.status === 'COMPLETED';
+              const isDone = task.status === 'COMPLETED' || task.status === 'completed_manual';
               const pInfo = priorityStyles[task.priority];
               const hasDl = Boolean(task.deadlineAt && task.deadlineAt.trim().length > 0);
               const deadlineDate = hasDl && task.deadlineAt ? new Date(task.deadlineAt) : null;
+              const syncMeta = getSyncStatusMeta(task.scheduledSessions);
+              const SyncMetaIcon = syncMeta?.icon;
 
               return (
                 <div
@@ -200,6 +268,23 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
                           <span className={`text-[10px] px-2 py-0.5 rounded-md border font-medium ${pInfo.badgeClass}`}>
                             {pInfo.label}
                           </span>
+
+                          {task.rescheduledFromTaskId && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-md bg-[#EAF3FC] text-[#2457A7] border border-[#8DBCEB]/50 font-medium">
+                              Hasil Jadwal Ulang
+                            </span>
+                          )}
+
+                          {/* Aggregate Google Calendar Sync Status Badge */}
+                          {syncMeta && SyncMetaIcon && (
+                            <span
+                              className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-md border font-medium ${syncMeta.badgeClass}`}
+                              title={syncMeta.tooltip}
+                            >
+                              <SyncMetaIcon size={11} className="shrink-0" />
+                              <span>{syncMeta.label}</span>
+                            </span>
+                          )}
                         </div>
 
                         {task.description && (
@@ -241,25 +326,58 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
                         {/* Scheduled Session Details if any */}
                         {task.scheduledSessions && task.scheduledSessions.length > 0 && (
                           <div className="pt-2">
-                            <span className="text-[11px] font-semibold text-[#16856B] block">
-                              Terjadwal pada:
+                            <span className="text-[11px] font-semibold text-[#16856B] block mb-1">
+                              Sesi Terjadwal ({task.scheduledSessions.length}):
                             </span>
-                            <div className="space-y-1 mt-1">
-                              {task.scheduledSessions.map((sess) => (
-                                <div
-                                  key={sess.id}
-                                  className="text-[11px] bg-slate-50 border border-[#D9E3EF] px-2.5 py-1 rounded-lg text-[#172B42] inline-block mr-2"
-                                >
-                                  {new Date(sess.startAt).toLocaleDateString('id-ID', {
-                                    weekday: 'short',
-                                    day: 'numeric',
-                                    month: 'short',
-                                    hour: '2-digit',
-                                    minute: '2-digit',
-                                  })}{' '}
-                                  ({sess.durationMinutes} mnt)
-                                </div>
-                              ))}
+                            <div className="flex flex-wrap gap-2">
+                              {task.scheduledSessions.map((sess) => {
+                                const sessBadge = getSessionSyncBadge(sess.syncStatus);
+                                const SessIcon = sessBadge.icon;
+                                const startDate = new Date(sess.startAt);
+
+                                return (
+                                  <div
+                                    key={sess.id}
+                                    className="flex items-center gap-2 text-[11px] bg-slate-50 border border-[#D9E3EF] px-2.5 py-1.5 rounded-xl text-[#172B42]"
+                                  >
+                                    <div>
+                                      <span className="font-medium">
+                                        {startDate.toLocaleDateString('id-ID', {
+                                          weekday: 'short',
+                                          day: 'numeric',
+                                          month: 'short',
+                                          hour: '2-digit',
+                                          minute: '2-digit',
+                                        })}
+                                      </span>
+                                      <span className="text-[#53657A] ml-1 font-mono text-[10px]">
+                                        ({sess.durationMinutes} mnt)
+                                      </span>
+                                    </div>
+
+                                    {/* Individual session sync badge */}
+                                    <span
+                                      className={`inline-flex items-center gap-1 text-[9px] px-1.5 py-0.5 rounded-md border font-semibold ${sessBadge.badgeClass}`}
+                                      title={sessBadge.tooltip}
+                                    >
+                                      <SessIcon size={9} className="shrink-0" />
+                                      <span>{sessBadge.label}</span>
+                                    </span>
+
+                                    {sess.htmlLink && (
+                                      <a
+                                        href={sess.htmlLink}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="text-[#2457A7] hover:text-[#1E4889] ml-0.5"
+                                        title="Buka sesi di Google Calendar"
+                                      >
+                                        <ExternalLink size={11} />
+                                      </a>
+                                    )}
+                                  </div>
+                                );
+                              })}
                             </div>
                           </div>
                         )}

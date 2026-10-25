@@ -14,6 +14,7 @@ import {
   Lock,
   Layers,
   AlertTriangle,
+  ArrowRight,
 } from 'lucide-react';
 import { CalendarEvent, Task, TaskScheduleSession, UserPreferences } from '../types';
 import {
@@ -22,6 +23,7 @@ import {
   endOfDayInTimezone,
   getZonedDateTimeParts,
   formatInTimezone,
+  createIsoInTimezone,
 } from '../lib/timezone';
 
 interface CalendarViewProps {
@@ -57,7 +59,49 @@ interface SlicedCalendarItem {
   hasConflict: boolean;
 }
 
-const ROW_HEIGHT = 56; // 56px per 1 hour slot
+export const ROW_HEIGHT = 56; // 56px per 1 hour slot
+export const PIXELS_PER_MINUTE = ROW_HEIGHT / 60; // Skala standar: 0.9333... px/menit
+
+export interface CalendarVerticalLayoutResult {
+  topPx: number;
+  heightPx: number;
+  startMinutesFromDayStart: number;
+  visibleDurationMinutes: number;
+  pixelsPerMinute: number;
+}
+
+/**
+ * Menghitung posisi vertikal (top) dan tinggi (height) kartu kegiatan kalender
+ * berdasarkan skala piksel per menit yang konsisten dari awal rentang harian (dayStartMs).
+ *
+ * Rumus:
+ *   skala = rowHeight / 60 (piksel per menit)
+ *   top = selisih menit antara waktu mulai kegiatan dan awal rentang harian × skala
+ *   height = durasi menit yang terlihat × skala
+ *
+ * Menghindari offset manual atau pergeseran sembarang agar kartu selalu presisi.
+ */
+export function calculateVerticalPosition(
+  visibleStartMs: number,
+  visibleEndMs: number,
+  dayStartMs: number,
+  rowHeight: number = ROW_HEIGHT
+): CalendarVerticalLayoutResult {
+  const pixelsPerMinute = rowHeight / 60;
+  const startMinutesFromDayStart = Math.max(0, (visibleStartMs - dayStartMs) / 60000);
+  const visibleDurationMinutes = Math.max(1, (visibleEndMs - visibleStartMs) / 60000);
+
+  const topPx = startMinutesFromDayStart * pixelsPerMinute;
+  const heightPx = visibleDurationMinutes * pixelsPerMinute;
+
+  return {
+    topPx,
+    heightPx,
+    startMinutesFromDayStart,
+    visibleDurationMinutes,
+    pixelsPerMinute,
+  };
+}
 
 export const CalendarView: React.FC<CalendarViewProps> = ({
   events,
@@ -73,6 +117,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
   const [currentDate, setCurrentDate] = useState<Date>(new Date());
   const [selectedEventDetails, setSelectedEventDetails] = useState<CalendarEvent | null>(null);
   const [selectedSessionDetails, setSelectedSessionDetails] = useState<{ task: Task; session: TaskScheduleSession } | null>(null);
+  const [selectedDayOverview, setSelectedDayOverview] = useState<{ date: Date; items: SlicedCalendarItem[] } | null>(null);
 
   // Compute week dates starting from Monday of currentDate
   const getWeekDates = (date: Date): Date[] => {
@@ -117,20 +162,29 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
     setCurrentDate(new Date());
   };
 
-  // Collect scheduled sessions from tasks
+  // Collect scheduled sessions from active tasks only (history is isolated)
   const scheduledSessions: { task: Task; session: TaskScheduleSession }[] = [];
   tasks.forEach((t) => {
+    // Only active tasks: Exclude tasks that have transitioned to history
+    if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') {
+      return;
+    }
     if (t.scheduledSessions && t.scheduledSessions.length > 0) {
       t.scheduledSessions.forEach((s) => {
-        if (s.status !== 'CANCELLED') {
+        if (
+          s.status !== 'CANCELLED' &&
+          s.status !== 'completed_manual' &&
+          s.status !== 'missed_auto' &&
+          s.status !== 'COMPLETED'
+        ) {
           scheduledSessions.push({ task: t, session: s });
         }
       });
     }
   });
 
-  // Hours: 01:00 to 24:00 (24 one-hour segments)
-  const gridHours = Array.from({ length: 24 }, (_, i) => i + 1);
+  // Hours: 00:00 to 23:00 (24 one-hour segments covering a full 24-hour day)
+  const gridHours = Array.from({ length: 24 }, (_, i) => i);
 
   // Mathematical slicing of items for any given calendar day [dayStart, dayEnd)
   const getSlicedItemsForDay = (dayDate: Date): SlicedCalendarItem[] => {
@@ -201,12 +255,12 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
       const visibleEndMs = Math.min(itemEndMs, dayEndMs);
 
       const totalDurationMinutes = Math.round((itemEndMs - itemStartMs) / 60000);
-      const visibleDurationMinutes = Math.max(1, Math.round((visibleEndMs - visibleStartMs) / 60000));
-      const startMinutesFromMidnight = (visibleStartMs - dayStartMs) / 60000;
-
-      const topPx = (startMinutesFromMidnight / 60) * ROW_HEIGHT;
-      // Guarantee minimum height so title & buttons stay legible
-      const heightPx = Math.max(26, (visibleDurationMinutes / 60) * ROW_HEIGHT);
+      const { topPx, heightPx, visibleDurationMinutes } = calculateVerticalPosition(
+        visibleStartMs,
+        visibleEndMs,
+        dayStartMs,
+        ROW_HEIGHT
+      );
 
       return {
         id: r.id,
@@ -255,6 +309,54 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
     }
 
     return slices;
+  };
+
+  // Compute month cells starting from Monday covering the full month grid
+  const getMonthGrid = (date: Date) => {
+    const p = getZonedDateTimeParts(date, tz);
+    const year = p.year;
+    const month = p.month; // 1-12
+
+    const firstDayIso = createIsoInTimezone(year, month, 1, 0, 0, 0, tz);
+    const firstDay = new Date(firstDayIso);
+    const firstParts = getZonedDateTimeParts(firstDay, tz);
+
+    // Monday is index 0, Sunday is index 6
+    const diffToMonday = firstParts.dayOfWeek === 0 ? 6 : firstParts.dayOfWeek - 1;
+
+    // Date UTC for number of days in this month
+    const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+
+    const start = new Date(firstDay);
+    start.setDate(firstDay.getDate() - diffToMonday);
+
+    const totalCells = Math.ceil((diffToMonday + daysInMonth) / 7) * 7;
+    const cells: {
+      date: Date;
+      dayNumber: number;
+      isCurrentMonth: boolean;
+      isToday: boolean;
+      items: SlicedCalendarItem[];
+    }[] = [];
+
+    for (let i = 0; i < totalCells; i++) {
+      const cellDate = new Date(start);
+      cellDate.setDate(start.getDate() + i);
+      const cp = getZonedDateTimeParts(cellDate, tz);
+      const isCurrentMonth = cp.month === month && cp.year === year;
+      const today = isSameCalendarDay(cellDate, new Date());
+      const items = getSlicedItemsForDay(cellDate);
+
+      cells.push({
+        date: cellDate,
+        dayNumber: cp.day,
+        isCurrentMonth,
+        isToday: today,
+        items,
+      });
+    }
+
+    return cells;
   };
 
   // Format header range
@@ -535,7 +637,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
           </div>
         )}
 
-        {/* Daily Grid & Agenda View (01:00 - 24:00) */}
+        {/* Daily Grid & Agenda View (00:00 - 24:00) */}
         {viewMode === 'day' && (
           <div className="max-w-3xl mx-auto space-y-4">
             <div className="bg-white border border-[#D9E3EF] rounded-2xl shadow-xs overflow-hidden">
@@ -543,7 +645,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                 <div>
                   <h3 className="font-bold text-[#172B42] text-sm flex items-center gap-2">
                     <CalendarIcon size={16} className="text-[#2457A7]" />
-                    <span>Jadwal Harian Berurutan (01:00 - 24:00)</span>
+                    <span>Jadwal Harian Berurutan (00:00 - 24:00)</span>
                   </h3>
                   <p className="text-xs text-[#53657A] mt-0.5">
                     {formatInTimezone(currentDate, tz, { dateStyle: 'full' })}
@@ -657,25 +759,240 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
           </div>
         )}
 
-        {/* Month View Placeholder */}
+        {/* Real Interactive Month Calendar Grid */}
         {viewMode === 'month' && (
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-6 shadow-xs text-center space-y-3">
-            <CalendarIcon className="w-10 h-10 text-[#2457A7] mx-auto opacity-70" />
-            <h3 className="text-base font-bold text-[#172B42] font-editorial">
-              Tinjauan Bulanan {formatInTimezone(currentDate, tz, { month: 'long', year: 'numeric' })}
-            </h3>
-            <p className="text-xs text-[#53657A] max-w-md mx-auto leading-relaxed">
-              Tampilan kalender bulanan mengelompokkan kegiatan Anda secara makro. Gunakan tampilan <strong>Minggu</strong> atau <strong>Hari</strong> untuk melihat skala jam 01:00 sampai 24:00 dengan posisi dan tinggi kartu presisi.
-            </p>
-            <button
-              onClick={() => setViewMode('week')}
-              className="px-4 py-2 bg-[#2457A7] text-white text-xs font-semibold rounded-xl hover:bg-[#1E4889]"
-            >
-              Buka Tampilan Mingguan
-            </button>
+          <div className="bg-white border border-[#D9E3EF] rounded-2xl shadow-xs overflow-hidden flex flex-col min-w-[760px]">
+            {/* Weekday Header Row (Senin - Minggu) */}
+            <div className="grid grid-cols-7 border-b border-[#D9E3EF] bg-[#F8FAFC]">
+              {['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'].map((dayName, idx) => (
+                <div
+                  key={idx}
+                  className="py-2.5 px-3 text-center border-r border-[#D9E3EF] last:border-r-0 text-xs font-semibold text-[#53657A] uppercase tracking-wider"
+                >
+                  <span className="hidden sm:inline">{dayName}</span>
+                  <span className="sm:hidden">{dayName.slice(0, 3)}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Calendar Cells Grid */}
+            <div className="grid grid-cols-7 divide-y divide-[#D9E3EF] bg-[#D9E3EF]/30 gap-[1px]">
+              {getMonthGrid(currentDate).map((cell, idx) => {
+                const maxVisible = 3;
+                const visibleItems = cell.items.slice(0, maxVisible);
+                const overflowCount = cell.items.length - maxVisible;
+
+                return (
+                  <div
+                    key={idx}
+                    onClick={() => {
+                      setCurrentDate(cell.date);
+                      setViewMode('day');
+                    }}
+                    className={`min-h-[115px] p-2 flex flex-col justify-between transition-colors cursor-pointer group ${
+                      cell.isCurrentMonth
+                        ? cell.isToday
+                          ? 'bg-[#EAF3FC]/40 hover:bg-[#EAF3FC]/70'
+                          : 'bg-white hover:bg-slate-50/80'
+                        : 'bg-[#F8FAFC]/90 text-slate-400 hover:bg-slate-100/60'
+                    }`}
+                  >
+                    <div>
+                      {/* Cell Header: Day Number & Add button */}
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span
+                          className={`text-xs font-bold w-6 h-6 leading-6 rounded-full inline-flex items-center justify-center transition-transform group-hover:scale-105 ${
+                            cell.isToday
+                              ? 'bg-[#2457A7] text-white shadow-2xs'
+                              : cell.isCurrentMonth
+                              ? 'text-[#172B42]'
+                              : 'text-slate-400'
+                          }`}
+                        >
+                          {cell.dayNumber}
+                        </span>
+
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (onSelectSlotToSchedule) {
+                              onSelectSlotToSchedule(cell.date, 9);
+                            } else {
+                              onOpenTaskModal();
+                            }
+                          }}
+                          className="opacity-0 group-hover:opacity-100 transition-opacity p-1 text-[#53657A] hover:text-[#2457A7] hover:bg-slate-100 rounded-lg"
+                          title={`Tambah kegiatan pada ${cell.dayNumber}`}
+                        >
+                          <Plus size={12} />
+                        </button>
+                      </div>
+
+                      {/* Event Chips List */}
+                      <div className="space-y-1">
+                        {visibleItems.map((item) => {
+                          const isGoogle = item.sourceType === 'google';
+                          const isDone = Boolean(item.isDone);
+                          const startTimeStr = formatInTimezone(item.visibleStart, tz, {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          });
+
+                          return (
+                            <div
+                              key={item.id}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isGoogle && item.event) {
+                                  setSelectedEventDetails(item.event);
+                                } else if (item.task && item.session) {
+                                  setSelectedSessionDetails({ task: item.task, session: item.session });
+                                }
+                              }}
+                              className={`px-1.5 py-0.5 rounded-md text-[11px] leading-tight font-medium truncate flex items-center gap-1 cursor-pointer transition-all ${
+                                isGoogle
+                                  ? 'bg-[#2457A7]/10 text-[#2457A7] hover:bg-[#2457A7]/20 border border-[#2457A7]/20'
+                                  : isDone
+                                  ? 'bg-slate-100 text-slate-400 line-through border border-slate-200'
+                                  : 'bg-[#EAF3FC] text-[#172B42] hover:bg-[#d5e7fa] border border-[#8DBCEB]/50'
+                              }`}
+                              title={`${item.title} (${startTimeStr})`}
+                            >
+                              <span className="font-mono text-[9px] shrink-0 opacity-80">
+                                {startTimeStr}
+                              </span>
+                              <span className="truncate">{item.title}</span>
+                              {(item.isContinuedFromYesterday || item.isContinuedToTomorrow) && (
+                                <span className="text-[8px] bg-indigo-100 text-indigo-700 font-bold px-1 rounded shrink-0">
+                                  {item.isContinuedFromYesterday ? '↩' : '↪'}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Overflow More Indicator */}
+                    {overflowCount > 0 && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedDayOverview({ date: cell.date, items: cell.items });
+                        }}
+                        className="text-[10px] font-semibold text-[#2457A7] hover:underline pt-1 text-left"
+                      >
+                        +{overflowCount} lainnya
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
       </div>
+
+      {/* Day Overview Modal for Month View */}
+      {selectedDayOverview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs">
+          <div className="w-full max-w-lg bg-white rounded-2xl p-6 shadow-xl border border-[#D9E3EF] space-y-4 max-h-[85vh] flex flex-col">
+            <div className="flex items-start justify-between border-b border-[#D9E3EF] pb-3">
+              <div>
+                <span className="text-[10px] font-semibold bg-[#EAF3FC] text-[#2457A7] px-2 py-0.5 rounded-full">
+                  Agenda Tanggal
+                </span>
+                <h3 className="text-base font-bold text-[#172B42] font-editorial mt-1">
+                  {formatInTimezone(selectedDayOverview.date, tz, {
+                    weekday: 'long',
+                    day: 'numeric',
+                    month: 'long',
+                    year: 'numeric',
+                  })}
+                </h3>
+              </div>
+              <button
+                onClick={() => setSelectedDayOverview(null)}
+                className="text-[#53657A] hover:text-[#172B42] p-1.5 rounded-lg hover:bg-slate-100"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="overflow-y-auto space-y-2 flex-1 pr-1">
+              {selectedDayOverview.items.map((item) => {
+                const isGoogle = item.sourceType === 'google';
+                const isDone = Boolean(item.isDone);
+                return (
+                  <div
+                    key={item.id}
+                    onClick={() => {
+                      if (isGoogle && item.event) {
+                        setSelectedEventDetails(item.event);
+                      } else if (item.task && item.session) {
+                        setSelectedSessionDetails({ task: item.task, session: item.session });
+                      }
+                      setSelectedDayOverview(null);
+                    }}
+                    className={`p-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-3 ${
+                      isGoogle
+                        ? 'bg-[#2457A7]/5 border-[#2457A7]/20 hover:bg-[#2457A7]/10'
+                        : isDone
+                        ? 'bg-slate-50 border-slate-200 text-slate-400 line-through'
+                        : 'bg-[#EAF3FC]/60 border-[#8DBCEB]/50 hover:bg-[#EAF3FC]'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-xs text-[#172B42] truncate">
+                          {item.title}
+                        </span>
+                        {isGoogle ? (
+                          <span className="text-[9px] bg-white border border-[#D9E3EF] text-[#53657A] px-1.5 py-0.2 rounded font-medium">
+                            Google
+                          </span>
+                        ) : (
+                          <span className="text-[9px] bg-[#2457A7] text-white px-1.5 py-0.2 rounded-full font-medium">
+                            Sesi EVEN
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 text-[11px] text-[#53657A] font-mono mt-1">
+                        <Clock size={12} className="text-[#2457A7]" />
+                        <span>
+                          {formatInTimezone(item.visibleStart, tz, { hour: '2-digit', minute: '2-digit' })} -{' '}
+                          {formatInTimezone(item.visibleEnd, tz, { hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                        <span>({item.visibleDurationMinutes}m)</span>
+                      </div>
+                    </div>
+                    <ArrowRight size={14} className="text-[#53657A] shrink-0" />
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="pt-3 border-t border-[#D9E3EF] flex items-center justify-between">
+              <button
+                onClick={() => {
+                  setCurrentDate(selectedDayOverview.date);
+                  setViewMode('day');
+                  setSelectedDayOverview(null);
+                }}
+                className="px-3.5 py-2 bg-[#2457A7] text-white text-xs font-semibold rounded-xl hover:bg-[#1E4889] transition-colors"
+              >
+                Buka di Tampilan Hari
+              </button>
+              <button
+                onClick={() => setSelectedDayOverview(null)}
+                className="px-3.5 py-2 text-xs font-medium text-[#53657A] hover:bg-slate-100 rounded-xl"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Google Event Details Modal */}
       {selectedEventDetails && (
@@ -686,7 +1003,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                 <span className="text-[10px] font-semibold bg-[#2457A7]/10 text-[#2457A7] px-2 py-0.5 rounded-full">
                   Acara Google Calendar
                 </span>
-                <h3 className="text-base font-bold text-[#172B42] mt-1.5">
+                <h3 className="text-base font-bold text-[#172B42] font-editorial mt-1.5">
                   {selectedEventDetails.title}
                 </h3>
               </div>

@@ -71,7 +71,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         {/* Header */}
         <div className="px-6 pt-6 pb-4 flex items-center justify-between border-b border-[#D9E3EF]/60">
           <div className="flex items-center gap-2">
-            <span className="font-editorial text-2xl font-bold text-[#2457A7] tracking-wide">
+            <span className="font-logo text-2xl font-bold text-[#2457A7] tracking-wide">
               EVEN
             </span>
             <span className="text-xs bg-[#EAF3FC] text-[#2457A7] font-medium px-2 py-0.5 rounded-full">

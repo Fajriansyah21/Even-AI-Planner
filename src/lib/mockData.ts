@@ -53,7 +53,7 @@ export function getInitialEvents(): CalendarEvent[] {
       id: 'gcal-evt-2',
       provider: 'google',
       title: 'Review Desain Sprint & UI Taskly Benchmark',
-      description: 'Evaluasi hirarki visual Open Horizon, keterbacaan Geist Sans, dan sidebar.',
+      description: 'Evaluasi hirarki visual Open Horizon, keterbacaan tipografi DM Sans, dan sidebar.',
       startAt: tomorrow14.toISOString(),
       endAt: tomorrow1530.toISOString(),
       attendees: ['fajriansyahpratama2103@gmail.com', 'rudi.designer@even.app'],
