@@ -156,9 +156,14 @@ export default function App() {
   // Setup Firebase Auth listener & browser extension error filter on mount
   useEffect(() => {
     const handleGlobalError = (event: ErrorEvent) => {
+      const msg = event.message || '';
+      const file = event.filename || '';
+      const stack = event.error?.stack || '';
       if (
-        event.message?.includes('Could not establish connection') ||
-        event.filename?.includes('chrome-extension://')
+        msg.includes('Could not establish connection') ||
+        msg.includes('Receiving end does not exist') ||
+        file.includes('chrome-extension://') ||
+        stack.includes('chrome-extension://')
       ) {
         event.preventDefault?.();
         event.stopImmediatePropagation?.();
@@ -167,18 +172,19 @@ export default function App() {
 
     const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
       const reason = event.reason?.message || String(event.reason || '');
+      const stack = event.reason?.stack || '';
       if (
         reason.includes('Could not establish connection') ||
         reason.includes('Receiving end does not exist') ||
-        event.reason?.stack?.includes('chrome-extension://')
+        stack.includes('chrome-extension://')
       ) {
         event.preventDefault?.();
         event.stopImmediatePropagation?.();
       }
     };
 
-    window.addEventListener('error', handleGlobalError);
-    window.addEventListener('unhandledrejection', handleUnhandledRejection);
+    window.addEventListener('error', handleGlobalError, true);
+    window.addEventListener('unhandledrejection', handleUnhandledRejection, true);
 
     const unsubscribe = initAuth(
       (user, token) => {

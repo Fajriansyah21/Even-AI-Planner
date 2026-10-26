@@ -17,11 +17,22 @@ import {
   ExternalLink,
   Ban,
   Check,
+  BarChart3,
+  CheckCheck,
+  TrendingUp,
 } from 'lucide-react';
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+} from 'recharts';
 import { Task, UserPreferences, Priority, TaskScheduleSession } from '../types';
 import { formatInTimezone } from '../lib/timezone';
 import { getTaskEffectiveStartTime, getTaskEffectiveEndTime } from '../lib/activityStatusManager';
-import { HistoryStatsSummary } from './HistoryStatsSummary';
 
 interface HistoryViewProps {
   tasks: Task[];
@@ -54,6 +65,8 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
     );
   });
 
+  const totalHistoryCount = historyTasks.length;
+
   const completedCount = historyTasks.filter(
     (t) => t.status === 'completed_manual' || t.status === 'COMPLETED'
   ).length;
@@ -63,6 +76,103 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
   const pendingActionCount = historyTasks.filter(
     (t) => t.status === 'missed_auto' && (!t.rescheduleDecision || t.rescheduleDecision === 'pending')
   ).length;
+
+  // Key Dashboard Statistics:
+  // 1. 'Persentase Penyelesaian' (completed_manual count / total history count)
+  const persentasePenyelesaian = totalHistoryCount > 0
+    ? Math.round((completedCount / totalHistoryCount) * 100)
+    : 0;
+
+  // 2. 'Tingkat Keterlambatan' (missed_auto count / total history count)
+  const tingkatKeterlambatan = totalHistoryCount > 0
+    ? Math.round((missedCount / totalHistoryCount) * 100)
+    : 0;
+
+  // 3. 'Total Kegiatan Selesai' (completed_manual count)
+  const totalKegiatanSelesai = completedCount;
+
+  // Additional focus time metadata
+  const totalCompletedMinutes = historyTasks
+    .filter((t) => t.status === 'completed_manual' || t.status === 'COMPLETED')
+    .reduce((acc, t) => acc + (t.estimatedDurationMinutes || 0), 0);
+  const completedHours = Math.floor(totalCompletedMinutes / 60);
+  const completedRemainingMins = totalCompletedMinutes % 60;
+
+  // 7-day completion trend calculation for Recharts line chart
+  const last7DaysTrendData = React.useMemo(() => {
+    const days: {
+      dateKey: string;
+      label: string;
+      fullDate: string;
+      completed: number;
+      missed: number;
+      total: number;
+      rate: number;
+    }[] = [];
+
+    const now = new Date();
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      const dateKey = `${year}-${month}-${day}`;
+
+      const dayName = d.toLocaleDateString('id-ID', { weekday: 'short' });
+      const dayDate = `${d.getDate()}/${d.getMonth() + 1}`;
+      const fullDate = d.toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'short' });
+
+      let dayCompleted = 0;
+      let dayMissed = 0;
+
+      for (const t of historyTasks) {
+        if (t.status === 'completed_manual' || t.status === 'COMPLETED') {
+          const compDateStr = t.completedAt || t.createdAt;
+          if (compDateStr) {
+            const cd = new Date(compDateStr);
+            const key = `${cd.getFullYear()}-${String(cd.getMonth() + 1).padStart(2, '0')}-${String(cd.getDate()).padStart(2, '0')}`;
+            if (key === dateKey) {
+              dayCompleted++;
+            }
+          }
+        } else if (t.status === 'missed_auto') {
+          const missDateStr = t.missedAt || t.createdAt;
+          if (missDateStr) {
+            const md = new Date(missDateStr);
+            const key = `${md.getFullYear()}-${String(md.getMonth() + 1).padStart(2, '0')}-${String(md.getDate()).padStart(2, '0')}`;
+            if (key === dateKey) {
+              dayMissed++;
+            }
+          }
+        }
+      }
+
+      const total = dayCompleted + dayMissed;
+      const rate = total > 0 ? Math.round((dayCompleted / total) * 100) : 0;
+
+      days.push({
+        dateKey,
+        label: `${dayName} (${dayDate})`,
+        fullDate,
+        completed: dayCompleted,
+        missed: dayMissed,
+        total,
+        rate,
+      });
+    }
+
+    return days;
+  }, [historyTasks]);
+
+  const sevenDaysCompletedTotal = React.useMemo(
+    () => last7DaysTrendData.reduce((acc, d) => acc + d.completed, 0),
+    [last7DaysTrendData]
+  );
+
+  const sevenDaysMissedTotal = React.useMemo(
+    () => last7DaysTrendData.reduce((acc, d) => acc + d.missed, 0),
+    [last7DaysTrendData]
+  );
 
   // Filter by user selection
   const filteredTasks = historyTasks.filter((t) => {
@@ -133,45 +243,238 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
           </button>
         </div>
 
-        {/* Ringkasan Statistik Rasio Selesai vs Terlewat */}
-        <HistoryStatsSummary historyTasks={historyTasks} />
-
-        {/* Stats Summary Cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-4 shadow-2xs">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-[#53657A]">Total Riwayat</span>
-              <History size={16} className="text-[#2457A7]" />
+        {/* Summary Dashboard Section */}
+        <section aria-label="Dasbor Ringkasan Statistik" className="space-y-3">
+          <div className="flex items-center justify-between px-0.5">
+            <div className="flex items-center gap-2">
+              <BarChart3 size={16} className="text-[#2457A7]" />
+              <h3 className="text-xs sm:text-sm font-semibold font-sans text-[#172B42] uppercase tracking-wider">
+                Ringkasan Statistik Riwayat
+              </h3>
             </div>
-            <p className="text-2xl font-bold text-[#172B42] mt-1.5">{historyTasks.length}</p>
-            <span className="text-[11px] text-[#53657A]/80">Kegiatan diarsipkan</span>
+            <span className="text-[11px] font-sans text-[#53657A]">
+              Total {totalHistoryCount} riwayat tercatat
+            </span>
           </div>
 
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-4 shadow-2xs">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-[#53657A]">Selesai (Manual)</span>
-              <CheckCircle2 size={16} className="text-[#16856B]" />
-            </div>
-            <p className="text-2xl font-bold text-[#16856B] mt-1.5">{completedCount}</p>
-            <span className="text-[11px] text-[#53657A]/80">Diselesaikan pengguna</span>
-          </div>
-
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl p-4 shadow-2xs">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-[#53657A]">Terlewat (Otomatis)</span>
-              <AlertCircle size={16} className="text-[#B86B12]" />
-            </div>
-            <div className="flex items-baseline gap-2 mt-1.5">
-              <p className="text-2xl font-bold text-[#B86B12]">{missedCount}</p>
-              {pendingActionCount > 0 && (
-                <span className="text-[10px] font-semibold bg-amber-100 text-[#B86B12] px-1.5 py-0.5 rounded-full">
-                  {pendingActionCount} butuh tindakan
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+            {/* 1. Persentase Penyelesaian */}
+            <div className="bg-white border border-[#D9E3EF] rounded-2xl p-4 sm:p-5 shadow-2xs hover:border-[#16856B]/40 transition-all flex flex-col justify-between space-y-3.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs sm:text-sm font-medium font-sans text-[#53657A]">
+                  Persentase Penyelesaian
                 </span>
-              )}
+                <div className="w-8 h-8 rounded-xl bg-emerald-50 text-[#16856B] flex items-center justify-center shrink-0">
+                  <CheckCircle2 size={18} />
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl sm:text-3xl font-bold font-sans text-[#16856B] tracking-tight">
+                    {persentasePenyelesaian}%
+                  </span>
+                  <span className="text-xs font-sans text-[#53657A]">selesai</span>
+                </div>
+
+                {/* Responsive progress bar */}
+                <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className="bg-[#16856B] h-full rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${persentasePenyelesaian}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="pt-1.5 border-t border-[#D9E3EF]/60 flex items-center justify-between text-[11px] font-sans text-[#53657A]">
+                <span>{completedCount} dari {totalHistoryCount} kegiatan</span>
+                <span className="font-semibold text-[#16856B]">Selesai Manual</span>
+              </div>
             </div>
-            <span className="text-[11px] text-[#53657A]/80">Waktu selesai telah lewat</span>
+
+            {/* 2. Tingkat Keterlambatan */}
+            <div className="bg-white border border-[#D9E3EF] rounded-2xl p-4 sm:p-5 shadow-2xs hover:border-[#B86B12]/40 transition-all flex flex-col justify-between space-y-3.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs sm:text-sm font-medium font-sans text-[#53657A]">
+                  Tingkat Keterlambatan
+                </span>
+                <div className="w-8 h-8 rounded-xl bg-amber-50 text-[#B86B12] flex items-center justify-center shrink-0">
+                  <AlertCircle size={18} />
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl sm:text-3xl font-bold font-sans text-[#B86B12] tracking-tight">
+                    {tingkatKeterlambatan}%
+                  </span>
+                  <span className="text-xs font-sans text-[#53657A]">terlewat</span>
+                </div>
+
+                {/* Responsive progress bar */}
+                <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className="bg-[#E2933A] h-full rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${tingkatKeterlambatan}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="pt-1.5 border-t border-[#D9E3EF]/60 flex items-center justify-between text-[11px] font-sans text-[#53657A]">
+                <span>{missedCount} kegiatan terlewat</span>
+                {pendingActionCount > 0 ? (
+                  <span className="font-semibold text-[#B86B12] bg-amber-50 px-1.5 py-0.5 rounded-md">
+                    {pendingActionCount} butuh aksi
+                  </span>
+                ) : (
+                  <span className="text-slate-400">Terlewat Otomatis</span>
+                )}
+              </div>
+            </div>
+
+            {/* 3. Total Kegiatan Selesai */}
+            <div className="bg-white border border-[#D9E3EF] rounded-2xl p-4 sm:p-5 shadow-2xs hover:border-[#2457A7]/40 transition-all flex flex-col justify-between space-y-3.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs sm:text-sm font-medium font-sans text-[#53657A]">
+                  Total Kegiatan Selesai
+                </span>
+                <div className="w-8 h-8 rounded-xl bg-[#EAF3FC] text-[#2457A7] flex items-center justify-center shrink-0">
+                  <CheckCheck size={18} />
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl sm:text-3xl font-bold font-sans text-[#172B42] tracking-tight">
+                    {totalKegiatanSelesai}
+                  </span>
+                  <span className="text-xs font-sans text-[#53657A]">kegiatan</span>
+                </div>
+
+                {/* Responsive progress bar */}
+                <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className="bg-[#2457A7] h-full rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${totalHistoryCount > 0 ? (totalKegiatanSelesai / totalHistoryCount) * 100 : 0}%` }}
+                  />
+                </div>
+              </div>
+
+              <div className="pt-1.5 border-t border-[#D9E3EF]/60 flex items-center justify-between text-[11px] font-sans text-[#53657A]">
+                <span>
+                  {totalCompletedMinutes > 0
+                    ? `Fokus: ${completedHours > 0 ? `${completedHours}j ` : ''}${completedRemainingMins > 0 ? `${completedRemainingMins}m` : ''}`
+                    : 'Tuntas dikerjakan'}
+                </span>
+                <span className="font-semibold text-[#2457A7]">Terselesaikan</span>
+              </div>
+            </div>
           </div>
-        </div>
+        </section>
+
+        {/* Line Chart Tren Penyelesaian 7 Hari Terakhir Menggunakan Recharts */}
+        <section aria-label="Grafik Tren Penyelesaian 7 Hari Terakhir" className="bg-white border border-[#D9E3EF] rounded-2xl p-4 sm:p-5 shadow-2xs space-y-3.5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-[#D9E3EF]/70 pb-3">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-xl bg-emerald-50 text-[#16856B] flex items-center justify-center shrink-0">
+                <TrendingUp size={18} />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold font-sans text-[#172B42] tracking-tight">
+                  Tren Penyelesaian 7 Hari Terakhir
+                </h3>
+                <p className="text-[11px] font-sans text-[#53657A]">
+                  Grafik perbandingan kegiatan selesai manual vs terlewat otomatis
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-4 text-xs font-sans self-start sm:self-auto">
+              <div className="flex items-center gap-1.5 text-[#16856B]">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#16856B]" />
+                <span className="font-medium">Selesai Manual ({sevenDaysCompletedTotal})</span>
+              </div>
+              <div className="flex items-center gap-1.5 text-[#B86B12]">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#E2933A]" />
+                <span className="font-medium">Terlewat Otomatis ({sevenDaysMissedTotal})</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="w-full h-64 sm:h-72 pt-1">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={last7DaysTrendData} margin={{ top: 10, right: 15, left: -20, bottom: 5 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#F1F5F9" vertical={false} />
+                <XAxis
+                  dataKey="label"
+                  stroke="#53657A"
+                  fontSize={11}
+                  tickLine={false}
+                  axisLine={{ stroke: '#E2E8F0' }}
+                />
+                <YAxis
+                  stroke="#53657A"
+                  fontSize={11}
+                  tickLine={false}
+                  axisLine={{ stroke: '#E2E8F0' }}
+                  allowDecimals={false}
+                />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (active && payload && payload.length) {
+                      const data = payload[0].payload;
+                      return (
+                        <div className="bg-white border border-[#D9E3EF] rounded-xl p-3 shadow-lg text-xs font-sans space-y-1.5 min-w-[170px]">
+                          <p className="font-semibold text-[#172B42] border-b border-[#D9E3EF]/80 pb-1">
+                            {data.fullDate || label}
+                          </p>
+                          <div className="flex items-center justify-between text-[#16856B]">
+                            <span className="flex items-center gap-1.5">
+                              <span className="w-2 h-2 rounded-full bg-[#16856B]" />
+                              Selesai Manual:
+                            </span>
+                            <span className="font-bold">{data.completed}</span>
+                          </div>
+                          <div className="flex items-center justify-between text-[#B86B12]">
+                            <span className="flex items-center gap-1.5">
+                              <span className="w-2 h-2 rounded-full bg-[#E2933A]" />
+                              Terlewat Otomatis:
+                            </span>
+                            <span className="font-bold">{data.missed}</span>
+                          </div>
+                          <div className="pt-1 border-t border-[#D9E3EF]/60 flex items-center justify-between text-[11px] text-[#53657A]">
+                            <span>Rasio Selesai:</span>
+                            <span className="font-bold text-[#172B42]">{data.rate}%</span>
+                          </div>
+                        </div>
+                      );
+                    }
+                    return null;
+                  }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="completed"
+                  name="Selesai Manual"
+                  stroke="#16856B"
+                  strokeWidth={2.5}
+                  dot={{ r: 4, stroke: '#16856B', strokeWidth: 2, fill: '#FFFFFF' }}
+                  activeDot={{ r: 6, stroke: '#16856B', strokeWidth: 2, fill: '#16856B' }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="missed"
+                  name="Terlewat Otomatis"
+                  stroke="#E2933A"
+                  strokeWidth={2}
+                  strokeDasharray="4 4"
+                  dot={{ r: 4, stroke: '#E2933A', strokeWidth: 2, fill: '#FFFFFF' }}
+                  activeDot={{ r: 6, stroke: '#E2933A', strokeWidth: 2, fill: '#E2933A' }}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </section>
 
         {/* Filter, Search & Sort Bar */}
         <div className="bg-white border border-[#D9E3EF] rounded-2xl p-3 shadow-2xs space-y-3">

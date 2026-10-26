@@ -13,6 +13,50 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=Lora:ital,wght@0,400..700;1,400..700&family=Playfair+Display:ital,wght@0,400..900;1,400..900&display=swap" rel="stylesheet" />
+    <script>
+      (function() {
+        var isExtensionError = function(msg, src, stack) {
+          var str = (String(msg || '') + ' ' + String(src || '') + ' ' + String(stack || '')).toLowerCase();
+          return (
+            str.indexOf('could not establish connection') !== -1 ||
+            str.indexOf('receiving end does not exist') !== -1 ||
+            str.indexOf('chrome-extension://') !== -1 ||
+            str.indexOf('moz-extension://') !== -1 ||
+            str.indexOf('safari-extension://') !== -1
+          );
+        };
+
+        window.addEventListener('error', function(event) {
+          if (isExtensionError(event.message, event.filename, event.error && event.error.stack)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return true;
+          }
+        }, true);
+
+        window.addEventListener('unhandledrejection', function(event) {
+          var reason = event.reason || {};
+          var msg = reason.message || String(reason || '');
+          var stack = reason.stack || '';
+          if (isExtensionError(msg, '', stack)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return true;
+          }
+        }, true);
+
+        var origOnError = window.onerror;
+        window.onerror = function(message, source, lineno, colno, error) {
+          if (isExtensionError(message, source, error && error.stack)) {
+            return true;
+          }
+          if (origOnError) {
+            return origOnError.apply(this, arguments);
+          }
+          return false;
+        };
+      })();
+    </script>
   </head>
   <body class="bg-[#F8FAFC] text-[#172B42] antialiased selection:bg-[#EAF3FC] selection:text-[#2457A7]">
     <div id="root"></div>
