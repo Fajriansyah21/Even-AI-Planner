@@ -111,7 +111,10 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
    c. 'deadline_only': Jika tugas fleksibel dan hanya dibatasi tenggat (contoh: 'laporan selesai sebelum lusa', 'baca artikel sebelum minggu').
 3. Estimasi durasi (estimatedDurationMinutes) harus konsisten dengan waktu yang diminta.
 4. Jangan berasumsi diam-diam bahwa waktu adalah pagi jika konteks menyebut malam atau sore.
-5. Sediakan 'reasoning' singkat dalam Bahasa Indonesia yang transparan.`;
+5. Sediakan 'reasoning' singkat dalam Bahasa Indonesia yang transparan.
+6. JADWAL MULTI-HARI & PERULANGAN:
+   - Jika pengguna menyebutkan beberapa hari (contoh: 'kelas pada Senin dan Selasa malam', 'Senin dan Rabu jam 19.00 - 21.00'), JANGAN PERNAH mengubahnya menjadi satu tugas berdurasi panjang 24 jam lebih!
+   - Pisahkan menjadi daftar kejadian terpisah di 'targetOccurrences' dengan waktu mulai dan selesai per masing-masing hari.`;
 
       const retryResult = await executeWithRetryAndTimeout(
         async (attempt, remainingMs) => {
@@ -153,12 +156,25 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
                       type: Type.STRING,
                       description: 'MORNING, AFTERNOON, EVENING, atau ANY',
                     },
-                    estimatedDurationMinutes: { type: Type.INTEGER, description: 'Estimasi durasi dalam menit' },
+                    estimatedDurationMinutes: { type: Type.INTEGER, description: 'Estimasi durasi dalam menit per sesi' },
                     deadlineDaysFromNow: { type: Type.INTEGER, description: 'Tenggat waktu dalam jumlah hari dari sekarang' },
                     deadlineAt: { type: Type.STRING, description: 'ISO string tenggat waktu absolut' },
                     priority: { type: Type.STRING, description: 'Prioritas: LOW, MEDIUM, HIGH, atau URGENT' },
                     allowSplit: { type: Type.BOOLEAN, description: 'Boleh dipecah beberapa sesi' },
                     minimumSessionMinutes: { type: Type.INTEGER, description: 'Durasi minimal per sesi jika dipecah' },
+                    targetOccurrences: {
+                      type: Type.ARRAY,
+                      description: 'Daftar kejadian jika pengguna menyebutkan beberapa hari (contoh: Senin dan Selasa malam)',
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          dayName: { type: Type.STRING, description: 'Nama hari (contoh: Senin, Selasa)' },
+                          requestedStartAt: { type: Type.STRING, description: 'ISO string waktu mulai untuk kejadian hari ini' },
+                          requestedEndAt: { type: Type.STRING, description: 'ISO string waktu selesai untuk kejadian hari ini' },
+                        },
+                        required: ['dayName', 'requestedStartAt', 'requestedEndAt'],
+                      },
+                    },
                     reasoning: { type: Type.STRING, description: 'Alasan rasional pemilihan durasi & struktur dalam Bahasa Indonesia' },
                   },
                   required: ['title', 'timeConstraintType', 'estimatedDurationMinutes', 'priority', 'allowSplit', 'reasoning'],
@@ -220,16 +236,39 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         timezone: ctx.userTimezone,
       };
 
-      // 1. Time constraint type determination:
-      if (baselinePlan.timeConstraintType === 'fixed_event') {
+      // 1. Time constraint type & occurrences determination:
+      if (baselinePlan.targetOccurrences && baselinePlan.targetOccurrences.length > 1) {
         sanitizedPlan.timeConstraintType = 'fixed_event';
-        sanitizedPlan.requestedStartAt = baselinePlan.requestedStartAt;
-        sanitizedPlan.requestedEndAt = baselinePlan.requestedEndAt;
+        sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
+        sanitizedPlan.targetDays = baselinePlan.targetDays;
+        sanitizedPlan.requestedStartAt = baselinePlan.targetOccurrences[0].requestedStartAt;
+        sanitizedPlan.requestedEndAt = baselinePlan.targetOccurrences[0].requestedEndAt;
         sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
         sanitizedPlan.allowSplit = false;
+      } else if (rawPlan.targetOccurrences && Array.isArray(rawPlan.targetOccurrences) && rawPlan.targetOccurrences.length > 1) {
+        sanitizedPlan.timeConstraintType = 'fixed_event';
+        sanitizedPlan.targetOccurrences = rawPlan.targetOccurrences;
+        sanitizedPlan.requestedStartAt = rawPlan.targetOccurrences[0].requestedStartAt;
+        sanitizedPlan.requestedEndAt = rawPlan.targetOccurrences[0].requestedEndAt;
+        sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes || rawPlan.estimatedDurationMinutes;
+        sanitizedPlan.allowSplit = false;
+      } else if (baselinePlan.timeConstraintType === 'fixed_event') {
+        sanitizedPlan.timeConstraintType = 'fixed_event';
+        // Only overwrite requestedStartAt with baseline if baseline explicitly recognized a day target or AI omitted it
+        if (baselinePlan.hasExplicitDayTarget || !rawPlan.requestedStartAt) {
+          sanitizedPlan.requestedStartAt = baselinePlan.requestedStartAt;
+          sanitizedPlan.requestedEndAt = baselinePlan.requestedEndAt;
+        } else {
+          sanitizedPlan.requestedStartAt = rawPlan.requestedStartAt;
+          sanitizedPlan.requestedEndAt = rawPlan.requestedEndAt;
+        }
+        sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
+        sanitizedPlan.allowSplit = false;
+        if (baselinePlan.targetOccurrences) {
+          sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
+          sanitizedPlan.targetDays = baselinePlan.targetDays;
+        }
       } else if (baselinePlan.timeConstraintType === 'preferred_window') {
-        // Flexible evening/morning window task: MUST NOT be treated as fixed_event,
-        // and MUST NOT carry AI-hallucinated requestedStartAt/requestedEndAt (e.g. 05:00 morning)!
         sanitizedPlan.timeConstraintType = 'preferred_window';
         sanitizedPlan.preferredWindow = baselinePlan.preferredWindow;
         sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;

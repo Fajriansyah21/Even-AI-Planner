@@ -5,6 +5,7 @@ import {
   createIsoInTimezone,
   formatInTimezone,
 } from './timezone';
+import { getNextValidDateForDayOfWeek, DAY_NAMES_ID } from './temporalParser';
 
 interface TimeInterval {
   start: Date;
@@ -47,7 +48,202 @@ export function scheduleTaskDeterministically(
   const userTz = parseTimezoneString(task.timezone || preferences.timezone || 'Asia/Jakarta');
 
   // -------------------------------------------------------------
-  // 1. HARD CONSTRAINT: FIXED COMMITMENT (fixed_event)
+  // 1. HARD CONSTRAINT: MULTI-DAY FIXED COMMITMENTS (targetOccurrences or targetDays)
+  // -------------------------------------------------------------
+  let occurrencesToEvaluate = task.targetOccurrences;
+
+  if (
+    task.timeConstraintType === 'fixed_event' &&
+    (!occurrencesToEvaluate || occurrencesToEvaluate.length === 0) &&
+    task.targetDays &&
+    task.targetDays.length > 0 &&
+    task.requestedStartAt
+  ) {
+    const sDate = new Date(task.requestedStartAt);
+    const sParts = getPartsInTimezone(sDate, userTz);
+    const duration = task.requestedEndAt
+      ? Math.round((new Date(task.requestedEndAt).getTime() - sDate.getTime()) / 60000)
+      : durationNeeded;
+
+    occurrencesToEvaluate = task.targetDays.map((dayOfWeek) => {
+      const validDate = getNextValidDateForDayOfWeek(dayOfWeek, referenceDate, userTz, {
+        targetHour: sParts.hour,
+        targetMinute: sParts.minute,
+      });
+      const occStartIso = createIsoInTimezone(
+        validDate.year,
+        validDate.month,
+        validDate.day,
+        sParts.hour,
+        sParts.minute,
+        0,
+        userTz
+      );
+      const occEndIso = new Date(new Date(occStartIso).getTime() + duration * 60000).toISOString();
+      const dayName = DAY_NAMES_ID[dayOfWeek] || `Hari ${dayOfWeek}`;
+      return {
+        dayName,
+        dayOfWeek,
+        requestedStartAt: occStartIso,
+        requestedEndAt: occEndIso,
+        label: `${dayName} (${String(sParts.hour).padStart(2, '0')}:${String(sParts.minute).padStart(2, '0')})`,
+      };
+    });
+  }
+
+  if (
+    task.timeConstraintType === 'fixed_event' &&
+    occurrencesToEvaluate &&
+    occurrencesToEvaluate.length > 0
+  ) {
+    const validSessions: ScheduleCalculationResult['proposedSessions'] = [];
+    const failedOccurrences: { dayName: string; timeStr: string; reason: string }[] = [];
+
+    for (let i = 0; i < occurrencesToEvaluate.length; i++) {
+      const occ = occurrencesToEvaluate[i];
+      const occStart = new Date(occ.requestedStartAt);
+      const occEnd = new Date(occ.requestedEndAt);
+
+      if (isNaN(occStart.getTime()) || isNaN(occEnd.getTime()) || occEnd <= occStart) {
+        failedOccurrences.push({
+          dayName: occ.dayName || `Kejadian ${i + 1}`,
+          timeStr: 'Format waktu tidak valid',
+          reason: 'Format tanggal atau waktu tidak valid.',
+        });
+        continue;
+      }
+
+      const occDuration = Math.round((occEnd.getTime() - occStart.getTime()) / 60000);
+      const dayLabel = occ.dayName || formatIndonesianDate(occStart, userTz);
+      const timeStr = `${formatTime(occStart, userTz)} - ${formatTime(occEnd, userTz)}`;
+
+      // Check collision against calendar events
+      let conflictReason: string | null = null;
+      for (const evt of existingEvents) {
+        const eStart = new Date(evt.startAt);
+        const eEnd = new Date(evt.endAt);
+        if (occStart < eEnd && occEnd > eStart) {
+          conflictReason = `bertabrakan dengan acara kalender "${evt.title}" (${formatTime(eStart, userTz)} - ${formatTime(eEnd, userTz)})`;
+          break;
+        }
+      }
+
+      // Check collision against other scheduled tasks
+      if (!conflictReason) {
+        for (const t of existingTasks) {
+          if (t.id === task.id) continue;
+          if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
+          if (t.scheduledSessions && t.scheduledSessions.length > 0) {
+            for (const s of t.scheduledSessions) {
+              if (
+                s.status !== 'CANCELLED' &&
+                s.status !== 'completed_manual' &&
+                s.status !== 'missed_auto' &&
+                s.status !== 'COMPLETED'
+              ) {
+                const sStart = new Date(s.startAt);
+                const sEnd = new Date(s.endAt);
+                if (occStart < sEnd && occEnd > sStart) {
+                  conflictReason = `bertabrakan dengan kegiatan "${t.title}" sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)})`;
+                  break;
+                }
+              }
+            }
+          }
+          if (conflictReason) break;
+        }
+      }
+
+      // Check collision against previously accepted sessions in this batch
+      if (!conflictReason) {
+        for (const prevSess of validSessions) {
+          const pStart = new Date(prevSess.startAt);
+          const pEnd = new Date(prevSess.endAt);
+          if (occStart < pEnd && occEnd > pStart) {
+            conflictReason = `bertabrakan dengan sesi ${prevSess.sessionIndex} dari kegiatan yang sama`;
+            break;
+          }
+        }
+      }
+
+      if (conflictReason) {
+        failedOccurrences.push({
+          dayName: dayLabel,
+          timeStr,
+          reason: conflictReason,
+        });
+      } else {
+        validSessions.push({
+          startAt: occStart.toISOString(),
+          endAt: occEnd.toISOString(),
+          durationMinutes: occDuration,
+          sessionIndex: validSessions.length + 1,
+          totalSessions: 0,
+          occurrenceLabel: dayLabel,
+        });
+      }
+    }
+
+    validSessions.forEach((s) => (s.totalSessions = validSessions.length));
+
+    if (validSessions.length === occurrencesToEvaluate.length) {
+      const occurrencesSummary = validSessions
+        .map(
+          (s) =>
+            `${formatIndonesianDate(new Date(s.startAt), userTz)} (${formatTime(new Date(s.startAt), userTz)} - ${formatTime(new Date(s.endAt), userTz)} WIB)`
+        )
+        .join(', ');
+
+      return {
+        success: true,
+        taskId: task.id,
+        taskTitle: task.title,
+        proposedSessions: validSessions,
+        explanation: `Berhasil menjadwalkan ${validSessions.length} sesi terpisah sesuai permintaan: ${occurrencesSummary}. Setiap kejadian dijadwalkan secara presisi tanpa digeser.`,
+      };
+    } else if (validSessions.length > 0) {
+      const successDays = validSessions
+        .map(
+          (s) =>
+            `${formatIndonesianDate(new Date(s.startAt), userTz)} (${formatTime(new Date(s.startAt), userTz)} - ${formatTime(new Date(s.endAt), userTz)} WIB)`
+        )
+        .join(', ');
+      const failedDetails = failedOccurrences
+        .map((f) => `${f.dayName} (${f.timeStr}) karena ${f.reason}`)
+        .join('; ');
+
+      return {
+        success: true,
+        partialSuccess: true,
+        taskId: task.id,
+        taskTitle: task.title,
+        proposedSessions: validSessions,
+        explanation: `Sesi pada ${successDays} berhasil ditempatkan. Namun, kejadian pada ${failedDetails}. Sesuai prinsip keandalan jadwal, sesi yang bertabrakan tidak digeser diam-diam ke hari lain.`,
+        warning: `Sebagian jadwal bertabrakan (${failedOccurrences.map((f) => f.dayName).join(', ')}). Hanya sesi yang bebas konflik yang dijadwalkan.`,
+        skippedOccurrences: failedOccurrences.map((f) => ({
+          dayName: f.dayName,
+          reason: f.reason,
+        })),
+      };
+    } else {
+      return {
+        success: false,
+        taskId: task.id,
+        taskTitle: task.title,
+        failureCode: 'TIME_CONFLICT',
+        proposedSessions: [],
+        explanation: `Seluruh sesi waktu tetap yang diminta mengalami tabrakan jadwal:\n${failedOccurrences.map((f) => `• ${f.dayName} (${f.timeStr}): ${f.reason}`).join('\n')}. Komitmen waktu tetap tidak dapat digeser secara otomatis.`,
+        warning: 'Silakan sesuaikan jam komitmen atau sesuaikan agenda yang bertabrakan di kalender.',
+        skippedOccurrences: failedOccurrences.map((f) => ({
+          dayName: f.dayName,
+          reason: f.reason,
+        })),
+      };
+    }
+  }
+
+  // -------------------------------------------------------------
+  // 1B. SINGLE FIXED COMMITMENT (fixed_event)
   // -------------------------------------------------------------
   // CRITICAL: A task is ONLY a fixed event if its timeConstraintType is explicitly 'fixed_event'!
   // A preferred_window task with an accidental requestedStartAt MUST NEVER be treated as fixed_event!
@@ -290,6 +486,177 @@ export function scheduleTaskDeterministically(
     }
     return free;
   };
+
+  // -------------------------------------------------------------
+  // 2A. RECURRING / MULTI-DAY FLEXIBLE TASKS (targetDays)
+  // -------------------------------------------------------------
+  if (
+    task.targetDays &&
+    task.targetDays.length > 0 &&
+    (task.isRecurring || task.targetDays.length > 1)
+  ) {
+    const validSessions: ScheduleCalculationResult['proposedSessions'] = [];
+    const failedOccurrences: { dayName: string; timeStr: string; reason: string }[] = [];
+
+    for (const dayOfWeek of task.targetDays) {
+      const dayName = DAY_NAMES_ID[dayOfWeek] || `Hari ${dayOfWeek}`;
+      const nextDate = getNextValidDateForDayOfWeek(dayOfWeek, referenceDate, userTz, {
+        targetHour: preferredWindowStartHour ?? preferences.workStartHour ?? 9,
+      });
+
+      const daySegments: TimeInterval[] = [];
+      if (preferredWindowStartHour !== null && preferredWindowEndHour !== null) {
+        const pStartIso = createIsoInTimezone(
+          nextDate.year,
+          nextDate.month,
+          nextDate.day,
+          preferredWindowStartHour,
+          task.preferredWindow?.startMinute || 0,
+          0,
+          userTz
+        );
+        const pEndIso = createIsoInTimezone(
+          nextDate.year,
+          nextDate.month,
+          nextDate.day,
+          preferredWindowEndHour,
+          task.preferredWindow?.endMinute || 0,
+          0,
+          userTz
+        );
+        const pStart = new Date(pStartIso);
+        const pEnd = new Date(pEndIso);
+        if (pEnd > pStart) {
+          daySegments.push({ start: pStart, end: pEnd });
+        }
+      } else {
+        const wStartHour = preferences.workStartHour ?? 9;
+        const wEndHour = preferences.workEndHour ?? 18;
+        const wStartIso = createIsoInTimezone(nextDate.year, nextDate.month, nextDate.day, wStartHour, 0, 0, userTz);
+        const wEndIso = createIsoInTimezone(nextDate.year, nextDate.month, nextDate.day, wEndHour, 0, 0, userTz);
+        const wStart = new Date(wStartIso);
+        const wEnd = new Date(wEndIso);
+        if (wEnd > wStart) {
+          daySegments.push({ start: wStart, end: wEnd });
+        }
+      }
+
+      // Check free blocks specifically on this day, subtracting busyWindows AND sessions already added to this batch
+      const combinedBusy: TimeInterval[] = [
+        ...busyWindows,
+        ...validSessions.map((s) => ({ start: new Date(s.startAt), end: new Date(s.endAt) })),
+      ].sort((a, b) => a.start.getTime() - b.start.getTime());
+
+      // Free blocks extractor for combinedBusy on daySegments
+      const freeOnDay: TimeInterval[] = [];
+      for (const seg of daySegments) {
+        let currentPointer = new Date(seg.start);
+        const overlappingBusy = combinedBusy.filter((b) => b.end > currentPointer && b.start < seg.end);
+        for (const busy of overlappingBusy) {
+          if (busy.start > currentPointer) {
+            const potentialEnd = busy.start < seg.end ? busy.start : seg.end;
+            const freeDuration = (potentialEnd.getTime() - currentPointer.getTime()) / 60000;
+            if (freeDuration >= 15) {
+              freeOnDay.push({ start: new Date(currentPointer), end: new Date(potentialEnd) });
+            }
+          }
+          if (busy.end > currentPointer) {
+            const bufferedPointer = new Date(busy.end.getTime() + preferences.bufferMinutes * 60 * 1000);
+            currentPointer = bufferedPointer > currentPointer ? bufferedPointer : currentPointer;
+          }
+        }
+        if (currentPointer < seg.end) {
+          const freeDuration = (seg.end.getTime() - currentPointer.getTime()) / 60000;
+          if (freeDuration >= 15) {
+            freeOnDay.push({ start: new Date(currentPointer), end: new Date(seg.end) });
+          }
+        }
+      }
+
+      // Find first slot of durationNeeded
+      let allocatedSlot: { start: Date; end: Date } | null = null;
+      for (const block of freeOnDay) {
+        const blockDuration = (block.end.getTime() - block.start.getTime()) / 60000;
+        if (blockDuration >= durationNeeded) {
+          const slotStart = new Date(block.start);
+          const slotEnd = new Date(slotStart.getTime() + durationNeeded * 60000);
+          allocatedSlot = { start: slotStart, end: slotEnd };
+          break;
+        }
+      }
+
+      const windowDesc = task.preferredWindow?.label || (hasEveningPref ? 'malam' : 'jam kerja');
+      if (allocatedSlot) {
+        validSessions.push({
+          startAt: allocatedSlot.start.toISOString(),
+          endAt: allocatedSlot.end.toISOString(),
+          durationMinutes: durationNeeded,
+          sessionIndex: validSessions.length + 1,
+          totalSessions: 0,
+          occurrenceLabel: `${dayName} (${formatTime(allocatedSlot.start, userTz)} - ${formatTime(allocatedSlot.end, userTz)})`,
+        });
+      } else {
+        failedOccurrences.push({
+          dayName,
+          timeStr: windowDesc,
+          reason: `slot waktu luang ${durationNeeded} menit tidak tersedia di jendela ${windowDesc} pada hari ${dayName}`,
+        });
+      }
+    }
+
+    validSessions.forEach((s) => (s.totalSessions = validSessions.length));
+
+    if (validSessions.length === task.targetDays.length) {
+      const summaryStr = validSessions
+        .map(
+          (s) =>
+            `${formatIndonesianDate(new Date(s.startAt), userTz)} (${formatTime(new Date(s.startAt), userTz)} - ${formatTime(new Date(s.endAt), userTz)} WIB)`
+        )
+        .join(', ');
+      return {
+        success: true,
+        taskId: task.id,
+        taskTitle: task.title,
+        proposedSessions: validSessions,
+        explanation: `Berhasil menjadwalkan ${validSessions.length} sesi berulang sesuai target hari (${task.targetDays.map((d) => DAY_NAMES_ID[d]).join(', ')}): ${summaryStr}.`,
+      };
+    } else if (validSessions.length > 0) {
+      const successStr = validSessions
+        .map(
+          (s) =>
+            `${formatIndonesianDate(new Date(s.startAt), userTz)} (${formatTime(new Date(s.startAt), userTz)} - ${formatTime(new Date(s.endAt), userTz)} WIB)`
+        )
+        .join(', ');
+      const failedStr = failedOccurrences.map((f) => `${f.dayName} (${f.reason})`).join('; ');
+      return {
+        success: true,
+        partialSuccess: true,
+        taskId: task.id,
+        taskTitle: task.title,
+        proposedSessions: validSessions,
+        explanation: `Sesi berulang berhasil dijadwalkan pada ${successStr}. Namun, sesi pada ${failedStr}. Sesuai prinsip keandalan jadwal, sesi yang bertabrakan tidak digeser diam-diam ke hari lain.`,
+        warning: `Sebagian jadwal berulang bertabrakan (${failedOccurrences.map((f) => f.dayName).join(', ')}). Hanya hari yang bebas konflik yang dijadwalkan.`,
+        skippedOccurrences: failedOccurrences.map((f) => ({
+          dayName: f.dayName,
+          reason: f.reason,
+        })),
+      };
+    } else {
+      return {
+        success: false,
+        taskId: task.id,
+        taskTitle: task.title,
+        failureCode: 'TIME_CONFLICT',
+        proposedSessions: [],
+        explanation: `Semua hari target yang diminta (${task.targetDays.map((d) => DAY_NAMES_ID[d]).join(', ')}) penuh atau bertabrakan dengan kegiatan lain:\n${failedOccurrences.map((f) => `• ${f.dayName}: ${f.reason}`).join('\n')}.`,
+        warning: 'Silakan sesuaikan jendela waktu atau kurangi agenda yang bertabrakan.',
+        skippedOccurrences: failedOccurrences.map((f) => ({
+          dayName: f.dayName,
+          reason: f.reason,
+        })),
+      };
+    }
+  }
 
   // Phase A: Search within PREFERRED WINDOW first (if requested)
   if (preferredWindowStartHour !== null && preferredWindowEndHour !== null) {

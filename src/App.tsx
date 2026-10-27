@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Sidebar } from './components/Sidebar';
+import { Sidebar, SidebarTab } from './components/Sidebar';
 import { Header } from './components/Header';
 import { CalendarView } from './components/CalendarView';
 import { TaskListView } from './components/TaskListView';
+import { TaskDashboardView } from './components/TaskDashboardView';
 import { AIAssistantView } from './components/AIAssistantView';
 import { SettingsView, CalendarDiagnosticInfo } from './components/SettingsView';
 import { KeepNotesView } from './components/KeepNotesView';
@@ -13,6 +14,7 @@ import { ScheduleResultModal } from './components/ScheduleResultModal';
 import { BatchScheduleModal } from './components/BatchScheduleModal';
 import { HistoryView } from './components/HistoryView';
 import { RescheduleModal } from './components/RescheduleModal';
+import { motion, AnimatePresence } from 'framer-motion';
 import {
   auditAndTransitionOverdueTasks,
   completeTaskManually,
@@ -62,7 +64,7 @@ import { doc, setDoc, deleteDoc } from 'firebase/firestore';
 
 export default function App() {
   // Navigation tab
-  const [currentTab, setCurrentTab] = useState<'calendar' | 'tasks' | 'keep' | 'ai' | 'settings' | 'history'>('calendar');
+  const [currentTab, setCurrentTab] = useState<SidebarTab>('calendar');
   const [rescheduleTaskTarget, setRescheduleTaskTarget] = useState<Task | null>(null);
 
   // User state - starts unauthenticated until verified
@@ -882,6 +884,7 @@ export default function App() {
       startAt: s.startAt,
       endAt: s.endAt,
       durationMinutes: s.durationMinutes,
+      occurrenceLabel: s.occurrenceLabel,
       status: 'SCHEDULED' as const,
       syncStatus: 'pending' as const,
     }));
@@ -902,6 +905,8 @@ export default function App() {
         timeConstraintType: plan.timeConstraintType,
         requestedStartAt: plan.requestedStartAt,
         requestedEndAt: plan.requestedEndAt,
+        targetDays: plan.targetDays,
+        targetOccurrences: plan.targetOccurrences,
         preferredWindow: plan.preferredWindow,
         timezone: plan.timezone,
         createdAt: new Date().toISOString(),
@@ -990,6 +995,8 @@ export default function App() {
       timeConstraintType: plan.timeConstraintType,
       requestedStartAt: plan.requestedStartAt,
       requestedEndAt: plan.requestedEndAt,
+      targetDays: plan.targetDays,
+      targetOccurrences: plan.targetOccurrences,
       preferredWindow: plan.preferredWindow,
       timezone: plan.timezone,
       createdAt: new Date().toISOString(),
@@ -1239,93 +1246,117 @@ export default function App() {
           onToggleMobileMenu={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
         />
 
-        <main className="flex-1 overflow-hidden flex flex-col">
-          {currentTab === 'calendar' && (
-            <CalendarView
-              events={events}
-              tasks={tasks}
-              preferences={preferences}
-              onToggleTaskSessionComplete={handleToggleTaskSessionComplete}
-              onOpenTaskModal={() => {
-                setTaskToEdit(null);
-                setIsTaskModalOpen(true);
-              }}
-              onOpenAIAssistant={() => setCurrentTab('ai')}
-            />
-          )}
+        <main className="flex-1 overflow-hidden flex flex-col relative">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={currentTab}
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18, ease: 'easeOut' }}
+              className="flex-1 flex flex-col h-full overflow-hidden"
+            >
+              {currentTab === 'calendar' && (
+                <CalendarView
+                  events={events}
+                  tasks={tasks}
+                  preferences={preferences}
+                  onToggleTaskSessionComplete={handleToggleTaskSessionComplete}
+                  onOpenTaskModal={() => {
+                    setTaskToEdit(null);
+                    setIsTaskModalOpen(true);
+                  }}
+                  onOpenAIAssistant={() => setCurrentTab('ai')}
+                />
+              )}
 
-          {currentTab === 'tasks' && (
-            <TaskListView
-              tasks={tasks}
-              onOpenTaskModal={() => {
-                setTaskToEdit(null);
-                setIsTaskModalOpen(true);
-              }}
-              onEditTask={(task) => {
-                setTaskToEdit(task);
-                setIsTaskModalOpen(true);
-              }}
-              onDeleteTask={handleDeleteTask}
-              onScheduleSingleTask={handleScheduleSingleTask}
-              onScheduleAllTasks={handleScheduleAllTasks}
-              onToggleTaskComplete={handleToggleTaskComplete}
-            />
-          )}
+              {currentTab === 'tasks' && (
+                <TaskListView
+                  tasks={tasks}
+                  onOpenTaskModal={() => {
+                    setTaskToEdit(null);
+                    setIsTaskModalOpen(true);
+                  }}
+                  onEditTask={(task) => {
+                    setTaskToEdit(task);
+                    setIsTaskModalOpen(true);
+                  }}
+                  onDeleteTask={handleDeleteTask}
+                  onScheduleSingleTask={handleScheduleSingleTask}
+                  onScheduleAllTasks={handleScheduleAllTasks}
+                  onToggleTaskComplete={handleToggleTaskComplete}
+                />
+              )}
 
-          {currentTab === 'history' && (
-            <HistoryView
-              tasks={tasks}
-              preferences={preferences}
-              onOpenReschedule={(task) => setRescheduleTaskTarget(task)}
-              onDismissTask={handleDismissMissedTask}
-              onRefreshAudit={() => {
-                const { updatedTasks, transitionedCount } = auditAndTransitionOverdueTasks(tasks);
-                if (transitionedCount > 0) {
-                  setTasks(updatedTasks);
-                  showToast(`${transitionedCount} kegiatan terlewat dipindahkan ke riwayat.`, 'info');
-                } else {
-                  showToast('Riwayat kegiatan sudah mutakhir.', 'info');
-                }
-              }}
-            />
-          )}
+              {currentTab === 'dashboard' && (
+                <TaskDashboardView
+                  tasks={tasks}
+                  preferences={preferences}
+                  onOpenTaskModal={() => {
+                    setTaskToEdit(null);
+                    setIsTaskModalOpen(true);
+                  }}
+                  onNavigateToTasks={() => setCurrentTab('tasks')}
+                  onNavigateToCalendar={() => setCurrentTab('calendar')}
+                />
+              )}
 
-          {currentTab === 'keep' && (
-            <KeepNotesView
-              notes={keepNotes}
-              onCreateNote={handleCreateKeepNote}
-              onUpdateNote={handleUpdateKeepNote}
-              onDeleteNote={handleDeleteKeepNote}
-              onConvertNoteToTask={handleConvertNoteToTask}
-            />
-          )}
+              {currentTab === 'history' && (
+                <HistoryView
+                  tasks={tasks}
+                  preferences={preferences}
+                  onOpenReschedule={(task) => setRescheduleTaskTarget(task)}
+                  onDismissTask={handleDismissMissedTask}
+                  onRefreshAudit={() => {
+                    const { updatedTasks, transitionedCount } = auditAndTransitionOverdueTasks(tasks);
+                    if (transitionedCount > 0) {
+                      setTasks(updatedTasks);
+                      showToast(`${transitionedCount} kegiatan terlewat dipindahkan ke riwayat.`, 'info');
+                    } else {
+                      showToast('Riwayat kegiatan sudah mutakhir.', 'info');
+                    }
+                  }}
+                />
+              )}
 
-          {currentTab === 'ai' && (
-            <AIAssistantView
-              tasks={tasks}
-              events={events}
-              preferences={preferences}
-              onApplyAIPlan={handleApplyAIPlan}
-              onNavigateToCalendar={() => setCurrentTab('calendar')}
-            />
-          )}
+              {currentTab === 'keep' && (
+                <KeepNotesView
+                  notes={keepNotes}
+                  onCreateNote={handleCreateKeepNote}
+                  onUpdateNote={handleUpdateKeepNote}
+                  onDeleteNote={handleDeleteKeepNote}
+                  onConvertNoteToTask={handleConvertNoteToTask}
+                />
+              )}
 
-          {currentTab === 'settings' && (
-            <SettingsView
-              preferences={preferences}
-              onUpdatePreferences={(updated) => {
-                setPreferences((prev) => ({ ...prev, ...updated }));
-                showToast('Pengaturan diperbarui.');
-              }}
-              onResetData={handleResetData}
-              onSyncCalendar={handleSyncCalendar}
-              isSyncing={isSyncing}
-              hasGoogleAccessToken={hasGoogleAccessToken}
-              onConnectCalendar={handleConnectCalendar}
-              onDisconnectCalendar={handleDisconnectCalendar}
-              diagnosticInfo={diagnosticInfo}
-            />
-          )}
+              {currentTab === 'ai' && (
+                <AIAssistantView
+                  tasks={tasks}
+                  events={events}
+                  preferences={preferences}
+                  onApplyAIPlan={handleApplyAIPlan}
+                  onNavigateToCalendar={() => setCurrentTab('calendar')}
+                />
+              )}
+
+              {currentTab === 'settings' && (
+                <SettingsView
+                  preferences={preferences}
+                  onUpdatePreferences={(updated) => {
+                    setPreferences((prev) => ({ ...prev, ...updated }));
+                    showToast('Pengaturan diperbarui.');
+                  }}
+                  onResetData={handleResetData}
+                  onSyncCalendar={handleSyncCalendar}
+                  isSyncing={isSyncing}
+                  hasGoogleAccessToken={hasGoogleAccessToken}
+                  onConnectCalendar={handleConnectCalendar}
+                  onDisconnectCalendar={handleDisconnectCalendar}
+                  diagnosticInfo={diagnosticInfo}
+                />
+              )}
+            </motion.div>
+          </AnimatePresence>
         </main>
       </div>
 

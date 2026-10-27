@@ -3,6 +3,7 @@ import {
   getPartsInTimezone,
   createIsoInTimezone,
 } from './timezone';
+import { TaskOccurrence } from '../types';
 
 export interface ParseContext {
   userPrompt: string;
@@ -13,6 +14,146 @@ export interface ParseContext {
     workStartHour: number;
     workEndHour: number;
   };
+}
+
+export const INDONESIAN_WEEKDAYS: { name: string; dayIndex: number }[] = [
+  { name: 'minggu', dayIndex: 0 },
+  { name: 'ahad', dayIndex: 0 },
+  { name: 'senin', dayIndex: 1 },
+  { name: 'selasa', dayIndex: 2 },
+  { name: 'rabu', dayIndex: 3 },
+  { name: 'kamis', dayIndex: 4 },
+  { name: 'jumat', dayIndex: 5 },
+  { name: "jum'at", dayIndex: 5 },
+  { name: 'sabtu', dayIndex: 6 },
+];
+
+export const DAY_NAMES_ID: Record<number, string> = {
+  0: 'Minggu',
+  1: 'Senin',
+  2: 'Selasa',
+  3: 'Rabu',
+  4: 'Kamis',
+  5: 'Jumat',
+  6: 'Sabtu',
+};
+
+export interface ParsedDayInfo {
+  dayIndex: number; // 0 = Minggu ... 6 = Sabtu
+  dayName: string;  // 'Minggu', 'Senin', dst.
+  rawKeyword: string;
+}
+
+/**
+ * Memetakan nama hari (0 = Minggu s/d 6 = Sabtu) ke tanggal kalender berikutnya yang valid
+ * berdasarkan zona waktu pengguna saat ini (Asia/Jakarta, WITA, WIT, dll).
+ * Jika hari target adalah hari ini:
+ * - Bila targetHour ditentukan dan jam tersebut sudah lewat hari ini, diarahkan ke minggu berikutnya (+7 hari).
+ * - Bila opsi forceNextWeek aktif atau prompt menyebut "depan", diarahkan ke minggu berikutnya (+7 hari).
+ * - Selain itu, diarahkan ke hari ini (+0 hari).
+ */
+export function getNextValidDateForDayOfWeek(
+  targetDayOfWeek: number,
+  referenceDate: Date = new Date(),
+  timezone: string = 'Asia/Jakarta',
+  options?: {
+    targetHour?: number;
+    targetMinute?: number;
+    forceNextWeek?: boolean;
+    weekOffset?: number;
+  }
+): {
+  date: Date;
+  dateStr: string; // YYYY-MM-DD
+  dayOffset: number;
+  year: number;
+  month: number;
+  day: number;
+} {
+  const tz = parseTimezoneString(timezone);
+  const baseParts = getPartsInTimezone(referenceDate, tz);
+  const currentDayOfWeek = baseParts.dayOfWeek;
+
+  let dayOffset = (targetDayOfWeek - currentDayOfWeek + 7) % 7;
+  if (dayOffset === 0) {
+    if (options?.forceNextWeek) {
+      dayOffset = 7;
+    } else if (options?.targetHour !== undefined) {
+      const currentMinutes = baseParts.hour * 60 + baseParts.minute;
+      const targetMinutes = options.targetHour * 60 + (options.targetMinute || 0);
+      if (targetMinutes <= currentMinutes) {
+        dayOffset = 7;
+      }
+    }
+  }
+
+  if (options?.weekOffset && options.weekOffset > 0) {
+    dayOffset += options.weekOffset * 7;
+  }
+
+  const targetDateObj = new Date(referenceDate.getTime() + dayOffset * 86400000);
+  const targetParts = getPartsInTimezone(targetDateObj, tz);
+  const dateStr = `${targetParts.year}-${String(targetParts.month).padStart(2, '0')}-${String(targetParts.day).padStart(2, '0')}`;
+
+  const iso = createIsoInTimezone(
+    targetParts.year,
+    targetParts.month,
+    targetParts.day,
+    options?.targetHour ?? 0,
+    options?.targetMinute ?? 0,
+    0,
+    tz
+  );
+
+  return {
+    date: new Date(iso),
+    dateStr,
+    dayOffset,
+    year: targetParts.year,
+    month: targetParts.month,
+    day: targetParts.day,
+  };
+}
+
+/**
+ * Parser nama hari Indonesia (Senin-Minggu) dengan deteksi pola perulangan (recurring).
+ */
+export function parseIndonesianDayNames(prompt: string): {
+  days: ParsedDayInfo[];
+  isRecurring: boolean;
+} {
+  const p = prompt.toLowerCase();
+  const days: ParsedDayInfo[] = [];
+
+  const isRecurring = /\b(setiap|tiap|rutin|berulang|mingguan|per minggu|tiap-tiap|selalu)\b/i.test(prompt);
+
+  const weekdayRegex = /\b(senin|selasa|rabu|kamis|jumat|jum'at|sabtu|ahad)\b/gi;
+  let match;
+  while ((match = weekdayRegex.exec(p)) !== null) {
+    const word = match[1].toLowerCase();
+    const entry = INDONESIAN_WEEKDAYS.find((w) => w.name === word);
+    if (entry && !days.some((d) => d.dayIndex === entry.dayIndex)) {
+      days.push({
+        dayIndex: entry.dayIndex,
+        dayName: DAY_NAMES_ID[entry.dayIndex],
+        rawKeyword: word,
+      });
+    }
+  }
+
+  // Check for Sunday ("minggu")
+  const sundayRegex = /\b(?:hari\s+minggu|minggu\s+(?:pagi|siang|sore|malam|jam|pukul|\d)|(?:dan|sampai|hingga|-)\s+minggu)\b|\bminggu\b(?!\s+depan)/gi;
+  if (sundayRegex.test(p)) {
+    if (!days.some((d) => d.dayIndex === 0)) {
+      days.push({
+        dayIndex: 0,
+        dayName: 'Minggu',
+        rawKeyword: 'minggu',
+      });
+    }
+  }
+
+  return { days, isRecurring };
 }
 
 /**
@@ -27,19 +168,43 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   const baseDate = ctx.currentDateTime ? new Date(ctx.currentDateTime) : new Date();
   const baseParts = getPartsInTimezone(baseDate, tz);
 
-  // 1. Determine target day offset:
-  // 'hari ini' / 'malam ini' / 'pagi ini' = 0; 'besok' = 1; 'lusa' = 2; etc.
+  // 1. Detect explicit Indonesian weekdays & recurring intent:
+  const { days: detectedWeekdays, isRecurring: promptIsRecurring } = parseIndonesianDayNames(prompt);
+
+  let hasExplicitDayTarget = false;
   let dayOffset = 0;
-  if (prompt.includes('besok lusa')) {
+
+  if (detectedWeekdays.length > 0) {
+    hasExplicitDayTarget = true;
+    const firstDay = detectedWeekdays[0].dayIndex;
+    const nextDate = getNextValidDateForDayOfWeek(firstDay, baseDate, tz, {
+      forceNextWeek: prompt.includes('depan'),
+    });
+    dayOffset = nextDate.dayOffset;
+  } else if (prompt.includes('besok lusa')) {
     dayOffset = 2;
+    hasExplicitDayTarget = true;
   } else if (prompt.includes('lusa')) {
     dayOffset = 2;
+    hasExplicitDayTarget = true;
   } else if (prompt.includes('besok')) {
     dayOffset = 1;
+    hasExplicitDayTarget = true;
   } else if (prompt.includes('3 hari lagi')) {
     dayOffset = 3;
+    hasExplicitDayTarget = true;
   } else if (prompt.includes('minggu depan')) {
     dayOffset = 7;
+    hasExplicitDayTarget = true;
+  } else if (
+    prompt.includes('hari ini') ||
+    prompt.includes('malam ini') ||
+    prompt.includes('pagi ini') ||
+    prompt.includes('siang ini') ||
+    prompt.includes('sore ini')
+  ) {
+    dayOffset = 0;
+    hasExplicitDayTarget = true;
   }
 
   // Calculate target date parts in the given timezone
@@ -211,24 +376,60 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
       prompt.includes('tidur pukul') ||
       prompt.includes('tidur jam'));
 
+  let targetOccurrences: TaskOccurrence[] | undefined = undefined;
+  let targetDays: number[] | undefined = detectedWeekdays.length > 0 ? detectedWeekdays.map((dw) => dw.dayIndex) : undefined;
+
   if (isExactFixedEvent && fixedStartHour !== null) {
     timeConstraintType = 'fixed_event';
 
-    // Construct start ISO in target timezone
-    requestedStartAt = createIsoInTimezone(
-      targetParts.year,
-      targetParts.month,
-      targetParts.day,
-      fixedStartHour,
-      fixedStartMin,
-      0,
-      tz
-    );
+    if (detectedWeekdays.length > 0) {
+      targetOccurrences = detectedWeekdays.map((dw) => {
+        const nextDate = getNextValidDateForDayOfWeek(dw.dayIndex, baseDate, tz, {
+          targetHour: fixedStartHour!,
+          targetMinute: fixedStartMin,
+          forceNextWeek: prompt.includes('depan'),
+          weekOffset: prompt.includes('minggu depan') ? 1 : 0,
+        });
 
-    // Calculate end ISO, handling cross-midnight seamlessly
-    const startDateObj = new Date(requestedStartAt);
-    const endDateObj = new Date(startDateObj.getTime() + duration * 60000);
-    requestedEndAt = endDateObj.toISOString();
+        const occStartIso = createIsoInTimezone(
+          nextDate.year,
+          nextDate.month,
+          nextDate.day,
+          fixedStartHour!,
+          fixedStartMin,
+          0,
+          tz
+        );
+        const occStartDate = new Date(occStartIso);
+        const occEndDate = new Date(occStartDate.getTime() + duration * 60000);
+        return {
+          dayName: dw.dayName,
+          dayOfWeek: dw.dayIndex,
+          requestedStartAt: occStartIso,
+          requestedEndAt: occEndDate.toISOString(),
+          label: `${dw.dayName} (${String(fixedStartHour).padStart(2, '0')}:${String(fixedStartMin).padStart(2, '0')})`,
+        };
+      });
+
+      requestedStartAt = targetOccurrences[0].requestedStartAt;
+      requestedEndAt = targetOccurrences[0].requestedEndAt;
+    } else {
+      // Construct start ISO in target timezone
+      requestedStartAt = createIsoInTimezone(
+        targetParts.year,
+        targetParts.month,
+        targetParts.day,
+        fixedStartHour,
+        fixedStartMin,
+        0,
+        tz
+      );
+
+      // Calculate end ISO, handling cross-midnight seamlessly
+      const startDateObj = new Date(requestedStartAt);
+      const endDateObj = new Date(startDateObj.getTime() + duration * 60000);
+      requestedEndAt = endDateObj.toISOString();
+    }
 
     preferredTimeOfDay = fixedStartHour >= 18 ? 'EVENING' : fixedStartHour >= 12 ? 'AFTERNOON' : 'MORNING';
   } else if (fixedStartHour !== null) {
@@ -326,7 +527,11 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   // 12. Explanation in Indonesian:
   let reasoning = '';
   if (timeConstraintType === 'fixed_event') {
-    reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, '0') : '00'}:${String(fixedStartMin).padStart(2, '0')} - ${fixedEndHour ? String(fixedEndHour).padStart(2, '0') : '00'}:${String(fixedEndMin).padStart(2, '0')}) sehingga dijaga tanpa digeser.`;
+    if (targetOccurrences && targetOccurrences.length > 1) {
+      reasoning = `AI mendeteksi ${targetOccurrences.length} komitmen waktu tetap terpisah (${targetOccurrences.map((o) => o.dayName).join(' dan ')}) pukul ${fixedStartHour ? String(fixedStartHour).padStart(2, '0') : '00'}:${String(fixedStartMin).padStart(2, '0')} - ${fixedEndHour ? String(fixedEndHour).padStart(2, '0') : '00'}:${String(fixedEndMin).padStart(2, '0')} sehingga dijadwalkan per hari tanpa digeser.`;
+    } else {
+      reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, '0') : '00'}:${String(fixedStartMin).padStart(2, '0')} - ${fixedEndHour ? String(fixedEndHour).padStart(2, '0') : '00'}:${String(fixedEndMin).padStart(2, '0')}) sehingga dijaga tanpa digeser.`;
+    }
   } else if (preferredWindow) {
     reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu ${preferredTimeOfDay === 'EVENING' ? 'santai atau fokus malam' : preferredTimeOfDay.toLowerCase()} Anda.`;
   } else {
@@ -340,6 +545,12 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     timeConstraintType,
     requestedStartAt,
     requestedEndAt,
+    targetDays,
+    targetOccurrences,
+    isRecurring: promptIsRecurring || (detectedWeekdays.length > 1),
+    recurrenceRule: (promptIsRecurring || detectedWeekdays.length > 1) ? 'WEEKLY_ON_DAYS' : undefined,
+    hasExplicitDayTarget,
+    isDayAmbiguous: isCommitmentKeyword && !hasExplicitDayTarget,
     preferredWindow,
     preferredTimeOfDay,
     deadlineAt: deadlineIso,

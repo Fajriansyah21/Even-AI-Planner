@@ -16,7 +16,7 @@ import {
   AlertTriangle,
   ArrowRight,
 } from 'lucide-react';
-import { CalendarEvent, Task, TaskScheduleSession, UserPreferences } from '../types';
+import { CalendarEvent, Priority, Task, TaskScheduleSession, UserPreferences } from '../types';
 import {
   normalizeTimezone,
   startOfDayInTimezone,
@@ -25,6 +25,17 @@ import {
   formatInTimezone,
   createIsoInTimezone,
 } from '../lib/timezone';
+import {
+  TaskCategory,
+  CATEGORY_OPTIONS,
+  PRIORITY_OPTIONS,
+  ALL_CATEGORIES,
+  ALL_PRIORITIES,
+  resolveItemCategory,
+  resolveItemPriority,
+  CalendarFilterPopover,
+  CalendarActiveFilterBar,
+} from './CalendarFilterPopover';
 
 interface CalendarViewProps {
   events: CalendarEvent[];
@@ -43,6 +54,8 @@ interface SlicedCalendarItem {
   event?: CalendarEvent;
   task?: Task;
   session?: TaskScheduleSession;
+  category: TaskCategory;
+  priority: Priority;
   itemStart: Date;
   itemEnd: Date;
   visibleStart: Date;
@@ -54,9 +67,26 @@ interface SlicedCalendarItem {
   isContinuedFromYesterday: boolean;
   isContinuedToTomorrow: boolean;
   isDone?: boolean;
+  isGoogleSynced?: boolean;
   colIndex: number;
   totalCols: number;
   hasConflict: boolean;
+}
+
+/**
+ * Memeriksa kesamaan identitas antara sesi internal EVEN dan acara Google Calendar
+ * secara ketat berdasarkan ID hubungan resmi (googleCalendarEventId vs id acara).
+ * Jangan pernah menyatukan dua acara hanya karena waktu atau judulnya sama.
+ */
+export function isSessionLinkedToGoogleEvent(
+  sessionGoogleId: string | undefined,
+  calendarEventId: string
+): boolean {
+  if (!sessionGoogleId || !calendarEventId) return false;
+  if (sessionGoogleId === calendarEventId) return true;
+  const cleanSessionId = sessionGoogleId.replace(/^gcal-/, '');
+  const cleanEventId = calendarEventId.replace(/^gcal-/, '');
+  return cleanSessionId === cleanEventId;
 }
 
 export const ROW_HEIGHT = 56; // 56px per 1 hour slot
@@ -118,6 +148,43 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
   const [selectedEventDetails, setSelectedEventDetails] = useState<CalendarEvent | null>(null);
   const [selectedSessionDetails, setSelectedSessionDetails] = useState<{ task: Task; session: TaskScheduleSession } | null>(null);
   const [selectedDayOverview, setSelectedDayOverview] = useState<{ date: Date; items: SlicedCalendarItem[] } | null>(null);
+
+  // Real-time filter states for category and priority
+  const [selectedCategories, setSelectedCategories] = useState<TaskCategory[]>(ALL_CATEGORIES);
+  const [selectedPriorities, setSelectedPriorities] = useState<Priority[]>(ALL_PRIORITIES);
+
+  const handleToggleCategory = (cat: TaskCategory) => {
+    setSelectedCategories((prev) =>
+      prev.includes(cat) ? prev.filter((c) => c !== cat) : [...prev, cat]
+    );
+  };
+
+  const handleTogglePriority = (prio: Priority) => {
+    setSelectedPriorities((prev) =>
+      prev.includes(prio) ? prev.filter((p) => p !== prio) : [...prev, prio]
+    );
+  };
+
+  const handleSelectAllCategories = () => {
+    if (selectedCategories.length === ALL_CATEGORIES.length) {
+      setSelectedCategories([]);
+    } else {
+      setSelectedCategories([...ALL_CATEGORIES]);
+    }
+  };
+
+  const handleSelectAllPriorities = () => {
+    if (selectedPriorities.length === ALL_PRIORITIES.length) {
+      setSelectedPriorities([]);
+    } else {
+      setSelectedPriorities([...ALL_PRIORITIES]);
+    }
+  };
+
+  const handleResetFilters = () => {
+    setSelectedCategories([...ALL_CATEGORIES]);
+    setSelectedPriorities([...ALL_PRIORITIES]);
+  };
 
   // Compute week dates starting from Monday of currentDate
   const getWeekDates = (date: Date): Date[] => {
@@ -200,10 +267,24 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
       event?: CalendarEvent;
       task?: Task;
       session?: TaskScheduleSession;
+      category: TaskCategory;
+      priority: Priority;
       start: Date;
       end: Date;
       isDone?: boolean;
     }[] = [];
+
+    // 1. Identifikasi sesi lokal yang terhubung dengan acara Google Calendar via ID unik resmi (googleCalendarEventId)
+    const linkedGoogleIds = new Set<string>();
+    for (const item of scheduledSessions) {
+      if (item.session.googleCalendarEventId) {
+        const rawId = item.session.googleCalendarEventId;
+        const cleanId = rawId.replace(/^gcal-/, '');
+        linkedGoogleIds.add(rawId);
+        linkedGoogleIds.add(cleanId);
+        linkedGoogleIds.add(`gcal-${cleanId}`);
+      }
+    }
 
     // 1. Google & manual calendar events
     for (const evt of events) {
@@ -212,11 +293,32 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
       if (!isNaN(s.getTime()) && !isNaN(e.getTime()) && e > s) {
         // Half-open interval intersection: s < dayEnd && e > dayStart
         if (s.getTime() < dayEndMs && e.getTime() > dayStartMs) {
+          const cleanEvtId = evt.id.replace(/^gcal-/, '');
+          // Jika acara Google ini sudah memiliki sesi lokal yang terhubung via ID hubungan googleCalendarEventId,
+          // lewati untuk menampilkan satu kartu representasi terpadu tanpa duplikasi visual.
+          if (
+            linkedGoogleIds.has(evt.id) ||
+            linkedGoogleIds.has(cleanEvtId) ||
+            linkedGoogleIds.has(`gcal-${cleanEvtId}`)
+          ) {
+            continue;
+          }
+
+          const cat = resolveItemCategory({ event: evt });
+          const prio = resolveItemPriority({ event: evt });
+
+          // Real-time filter: skip if category or priority is not selected
+          if (!selectedCategories.includes(cat) || !selectedPriorities.includes(prio)) {
+            continue;
+          }
+
           rawItems.push({
             id: `evt-${evt.id}`,
             sourceType: 'google',
             title: evt.title,
             event: evt,
+            category: cat,
+            priority: prio,
             start: s,
             end: e,
           });
@@ -230,15 +332,31 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
       const e = new Date(item.session.endAt);
       if (!isNaN(s.getTime()) && !isNaN(e.getTime()) && e > s) {
         if (s.getTime() < dayEndMs && e.getTime() > dayStartMs) {
+          // Cari acara Google Calendar pasangannya jika ada untuk tautan/metadata
+          const matchedEvt = events.find((evt) =>
+            isSessionLinkedToGoogleEvent(item.session.googleCalendarEventId, evt.id)
+          );
+
+          const cat = resolveItemCategory({ task: item.task, event: matchedEvt });
+          const prio = resolveItemPriority({ task: item.task, event: matchedEvt });
+
+          // Real-time filter: skip if category or priority is not selected
+          if (!selectedCategories.includes(cat) || !selectedPriorities.includes(prio)) {
+            continue;
+          }
+
           rawItems.push({
             id: `sess-${item.session.id}`,
             sourceType: 'session',
             title: item.session.taskTitle,
             task: item.task,
             session: item.session,
+            event: matchedEvt,
+            category: cat,
+            priority: prio,
             start: s,
             end: e,
-            isDone: item.session.status === 'COMPLETED',
+            isDone: item.session.status === 'COMPLETED' || item.session.status === 'completed_manual',
           });
         }
       }
@@ -253,7 +371,6 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
       const itemEndMs = r.end.getTime();
       const visibleStartMs = Math.max(itemStartMs, dayStartMs);
       const visibleEndMs = Math.min(itemEndMs, dayEndMs);
-
       const totalDurationMinutes = Math.round((itemEndMs - itemStartMs) / 60000);
       const { topPx, heightPx, visibleDurationMinutes } = calculateVerticalPosition(
         visibleStartMs,
@@ -269,6 +386,8 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
         event: r.event,
         task: r.task,
         session: r.session,
+        category: r.category,
+        priority: r.priority,
         itemStart: r.start,
         itemEnd: r.end,
         visibleStart: new Date(visibleStartMs),
@@ -280,6 +399,11 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
         isContinuedFromYesterday: itemStartMs < dayStartMs,
         isContinuedToTomorrow: itemEndMs > dayEndMs,
         isDone: r.isDone,
+        isGoogleSynced: Boolean(
+          r.event ||
+          r.session?.googleCalendarEventId ||
+          r.session?.syncStatus === 'synced'
+        ),
         colIndex: 0,
         totalCols: 1,
         hasConflict: false,
@@ -413,40 +537,64 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
           </h2>
         </div>
 
-        {/* View Mode Toggle */}
-        <div className="flex items-center gap-1 p-1 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs font-medium">
-          <button
-            onClick={() => setViewMode('day')}
-            className={`px-3 py-1 rounded-lg transition-all ${
-              viewMode === 'day'
-                ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
-                : 'text-[#53657A] hover:text-[#172B42]'
-            }`}
-          >
-            Hari
-          </button>
-          <button
-            onClick={() => setViewMode('week')}
-            className={`px-3 py-1 rounded-lg transition-all ${
-              viewMode === 'week'
-                ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
-                : 'text-[#53657A] hover:text-[#172B42]'
-            }`}
-          >
-            Minggu
-          </button>
-          <button
-            onClick={() => setViewMode('month')}
-            className={`px-3 py-1 rounded-lg transition-all ${
-              viewMode === 'month'
-                ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
-                : 'text-[#53657A] hover:text-[#172B42]'
-            }`}
-          >
-            Bulan
-          </button>
+        {/* Actions & View Mode Toggle */}
+        <div className="flex items-center gap-2">
+          {/* UI Filter Real-time Kategori & Prioritas */}
+          <CalendarFilterPopover
+            selectedCategories={selectedCategories}
+            selectedPriorities={selectedPriorities}
+            onToggleCategory={handleToggleCategory}
+            onTogglePriority={handleTogglePriority}
+            onSelectAllCategories={handleSelectAllCategories}
+            onSelectAllPriorities={handleSelectAllPriorities}
+            onResetFilters={handleResetFilters}
+            totalItemsCount={scheduledSessions.length + events.length}
+          />
+
+          {/* View Mode Toggle */}
+          <div className="flex items-center gap-1 p-1 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs font-medium">
+            <button
+              onClick={() => setViewMode('day')}
+              className={`px-3 py-1 rounded-lg transition-all ${
+                viewMode === 'day'
+                  ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
+                  : 'text-[#53657A] hover:text-[#172B42]'
+              }`}
+            >
+              Hari
+            </button>
+            <button
+              onClick={() => setViewMode('week')}
+              className={`px-3 py-1 rounded-lg transition-all ${
+                viewMode === 'week'
+                  ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
+                  : 'text-[#53657A] hover:text-[#172B42]'
+              }`}
+            >
+              Minggu
+            </button>
+            <button
+              onClick={() => setViewMode('month')}
+              className={`px-3 py-1 rounded-lg transition-all ${
+                viewMode === 'month'
+                  ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
+                  : 'text-[#53657A] hover:text-[#172B42]'
+              }`}
+            >
+              Bulan
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Active Filter Chips Bar */}
+      <CalendarActiveFilterBar
+        selectedCategories={selectedCategories}
+        selectedPriorities={selectedPriorities}
+        onToggleCategory={handleToggleCategory}
+        onTogglePriority={handleTogglePriority}
+        onResetFilters={handleResetFilters}
+      />
 
       {/* Main Calendar Content Area */}
       <div className="flex-1 overflow-y-auto p-4 sm:p-6">
@@ -582,25 +730,35 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                               <span className="text-[11px] font-bold truncate">
                                 {item.title}
                               </span>
-                              {isGoogle ? (
-                                <Lock size={9} className="text-[#53657A] shrink-0" />
-                              ) : (
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    if (item.task && item.session) {
-                                      onToggleTaskSessionComplete(item.task.id, item.session.id);
-                                    }
-                                  }}
-                                  className="text-[#2457A7] hover:text-[#16856B] shrink-0"
-                                  title={isDone ? 'Tandai belum selesai' : 'Tandai selesai'}
-                                >
-                                  <CheckCircle2
-                                    size={11}
-                                    className={isDone ? 'text-[#16856B] fill-[#16856B]/20' : 'text-[#2457A7]'}
-                                  />
-                                </button>
-                              )}
+                              <div className="flex items-center gap-1 shrink-0">
+                                {item.isGoogleSynced && !isGoogle && (
+                                  <span
+                                    title="Tersinkronisasi dengan Google Calendar"
+                                    className="text-[8px] bg-blue-100 text-[#2457A7] px-1 py-0.2 rounded font-semibold"
+                                  >
+                                    GCal
+                                  </span>
+                                )}
+                                {isGoogle ? (
+                                  <Lock size={9} className="text-[#53657A] shrink-0" />
+                                ) : (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (item.task && item.session) {
+                                        onToggleTaskSessionComplete(item.task.id, item.session.id);
+                                      }
+                                    }}
+                                    className="text-[#2457A7] hover:text-[#16856B] shrink-0"
+                                    title={isDone ? 'Tandai belum selesai' : 'Tandai selesai'}
+                                  >
+                                    <CheckCircle2
+                                      size={11}
+                                      className={isDone ? 'text-[#16856B] fill-[#16856B]/20' : 'text-[#2457A7]'}
+                                    />
+                                  </button>
+                                )}
+                              </div>
                             </div>
 
                             {/* Continuation Badges for Cross-Midnight Events */}
@@ -721,15 +879,22 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                         <div>
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-xs font-bold truncate">{item.title}</span>
-                            {isGoogle ? (
-                              <span className="text-[10px] bg-white border border-[#D9E3EF] text-[#53657A] px-1.5 py-0.2 rounded font-medium shrink-0">
-                                Google
-                              </span>
-                            ) : (
-                              <span className="text-[10px] bg-[#2457A7] text-white px-2 py-0.2 rounded-full font-medium shrink-0">
-                                Sesi Fokus
-                              </span>
-                            )}
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              {item.isGoogleSynced && !isGoogle && (
+                                <span className="text-[9px] bg-blue-100 border border-blue-200 text-[#2457A7] px-1.5 py-0.2 rounded font-medium">
+                                  Google Synced
+                                </span>
+                              )}
+                              {isGoogle ? (
+                                <span className="text-[10px] bg-white border border-[#D9E3EF] text-[#53657A] px-1.5 py-0.2 rounded font-medium shrink-0">
+                                  Google
+                                </span>
+                              ) : (
+                                <span className="text-[10px] bg-[#2457A7] text-white px-2 py-0.2 rounded-full font-medium shrink-0">
+                                  Sesi Fokus
+                                </span>
+                              )}
+                            </div>
                           </div>
                           {item.isContinuedFromYesterday && (
                             <span className="text-[10px] bg-indigo-100 text-indigo-800 px-1.5 py-0.2 rounded mt-1 inline-block">
@@ -741,6 +906,17 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                               Bersambung ke hari berikutnya
                             </span>
                           )}
+
+                          {/* Category & Priority Badges */}
+                          <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
+                            <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full font-medium bg-white/80 border border-[#D9E3EF]">
+                              <span className={`w-1.5 h-1.5 rounded-full ${CATEGORY_OPTIONS.find((c) => c.id === item.category)?.dotClass}`} />
+                              <span>{CATEGORY_OPTIONS.find((c) => c.id === item.category)?.label}</span>
+                            </span>
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium border ${PRIORITY_OPTIONS.find((p) => p.id === item.priority)?.badgeClass}`}>
+                              Prioritas {PRIORITY_OPTIONS.find((p) => p.id === item.priority)?.label}
+                            </span>
+                          </div>
                         </div>
 
                         <div className="flex items-center justify-between text-[11px] text-[#53657A] font-mono pt-1">
@@ -1082,9 +1258,18 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
           <div className="w-full max-w-md bg-white rounded-2xl p-6 shadow-xl border border-[#D9E3EF] space-y-4">
             <div className="flex items-start justify-between">
               <div>
-                <span className="text-[10px] font-semibold bg-[#EAF3FC] text-[#2457A7] px-2 py-0.5 rounded-full">
-                  Sesi Kegiatan EVEN
-                </span>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[10px] font-semibold bg-[#EAF3FC] text-[#2457A7] px-2 py-0.5 rounded-full">
+                    Sesi Kegiatan EVEN
+                  </span>
+                  <span className={`inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full border ${CATEGORY_OPTIONS.find((c) => c.id === (selectedSessionDetails.task.category || 'personal'))?.badgeClass}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full ${CATEGORY_OPTIONS.find((c) => c.id === (selectedSessionDetails.task.category || 'personal'))?.dotClass}`} />
+                    {CATEGORY_OPTIONS.find((c) => c.id === (selectedSessionDetails.task.category || 'personal'))?.label}
+                  </span>
+                  <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full border ${PRIORITY_OPTIONS.find((p) => p.id === selectedSessionDetails.task.priority)?.badgeClass}`}>
+                    Prioritas {PRIORITY_OPTIONS.find((p) => p.id === selectedSessionDetails.task.priority)?.label}
+                  </span>
+                </div>
                 <h3 className="text-base font-bold text-[#172B42] mt-1.5">
                   {selectedSessionDetails.session.taskTitle}
                 </h3>
@@ -1119,6 +1304,25 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                 Durasi pengerjaan: <strong className="text-[#172B42]">{selectedSessionDetails.session.durationMinutes} menit</strong>
                 {selectedSessionDetails.session.totalSessions > 1 && ` (Bagian ${selectedSessionDetails.session.sessionIndex} dari ${selectedSessionDetails.session.totalSessions} sesi)`}
               </p>
+
+              {(selectedSessionDetails.session.googleCalendarEventId || selectedSessionDetails.session.syncStatus === 'synced') && (
+                <div className="p-2.5 bg-blue-50/70 border border-blue-200/80 rounded-xl flex items-center justify-between text-xs text-[#2457A7] mt-2">
+                  <div className="flex items-center gap-1.5 font-medium">
+                    <CalendarIcon size={13} className="text-[#2457A7]" />
+                    <span>Tersinkronisasi dengan Google Calendar</span>
+                  </div>
+                  {selectedSessionDetails.session.htmlLink && (
+                    <a
+                      href={selectedSessionDetails.session.htmlLink}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-semibold underline hover:text-[#1E4889] flex items-center gap-1 text-[11px]"
+                    >
+                      <ExternalLink size={12} /> Buka
+                    </a>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="pt-2 flex items-center gap-2">

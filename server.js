@@ -84,22 +84,88 @@ function createIsoInTimezone(year, month, day, hour, minute = 0, second = 0, tim
 }
 
 // src/lib/temporalParser.ts
+var INDONESIAN_WEEKDAYS = [
+  { name: "minggu", dayIndex: 0 },
+  { name: "ahad", dayIndex: 0 },
+  { name: "senin", dayIndex: 1 },
+  { name: "selasa", dayIndex: 2 },
+  { name: "rabu", dayIndex: 3 },
+  { name: "kamis", dayIndex: 4 },
+  { name: "jumat", dayIndex: 5 },
+  { name: "jum'at", dayIndex: 5 },
+  { name: "sabtu", dayIndex: 6 }
+];
+var DAY_NAMES_ID = {
+  0: "Minggu",
+  1: "Senin",
+  2: "Selasa",
+  3: "Rabu",
+  4: "Kamis",
+  5: "Jumat",
+  6: "Sabtu"
+};
 function parseIndonesianTemporalRules(ctx) {
   const prompt = ctx.userPrompt.trim().toLowerCase();
   const tz = parseTimezoneString(ctx.userTimezone || "Asia/Jakarta");
   const baseDate = ctx.currentDateTime ? new Date(ctx.currentDateTime) : /* @__PURE__ */ new Date();
   const baseParts = getPartsInTimezone(baseDate, tz);
+  const todayDayOfWeek = baseParts.dayOfWeek;
+  const detectedWeekdays = [];
+  const weekdayRegex = /\b(senin|selasa|rabu|kamis|jumat|jum'at|sabtu|ahad)\b/gi;
+  let match;
+  while ((match = weekdayRegex.exec(prompt)) !== null) {
+    const word = match[1].toLowerCase();
+    const entry = INDONESIAN_WEEKDAYS.find((w) => w.name === word);
+    if (entry && !detectedWeekdays.some((d) => d.dayIndex === entry.dayIndex)) {
+      detectedWeekdays.push({
+        dayIndex: entry.dayIndex,
+        dayName: DAY_NAMES_ID[entry.dayIndex],
+        indexInPrompt: match.index
+      });
+    }
+  }
+  const sundayRegex = /\b(?:hari\s+minggu|minggu\s+(?:pagi|siang|sore|malam|jam|pukul|\d)|(?:dan|sampai|hingga|-)\s+minggu)\b|\bminggu\b(?!\s+depan)/gi;
+  if (sundayRegex.test(prompt)) {
+    if (!detectedWeekdays.some((d) => d.dayIndex === 0)) {
+      detectedWeekdays.push({
+        dayIndex: 0,
+        dayName: "Minggu",
+        indexInPrompt: prompt.indexOf("minggu")
+      });
+    }
+  }
+  detectedWeekdays.sort((a, b) => a.indexInPrompt - b.indexInPrompt);
+  let hasExplicitDayTarget = false;
   let dayOffset = 0;
-  if (prompt.includes("besok lusa")) {
+  if (detectedWeekdays.length > 0) {
+    hasExplicitDayTarget = true;
+    const firstDay = detectedWeekdays[0].dayIndex;
+    let diff = (firstDay - todayDayOfWeek + 7) % 7;
+    if (diff === 0 && prompt.includes("depan")) {
+      diff = 7;
+    }
+    if (prompt.includes("minggu depan") && diff < 7) {
+      diff += 7;
+    }
+    dayOffset = diff;
+  } else if (prompt.includes("besok lusa")) {
     dayOffset = 2;
+    hasExplicitDayTarget = true;
   } else if (prompt.includes("lusa")) {
     dayOffset = 2;
+    hasExplicitDayTarget = true;
   } else if (prompt.includes("besok")) {
     dayOffset = 1;
+    hasExplicitDayTarget = true;
   } else if (prompt.includes("3 hari lagi")) {
     dayOffset = 3;
+    hasExplicitDayTarget = true;
   } else if (prompt.includes("minggu depan")) {
     dayOffset = 7;
+    hasExplicitDayTarget = true;
+  } else if (prompt.includes("hari ini") || prompt.includes("malam ini") || prompt.includes("pagi ini") || prompt.includes("siang ini") || prompt.includes("sore ini")) {
+    dayOffset = 0;
+    hasExplicitDayTarget = true;
   }
   const targetDateObj = new Date(baseDate.getTime() + dayOffset * 864e5);
   const targetParts = getPartsInTimezone(targetDateObj, tz);
@@ -220,20 +286,58 @@ function parseIndonesianTemporalRules(ctx) {
   let preferredTimeOfDay = "ANY";
   const isFlexibleLearningOrTask = /\b(belajar|kerja|mengerjakan|tugas|baca|membaca|fokus|cicil)\b/i.test(prompt);
   const isExactFixedEvent = fixedStartHour !== null && (hasExplicitRange || isCommitmentKeyword || !isFlexibleLearningOrTask && (prompt.includes("pukul") || prompt.includes("jam")) || prompt.includes("tidur pukul") || prompt.includes("tidur jam"));
+  let targetOccurrences = void 0;
+  let targetDays = void 0;
   if (isExactFixedEvent && fixedStartHour !== null) {
     timeConstraintType = "fixed_event";
-    requestedStartAt = createIsoInTimezone(
-      targetParts.year,
-      targetParts.month,
-      targetParts.day,
-      fixedStartHour,
-      fixedStartMin,
-      0,
-      tz
-    );
-    const startDateObj = new Date(requestedStartAt);
-    const endDateObj = new Date(startDateObj.getTime() + duration * 6e4);
-    requestedEndAt = endDateObj.toISOString();
+    if (detectedWeekdays.length > 0) {
+      targetDays = detectedWeekdays.map((dw) => dw.dayIndex);
+      targetOccurrences = detectedWeekdays.map((dw) => {
+        let diff = (dw.dayIndex - todayDayOfWeek + 7) % 7;
+        const hasTimePassed = fixedStartHour !== null && (fixedStartHour < baseParts.hour || fixedStartHour === baseParts.hour && fixedStartMin <= baseParts.minute);
+        if (diff === 0 && (prompt.includes("depan") || hasTimePassed)) {
+          diff = 7;
+        }
+        if (prompt.includes("minggu depan") && diff < 7) {
+          diff += 7;
+        }
+        const occDateObj = new Date(baseDate.getTime() + diff * 864e5);
+        const occParts = getPartsInTimezone(occDateObj, tz);
+        const occStartIso = createIsoInTimezone(
+          occParts.year,
+          occParts.month,
+          occParts.day,
+          fixedStartHour,
+          fixedStartMin,
+          0,
+          tz
+        );
+        const occStartDate = new Date(occStartIso);
+        const occEndDate = new Date(occStartDate.getTime() + duration * 6e4);
+        return {
+          dayName: dw.dayName,
+          dayOfWeek: dw.dayIndex,
+          requestedStartAt: occStartIso,
+          requestedEndAt: occEndDate.toISOString(),
+          label: `${dw.dayName} (${String(fixedStartHour).padStart(2, "0")}:${String(fixedStartMin).padStart(2, "0")})`
+        };
+      });
+      requestedStartAt = targetOccurrences[0].requestedStartAt;
+      requestedEndAt = targetOccurrences[0].requestedEndAt;
+    } else {
+      requestedStartAt = createIsoInTimezone(
+        targetParts.year,
+        targetParts.month,
+        targetParts.day,
+        fixedStartHour,
+        fixedStartMin,
+        0,
+        tz
+      );
+      const startDateObj = new Date(requestedStartAt);
+      const endDateObj = new Date(startDateObj.getTime() + duration * 6e4);
+      requestedEndAt = endDateObj.toISOString();
+    }
     preferredTimeOfDay = fixedStartHour >= 18 ? "EVENING" : fixedStartHour >= 12 ? "AFTERNOON" : "MORNING";
   } else if (fixedStartHour !== null) {
     timeConstraintType = "preferred_window";
@@ -311,7 +415,11 @@ function parseIndonesianTemporalRules(ctx) {
   }
   let reasoning = "";
   if (timeConstraintType === "fixed_event") {
-    reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, "0") : "00"}:${String(fixedStartMin).padStart(2, "0")} - ${fixedEndHour ? String(fixedEndHour).padStart(2, "0") : "00"}:${String(fixedEndMin).padStart(2, "0")}) sehingga dijaga tanpa digeser.`;
+    if (targetOccurrences && targetOccurrences.length > 1) {
+      reasoning = `AI mendeteksi ${targetOccurrences.length} komitmen waktu tetap terpisah (${targetOccurrences.map((o) => o.dayName).join(" dan ")}) pukul ${fixedStartHour ? String(fixedStartHour).padStart(2, "0") : "00"}:${String(fixedStartMin).padStart(2, "0")} - ${fixedEndHour ? String(fixedEndHour).padStart(2, "0") : "00"}:${String(fixedEndMin).padStart(2, "0")} sehingga dijadwalkan per hari tanpa digeser.`;
+    } else {
+      reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, "0") : "00"}:${String(fixedStartMin).padStart(2, "0")} - ${fixedEndHour ? String(fixedEndHour).padStart(2, "0") : "00"}:${String(fixedEndMin).padStart(2, "0")}) sehingga dijaga tanpa digeser.`;
+    }
   } else if (preferredWindow) {
     reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu ${preferredTimeOfDay === "EVENING" ? "santai atau fokus malam" : preferredTimeOfDay.toLowerCase()} Anda.`;
   } else {
@@ -324,6 +432,10 @@ function parseIndonesianTemporalRules(ctx) {
     timeConstraintType,
     requestedStartAt,
     requestedEndAt,
+    targetDays,
+    targetOccurrences,
+    hasExplicitDayTarget,
+    isDayAmbiguous: isCommitmentKeyword && !hasExplicitDayTarget,
     preferredWindow,
     preferredTimeOfDay,
     deadlineAt: deadlineIso,
@@ -589,7 +701,10 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
    c. 'deadline_only': Jika tugas fleksibel dan hanya dibatasi tenggat (contoh: 'laporan selesai sebelum lusa', 'baca artikel sebelum minggu').
 3. Estimasi durasi (estimatedDurationMinutes) harus konsisten dengan waktu yang diminta.
 4. Jangan berasumsi diam-diam bahwa waktu adalah pagi jika konteks menyebut malam atau sore.
-5. Sediakan 'reasoning' singkat dalam Bahasa Indonesia yang transparan.`;
+5. Sediakan 'reasoning' singkat dalam Bahasa Indonesia yang transparan.
+6. JADWAL MULTI-HARI & PERULANGAN:
+   - Jika pengguna menyebutkan beberapa hari (contoh: 'kelas pada Senin dan Selasa malam', 'Senin dan Rabu jam 19.00 - 21.00'), JANGAN PERNAH mengubahnya menjadi satu tugas berdurasi panjang 24 jam lebih!
+   - Pisahkan menjadi daftar kejadian terpisah di 'targetOccurrences' dengan waktu mulai dan selesai per masing-masing hari.`;
       const retryResult = await executeWithRetryAndTimeout(
         async (attempt, remainingMs) => {
           const perAttemptTimeoutMs = Math.min(25e3, Math.max(5e3, remainingMs - 500));
@@ -629,12 +744,25 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
                       type: Type.STRING,
                       description: "MORNING, AFTERNOON, EVENING, atau ANY"
                     },
-                    estimatedDurationMinutes: { type: Type.INTEGER, description: "Estimasi durasi dalam menit" },
+                    estimatedDurationMinutes: { type: Type.INTEGER, description: "Estimasi durasi dalam menit per sesi" },
                     deadlineDaysFromNow: { type: Type.INTEGER, description: "Tenggat waktu dalam jumlah hari dari sekarang" },
                     deadlineAt: { type: Type.STRING, description: "ISO string tenggat waktu absolut" },
                     priority: { type: Type.STRING, description: "Prioritas: LOW, MEDIUM, HIGH, atau URGENT" },
                     allowSplit: { type: Type.BOOLEAN, description: "Boleh dipecah beberapa sesi" },
                     minimumSessionMinutes: { type: Type.INTEGER, description: "Durasi minimal per sesi jika dipecah" },
+                    targetOccurrences: {
+                      type: Type.ARRAY,
+                      description: "Daftar kejadian jika pengguna menyebutkan beberapa hari (contoh: Senin dan Selasa malam)",
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          dayName: { type: Type.STRING, description: "Nama hari (contoh: Senin, Selasa)" },
+                          requestedStartAt: { type: Type.STRING, description: "ISO string waktu mulai untuk kejadian hari ini" },
+                          requestedEndAt: { type: Type.STRING, description: "ISO string waktu selesai untuk kejadian hari ini" }
+                        },
+                        required: ["dayName", "requestedStartAt", "requestedEndAt"]
+                      }
+                    },
                     reasoning: { type: Type.STRING, description: "Alasan rasional pemilihan durasi & struktur dalam Bahasa Indonesia" }
                   },
                   required: ["title", "timeConstraintType", "estimatedDurationMinutes", "priority", "allowSplit", "reasoning"]
@@ -688,12 +816,36 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         ...rawPlan,
         timezone: ctx.userTimezone
       };
-      if (baselinePlan.timeConstraintType === "fixed_event") {
+      if (baselinePlan.targetOccurrences && baselinePlan.targetOccurrences.length > 1) {
         sanitizedPlan.timeConstraintType = "fixed_event";
-        sanitizedPlan.requestedStartAt = baselinePlan.requestedStartAt;
-        sanitizedPlan.requestedEndAt = baselinePlan.requestedEndAt;
+        sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
+        sanitizedPlan.targetDays = baselinePlan.targetDays;
+        sanitizedPlan.requestedStartAt = baselinePlan.targetOccurrences[0].requestedStartAt;
+        sanitizedPlan.requestedEndAt = baselinePlan.targetOccurrences[0].requestedEndAt;
         sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
         sanitizedPlan.allowSplit = false;
+      } else if (rawPlan.targetOccurrences && Array.isArray(rawPlan.targetOccurrences) && rawPlan.targetOccurrences.length > 1) {
+        sanitizedPlan.timeConstraintType = "fixed_event";
+        sanitizedPlan.targetOccurrences = rawPlan.targetOccurrences;
+        sanitizedPlan.requestedStartAt = rawPlan.targetOccurrences[0].requestedStartAt;
+        sanitizedPlan.requestedEndAt = rawPlan.targetOccurrences[0].requestedEndAt;
+        sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes || rawPlan.estimatedDurationMinutes;
+        sanitizedPlan.allowSplit = false;
+      } else if (baselinePlan.timeConstraintType === "fixed_event") {
+        sanitizedPlan.timeConstraintType = "fixed_event";
+        if (baselinePlan.hasExplicitDayTarget || !rawPlan.requestedStartAt) {
+          sanitizedPlan.requestedStartAt = baselinePlan.requestedStartAt;
+          sanitizedPlan.requestedEndAt = baselinePlan.requestedEndAt;
+        } else {
+          sanitizedPlan.requestedStartAt = rawPlan.requestedStartAt;
+          sanitizedPlan.requestedEndAt = rawPlan.requestedEndAt;
+        }
+        sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
+        sanitizedPlan.allowSplit = false;
+        if (baselinePlan.targetOccurrences) {
+          sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
+          sanitizedPlan.targetDays = baselinePlan.targetDays;
+        }
       } else if (baselinePlan.timeConstraintType === "preferred_window") {
         sanitizedPlan.timeConstraintType = "preferred_window";
         sanitizedPlan.preferredWindow = baselinePlan.preferredWindow;

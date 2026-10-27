@@ -40,6 +40,15 @@ export interface TaskScheduleSession {
   htmlLink?: string;
   completedAt?: string;
   missedAt?: string;
+  occurrenceLabel?: string;
+}
+
+export interface TaskOccurrence {
+  dayName?: string;
+  dayOfWeek?: number;
+  requestedStartAt: string;
+  requestedEndAt: string;
+  label?: string;
 }
 
 export type TimeConstraintType = 'fixed_event' | 'preferred_window' | 'deadline_only';
@@ -67,6 +76,10 @@ export interface Task {
   timeConstraintType?: TimeConstraintType;
   requestedStartAt?: string; // ISO string for fixed event
   requestedEndAt?: string;   // ISO string for fixed event
+  targetDays?: number[];     // e.g. [1, 2] for Monday & Tuesday
+  targetOccurrences?: TaskOccurrence[];
+  isRecurring?: boolean;     // Jadwal berulang / recurring
+  recurrenceRule?: string;   // e.g. 'WEEKLY_ON_DAYS'
   isAllDay?: boolean;
   category?: 'work' | 'personal' | 'study' | 'focus';
   preferredWindow?: PreferredTimeWindow;
@@ -134,9 +147,17 @@ export interface ScheduleCalculationResult {
     durationMinutes: number;
     sessionIndex: number;
     totalSessions: number;
+    occurrenceLabel?: string;
   }[];
   explanation: string;
   warning?: string;
+  partialSuccess?: boolean;
+  skippedOccurrences?: {
+    dayName: string;
+    startAt?: string;
+    endAt?: string;
+    reason: string;
+  }[];
   diagnostics?: {
     freeTimeCalculatedMinutes?: number;
     searchDaysLimit?: number;
@@ -151,6 +172,12 @@ export interface AIPlanDraft {
   timeConstraintType: TimeConstraintType; // 'fixed_event' | 'preferred_window' | 'deadline_only'
   requestedStartAt?: string;             // ISO date string for fixed event
   requestedEndAt?: string;               // ISO date string for fixed event
+  targetDays?: number[];                 // e.g. [1, 2] for Monday & Tuesday
+  targetOccurrences?: TaskOccurrence[];
+  isRecurring?: boolean;                 // Jadwal berulang / recurring
+  recurrenceRule?: string;               // e.g. 'WEEKLY_ON_DAYS'
+  hasExplicitDayTarget?: boolean;
+  isDayAmbiguous?: boolean;
   preferredWindow?: PreferredTimeWindow; // Custom window e.g. 19:00 - 22:00
   preferredTimeOfDay: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY';
   deadlineAt?: string | null;            // ISO date string (optional)

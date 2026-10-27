@@ -5,6 +5,7 @@ import { runNightAndTimezoneTests } from './night-and-timezone-scheduling.test';
 import { runRealGoogleCalendarIntegrationTest } from './real-google-integration.test';
 import { runCalendarVerticalPositionTests } from './calendar-vertical-position.test';
 import { runActivityHistoryAndStatusTests } from './activity-history-and-status.test';
+import { runSchedulingBugsTests } from './scheduling-bugs-audit-and-fix.test';
 
 async function main() {
   console.log('================================================================');
@@ -13,34 +14,38 @@ async function main() {
 
   try {
     // 1. Core Parser & Deterministic Scheduler Suite
-    console.log('>>> [1/7] Parser & Scheduler Test Suite...');
+    console.log('>>> [1/8] Parser & Scheduler Test Suite...');
     await import('./parser-scheduler.test');
 
     // 2. Night Scheduling & Asia/Jakarta Timezone Suite
-    console.log('\n>>> [2/7] Night Scheduling & Timezone Suite...');
+    console.log('\n>>> [2/8] Night Scheduling & Timezone Suite...');
     await runNightAndTimezoneTests();
 
     // 3. Gemini Error Classification & Exponential Backoff Suite
-    console.log('\n>>> [3/7] Gemini Error Handling & Resilience Suite...');
+    console.log('\n>>> [3/8] Gemini Error Handling & Resilience Suite...');
     await import('./gemini-error-handling.test');
 
     // 4. Auth Integrity & Zero Fake Login Suite
-    console.log('\n>>> [4/7] Auth Integrity & Status Truth Suite...');
+    console.log('\n>>> [4/8] Auth Integrity & Status Truth Suite...');
     await import('./auth-and-truth.test');
 
     // 5. Calendar Vertical Position & Scale Mapping Suite
-    console.log('\n>>> [5/7] Calendar Vertical Position Mapping Suite...');
+    console.log('\n>>> [5/8] Calendar Vertical Position Mapping Suite...');
     runCalendarVerticalPositionTests();
 
     // 6. Activity History & Status Automation Suite
-    console.log('\n>>> [6/7] Activity History & Automated Status Suite...');
+    console.log('\n>>> [6/8] Activity History & Automated Status Suite...');
     await runActivityHistoryAndStatusTests();
 
     // 7. Google Calendar Mock Read/Write Suite
-    console.log('\n>>> [7/7] Google Calendar Mock API Suite...');
+    console.log('\n>>> [7/8] Google Calendar Mock API Suite...');
     await runGoogleCalendarUnitTests();
 
-    // 8. Real Google Calendar Integration (Opt-in Check)
+    // 8. Scheduling Bugs Audit & Multi-day Fix Suite
+    console.log('\n>>> [8/8] Scheduling Bugs Audit & Multi-day Fix Suite...');
+    await runSchedulingBugsTests();
+
+    // 9. Real Google Calendar Integration (Opt-in Check)
     console.log('\n>>> [Opsi] Pengujian Integrasi Google Calendar Nyata...');
     await runRealGoogleCalendarIntegrationTest();
 

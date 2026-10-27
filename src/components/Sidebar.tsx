@@ -9,12 +9,16 @@ import {
   LogOut,
   StickyNote,
   History,
+  BarChart2,
 } from 'lucide-react';
+import { motion } from 'framer-motion';
 import { UserPreferences } from '../types';
 
+export type SidebarTab = 'calendar' | 'tasks' | 'dashboard' | 'keep' | 'ai' | 'settings' | 'history';
+
 interface SidebarProps {
-  currentTab: 'calendar' | 'tasks' | 'keep' | 'ai' | 'settings' | 'history';
-  onSelectTab: (tab: 'calendar' | 'tasks' | 'keep' | 'ai' | 'settings' | 'history') => void;
+  currentTab: SidebarTab;
+  onSelectTab: (tab: SidebarTab) => void;
   pendingTasksCount: number;
   keepNotesCount: number;
   missedTasksCount?: number;
@@ -51,6 +55,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
       icon: CheckSquare,
       badge: pendingTasksCount > 0 ? pendingTasksCount : null,
       subtitle: 'Durasi & Jadwal',
+    },
+    {
+      id: 'dashboard' as const,
+      label: 'Dashboard',
+      icon: BarChart2,
+      badge: null,
+      subtitle: 'Distribusi & Beban',
     },
     {
       id: 'history' as const,
@@ -103,29 +114,40 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         </div>
 
-        {/* Navigation Items */}
-        <nav className="space-y-1" aria-label="Navigasi Utama">
+        {/* Navigation Items with Framer Motion transitions */}
+        <nav className="space-y-1 relative" aria-label="Navigasi Utama">
           {navItems.map((item) => {
             const Icon = item.icon;
             const isActive = currentTab === item.id;
 
             return (
-              <button
+              <motion.button
                 key={item.id}
                 onClick={() => onSelectTab(item.id)}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-left transition-all text-sm font-medium ${
+                whileHover={{ x: 2 }}
+                whileTap={{ scale: 0.98 }}
+                className={`relative w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-left text-sm font-medium transition-colors ${
                   isActive
-                    ? 'bg-[#EAF3FC] text-[#2457A7] shadow-xs'
-                    : 'text-[#53657A] hover:text-[#172B42] hover:bg-slate-100/80'
+                    ? 'text-[#2457A7]'
+                    : 'text-[#53657A] hover:text-[#172B42] hover:bg-slate-100/60'
                 }`}
               >
-                <div className="flex items-center gap-2.5">
+                {/* Framer Motion Active Tab Indicator */}
+                {isActive && (
+                  <motion.div
+                    layoutId="sidebarActivePill"
+                    className="absolute inset-0 bg-[#EAF3FC] border border-[#2457A7]/15 rounded-xl shadow-xs"
+                    transition={{ type: 'spring', stiffness: 450, damping: 32 }}
+                  />
+                )}
+
+                <div className="relative z-10 flex items-center gap-2.5">
                   <Icon
                     size={17}
                     className={isActive ? 'text-[#2457A7]' : 'text-[#53657A]'}
                   />
                   <div>
-                    <span className="block leading-tight">{item.label}</span>
+                    <span className="block leading-tight font-medium">{item.label}</span>
                     <span className="text-[10px] text-[#53657A]/80 font-normal">
                       {item.subtitle}
                     </span>
@@ -133,15 +155,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 </div>
 
                 {item.badge !== null && (
-                  <span
-                    className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                  <motion.span
+                    initial={{ scale: 0.8 }}
+                    animate={{ scale: 1 }}
+                    className={`relative z-10 text-[10px] font-semibold px-2 py-0.5 rounded-full ${
                       item.badgeClass || (isActive ? 'bg-[#2457A7] text-white' : 'bg-slate-200 text-[#172B42]')
                     }`}
                   >
                     {item.badge}
-                  </span>
+                  </motion.span>
                 )}
-              </button>
+              </motion.button>
             );
           })}
         </nav>

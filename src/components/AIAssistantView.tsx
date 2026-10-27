@@ -162,6 +162,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         timeConstraintType: plan.timeConstraintType,
         requestedStartAt: plan.requestedStartAt,
         requestedEndAt: plan.requestedEndAt,
+        targetDays: plan.targetDays,
+        targetOccurrences: plan.targetOccurrences,
         preferredWindow: plan.preferredWindow,
         timezone: plan.timezone || userTimezone,
         createdAt: new Date().toISOString(),
@@ -386,7 +388,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                   <Calendar size={12} /> Target / Waktu
                 </span>
                 <span className="text-xs font-bold text-[#172B42]">
-                  {proposedPlan.requestedStartAt
+                  {proposedPlan.targetOccurrences && proposedPlan.targetOccurrences.length > 1
+                    ? proposedPlan.targetOccurrences.map((o) => o.dayName).join(' & ')
+                    : proposedPlan.requestedStartAt
                     ? (() => {
                         const startD = new Date(proposedPlan.requestedStartAt);
                         const startStr = formatInUserTimezone(startD, userTimezone, {
