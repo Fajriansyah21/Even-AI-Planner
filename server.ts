@@ -3,7 +3,11 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
-import { parseIndonesianTemporalRules, ParseContext } from './src/lib/temporalParser';
+import {
+  parseIndonesianTemporalRules,
+  extractCleanActivityTitle,
+  ParseContext,
+} from './src/lib/temporalParser';
 import {
   classifyGeminiError,
   executeWithRetryAndTimeout,
@@ -114,7 +118,10 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
 5. Sediakan 'reasoning' singkat dalam Bahasa Indonesia yang transparan.
 6. JADWAL MULTI-HARI & PERULANGAN:
    - Jika pengguna menyebutkan beberapa hari (contoh: 'kelas pada Senin dan Selasa malam', 'Senin dan Rabu jam 19.00 - 21.00'), JANGAN PERNAH mengubahnya menjadi satu tugas berdurasi panjang 24 jam lebih!
-   - Pisahkan menjadi daftar kejadian terpisah di 'targetOccurrences' dengan waktu mulai dan selesai per masing-masing hari.`;
+   - Pisahkan menjadi daftar kejadian terpisah di 'targetOccurrences' dengan waktu mulai dan selesai per masing-masing hari.
+7. PEMBUATAN JUDUL TUGAS (title):
+   - Buat judul ringkas dan fokus pada inti kegiatan/subjek (contoh: 'UTS Web Programming', 'Melanjutkan Desain', 'Persiapan UTS Design', 'Rapat Koordinasi Tim').
+   - JANGAN MENYALIN mentah-mentah seluruh prompt pengguna sebagai judul!`;
 
       const retryResult = await executeWithRetryAndTimeout(
         async (attempt, remainingMs) => {
@@ -302,6 +309,15 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       if (baselinePlan.deadlineAt) {
         sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
         sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
+      }
+
+      // 6. Title and Description Sanitization:
+      // Pastikan judul ringkas dan tidak pernah menyalin mentah seluruh prompt
+      sanitizedPlan.title = extractCleanActivityTitle(trimmedPrompt, rawPlan.title || baselinePlan.title);
+      if (!sanitizedPlan.description || sanitizedPlan.description.trim() === '') {
+        sanitizedPlan.description = `Catatan asli: "${trimmedPrompt}"`;
+      } else if (!sanitizedPlan.description.includes(trimmedPrompt)) {
+        sanitizedPlan.description = `${sanitizedPlan.description}\nCatatan asli: "${trimmedPrompt}"`;
       }
 
       const elapsedMs = Date.now() - startTime;

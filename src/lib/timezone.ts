@@ -160,3 +160,24 @@ export function formatDateOnlyInTimezone(date: Date, timeZone: string = 'Asia/Ja
   return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
 }
 
+/**
+ * Menambahkan atau mengurangkan hari secara aman pada zona waktu kalender lokal pengguna
+ * tanpa pergeseran akibat DST atau pembulatan naive milidetik (+86400000ms).
+ */
+export function addDaysInTimezone(
+  date: Date,
+  days: number,
+  timeZone: string = 'Asia/Jakarta'
+): Date {
+  const cleanTz = parseTimezoneString(timeZone);
+  const parts = getPartsInTimezone(date, cleanTz);
+  // Gunakan Date.UTC pada komponen tahun, bulan, hari untuk pergeseran kalender murni
+  const utcCalc = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days, parts.hour, parts.minute, parts.second));
+  const newYear = utcCalc.getUTCFullYear();
+  const newMonth = utcCalc.getUTCMonth() + 1;
+  const newDay = utcCalc.getUTCDate();
+  const iso = createIsoInTimezone(newYear, newMonth, newDay, parts.hour, parts.minute, parts.second, cleanTz);
+  return new Date(iso);
+}
+
+

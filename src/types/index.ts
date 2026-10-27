@@ -131,6 +131,17 @@ export interface UserPreferences {
   allowAutoSplit: boolean;
 }
 
+export interface DateEvaluationDiagnostic {
+  dateStr: string;          // YYYY-MM-DD
+  dayName: string;          // e.g. 'Kamis, 22 Okt'
+  windowStart: string;      // HH:mm (e.g. '09:00')
+  windowEnd: string;        // HH:mm (e.g. '18:00')
+  totalFreeMinutes: number;
+  maxContiguousFreeMinutes?: number;
+  conflicts: string[];      // List of conflicting agenda names & times
+  rejectionReason?: string; // Why this date could not fit the task
+}
+
 export interface ScheduleCalculationResult {
   success: boolean;
   taskId: string;
@@ -162,6 +173,7 @@ export interface ScheduleCalculationResult {
     freeTimeCalculatedMinutes?: number;
     searchDaysLimit?: number;
     isNightShift?: boolean;
+    evaluatedDays?: DateEvaluationDiagnostic[];
   };
 }
 

@@ -399,15 +399,32 @@ export function scheduleTaskDeterministically(
   const candidateDays: { year: number; month: number; day: number; dayOfWeek: number; dateObj: Date }[] = [];
   const searchStart = new Date(referenceDate);
 
-  for (let d = 0; d < maxSearchDays; d++) {
-    const dayObj = new Date(searchStart.getTime() + d * 86400000);
-    const parts = getPartsInTimezone(dayObj, userTz);
-    const isPreferredWindowSpecified =
-      Boolean(task.preferredWindow) || task.preferredTimeOfDay === 'EVENING' || task.preferredTimeOfDay === 'MORNING';
+  // Jika tugas memiliki target hari tunggal eksplisit (misal: "Kamis..."), targetkan hari tersebut!
+  const hasSpecificSingleTargetDay = Boolean(
+    task.targetDays && task.targetDays.length === 1 && !task.isRecurring
+  );
 
-    const activeWorkDays = preferences.workDays || [1, 2, 3, 4, 5];
-    if (activeWorkDays.includes(parts.dayOfWeek) || (isPreferredWindowSpecified && d <= 1)) {
-      candidateDays.push({ ...parts, dateObj: dayObj });
+  if (hasSpecificSingleTargetDay && task.targetDays) {
+    const targetDayIndex = task.targetDays[0];
+    const targetDateInfo = getNextValidDateForDayOfWeek(targetDayIndex, referenceDate, userTz);
+    candidateDays.push({
+      year: targetDateInfo.year,
+      month: targetDateInfo.month,
+      day: targetDateInfo.day,
+      dayOfWeek: targetDayIndex,
+      dateObj: targetDateInfo.date,
+    });
+  } else {
+    for (let d = 0; d < maxSearchDays; d++) {
+      const dayObj = addDaysInTimezone(searchStart, d, userTz);
+      const parts = getPartsInTimezone(dayObj, userTz);
+      const isPreferredWindowSpecified =
+        Boolean(task.preferredWindow) || task.preferredTimeOfDay === 'EVENING' || task.preferredTimeOfDay === 'MORNING';
+
+      const activeWorkDays = preferences.workDays || [1, 2, 3, 4, 5];
+      if (activeWorkDays.includes(parts.dayOfWeek) || (isPreferredWindowSpecified && d <= 1)) {
+        candidateDays.push({ ...parts, dateObj: dayObj });
+      }
     }
   }
 

@@ -2,6 +2,7 @@ import {
   parseTimezoneString,
   getPartsInTimezone,
   createIsoInTimezone,
+  addDaysInTimezone,
 } from './timezone';
 import { TaskOccurrence } from '../types';
 
@@ -42,6 +43,125 @@ export interface ParsedDayInfo {
   dayIndex: number; // 0 = Minggu ... 6 = Sabtu
   dayName: string;  // 'Minggu', 'Senin', dst.
   rawKeyword: string;
+}
+
+/**
+ * Normalisasi huruf kapital (Title Case) dengan mempertahankan akronim teknis.
+ */
+export function toTitleCase(str: string): string {
+  const acronyms = new Set([
+    'UTS', 'UAS', 'PR', 'UI', 'UX', 'UI/UX', 'API', 'AI', 'HTML', 'CSS', 'SQL',
+    'WIB', 'WITA', 'WIT', 'GBK', 'IT', 'QA', 'CRUD', 'MVP', 'SDK'
+  ]);
+  return str
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => {
+      const upper = word.toUpperCase();
+      if (acronyms.has(upper)) return upper;
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    })
+    .join(' ');
+}
+
+/**
+ * Membentuk judul kegiatan ringkas dan bermakna dari inti pekerjaan/subjek,
+ * bukan menyalin seluruh prompt mentah.
+ * Contoh:
+ * - "Rabu malam jam 7 sampai jam 10 malam, akan ada UTS Web Programming" -> "UTS Web Programming"
+ * - "Kamis aku mau lanjut ngerjain design kalo belum selesai, selama tiga jam" -> "Melanjutkan Desain"
+ * - "Aku ada UTS Design deadline-nya hari Jumat" -> "Persiapan UTS Design"
+ */
+export function extractCleanActivityTitle(prompt: string, aiTitle?: string): string {
+  if (aiTitle && typeof aiTitle === 'string') {
+    const trimmedAi = aiTitle.trim();
+    const promptTrimmed = prompt.trim();
+    if (
+      trimmedAi.length >= 3 &&
+      trimmedAi.length <= 60 &&
+      trimmedAi.toLowerCase() !== promptTrimmed.toLowerCase() &&
+      !/^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|bikin\s+jadwal)\b/i.test(trimmedAi)
+    ) {
+      return trimmedAi;
+    }
+  }
+
+  const raw = prompt.trim();
+
+  // Pola 1: Persiapan Ujian / Tugas dengan deadline
+  // Contoh: "Aku ada UTS Design deadline-nya hari Jumat" -> "Persiapan UTS Design"
+  const examDeadlineMatch = raw.match(
+    /\b(?:ada\s+)?(UTS|UAS|ujian|tugas|kuis|quiz)\s+([A-Za-z0-9\s/]+?)(?:\s+(?:deadline[-a-zA-Z0-9]*|tenggat|paling lambat).*|$)/i
+  );
+  if (examDeadlineMatch && /\b(deadline|tenggat|paling lambat)\b/i.test(raw)) {
+    const examType = examDeadlineMatch[1].toUpperCase();
+    let subject = examDeadlineMatch[2].trim();
+    if (subject.toLowerCase() === 'design') subject = 'Design';
+    return `Persiapan ${examType} ${toTitleCase(subject)}`;
+  }
+
+  // Pola 2: "lanjut ngerjain / mengerjakan / bikin [subjek]"
+  // Contoh: "Kamis aku mau lanjut ngerjain design kalo belum selesai, selama tiga jam" -> "Melanjutkan Desain"
+  const continueMatch = raw.match(
+    /\b(?:lanjut|melanjutkan)\s+(?:ngerjain|mengerjakan|bikin|buat|kerja(?:kan)?|belajar)?\s*([A-Za-z0-9\s/]+?)(?:\s+(?:kalo|kalau|jika|bila)\s+belum\s+selesai|\s+selama|\s+jam|\s+pukul|$)/i
+  );
+  if (continueMatch) {
+    let subject = continueMatch[1].trim();
+    if (subject.toLowerCase() === 'design' || subject.toLowerCase() === 'desain') {
+      subject = 'Desain';
+    } else {
+      subject = toTitleCase(subject);
+    }
+    return `Melanjutkan ${subject}`;
+  }
+
+  let text = raw;
+
+  // Hapus awalan perintah/keinginan percakapan
+  text = text.replace(
+    /^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|bikin)?\s*(?:jadwal\s+)?(?:aku\s+|saya\s+|kami\s+)?(?:mau\s+|ingin\s+|pengen\s+|rencananya\s+)?(?:akan\s+ada\s+|ada\s+)?/i,
+    ''
+  );
+
+  // Hapus frasa hari dan rentang hari
+  text = text.replace(
+    /\b(?:hari\s+)?(?:senin|selasa|rabu|kamis|jumat|jum'at|sabtu|minggu|ahad)(?:\s+(?:dan|sampai|hingga|-)\s+(?:senin|selasa|rabu|kamis|jumat|jum'at|sabtu|minggu|ahad))*\b/gi,
+    ''
+  );
+  text = text.replace(/\b(?:besok\s+lusa|besok|lusa|kemarin|minggu\s+depan|hari\s+ini|nanti)\b/gi, '');
+
+  // Hapus rentang waktu jam
+  text = text.replace(
+    /(?:dari\s+)?(?:jam|pukul)?\s*\d{1,2}(?:[:.]\d{2})?\s*(?:pagi|siang|sore|malam)?\s*(?:sampai|hingga|s\/d|-|–)\s*(?:jam|pukul)?\s*\d{1,2}(?:[:.]\d{2})?\s*(?:pagi|siang|sore|malam)?/gi,
+    ''
+  );
+  text = text.replace(/(?:pada\s+)?(?:jam|pukul)\s*\d{1,2}(?:[:.]\d{2})?\s*(?:pagi|siang|sore|malam)?/gi, '');
+  text = text.replace(/\b(?:malam\s+ini|pagi\s+ini|siang\s+ini|sore\s+ini)\b/gi, '');
+  text = text.replace(/\b(?:malam|pagi|siang|sore)\b/gi, '');
+
+  // Hapus durasi waktu
+  text = text.replace(
+    /\b(?:selama\s+)?(?:\d+|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|setengah)\s*(?:setengah)?\s*(?:jam|menit|mnt)\b/gi,
+    ''
+  );
+
+  // Hapus frasa deadline
+  text = text.replace(/\b(?:deadline[-a-zA-Z0-9]*|tenggat\s+waktu|paling\s+lambat)\s*(?:hari\s+\w+|\w+)?\b/gi, '');
+
+  // Hapus kondisi pelengkap
+  text = text.replace(/\b(?:kalo|kalau|jika|bila)\s+belum\s+selesai\b/gi, '');
+
+  // Hapus kata penghubung sisa
+  text = text.replace(/\b(?:akan\s+ada|ada|mau|selama)\b/gi, '');
+
+  // Bersihkan tanda baca dan spasi berlebih
+  text = text.replace(/[,;:.–—-]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+  if (!text || text.length < 2) {
+    return 'Kegiatan Terjadwal';
+  }
+
+  return toTitleCase(text);
 }
 
 /**
@@ -91,7 +211,7 @@ export function getNextValidDateForDayOfWeek(
     dayOffset += options.weekOffset * 7;
   }
 
-  const targetDateObj = new Date(referenceDate.getTime() + dayOffset * 86400000);
+  const targetDateObj = addDaysInTimezone(referenceDate, dayOffset, tz);
   const targetParts = getPartsInTimezone(targetDateObj, tz);
   const dateStr = `${targetParts.year}-${String(targetParts.month).padStart(2, '0')}-${String(targetParts.day).padStart(2, '0')}`;
 
@@ -208,7 +328,7 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   }
 
   // Calculate target date parts in the given timezone
-  const targetDateObj = new Date(baseDate.getTime() + dayOffset * 86400000);
+  const targetDateObj = addDaysInTimezone(baseDate, dayOffset, tz);
   const targetParts = getPartsInTimezone(targetDateObj, tz);
 
   // 2. Identify fixed commitment keywords vs flexible tasks:
@@ -519,10 +639,7 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   const minSession = 30;
 
   // 11. Title generation:
-  let title = ctx.userPrompt.trim();
-  if (title.length > 50) {
-    title = title.slice(0, 47) + '...';
-  }
+  const title = extractCleanActivityTitle(ctx.userPrompt);
 
   // 12. Explanation in Indonesian:
   let reasoning = '';
