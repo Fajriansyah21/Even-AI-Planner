@@ -8,6 +8,7 @@ import { runActivityHistoryAndStatusTests } from './activity-history-and-status.
 import { runSchedulingBugsTests } from './scheduling-bugs-audit-and-fix.test';
 import { runSchedulingReliabilityPatchTests } from './scheduling-reliability-patch.test';
 import { runCriticalBugsValidationTests } from './critical-bugs-validation.test';
+import { runMarkMissedCompletedTests } from './mark-missed-completed.test';
 
 async function main() {
   console.log('================================================================');

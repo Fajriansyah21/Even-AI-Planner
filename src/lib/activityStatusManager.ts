@@ -252,6 +252,54 @@ export function dismissMissedTask(task: Task, now: Date = new Date()): Task {
 }
 
 /**
+ * Menandai kegiatan yang sebelumnya berstatus `missed_auto` menjadi `completed_manual`
+ * karena pengguna mengonfirmasi bahwa kegiatan tersebut sebenarnya sudah diselesaikan.
+ *
+ * Menjamin:
+ * 1. Idempotensi: Hanya menerima tugas dengan status `missed_auto`.
+ * 2. Mempertahankan nilai `missedAt` asli sebagai bukti historis bahwa sistem pernah menandainya terlewat.
+ * 3. Mengisi `completedAt` dengan waktu konfirmasi penyelesaian.
+ * 4. Memperbarui status sesi jadwal menjadi `completed_manual` tanpa menghapus relasi Google Calendar atau ID acara.
+ * 5. Menambahkan catatan statusHistory yang mencatat transisi eksplisit ini dengan alasan yang jelas.
+ */
+export function markMissedTaskAsCompleted(
+  task: Task,
+  now: Date = new Date(),
+  reason: string = 'Pengguna mengonfirmasi bahwa kegiatan telah selesai.'
+): Task {
+  // Hanya menerima tugas dengan status missed_auto. Idempoten jika tugas bukan missed_auto.
+  if (task.status !== 'missed_auto') {
+    return task;
+  }
+
+  const nowIso = now.toISOString();
+
+  // Pertahankan sesi yang ada beserta ID acara Google Calendar, perbarui status sesi
+  const updatedSessions = task.scheduledSessions?.map((s) => ({
+    ...s,
+    status: 'completed_manual' as const,
+    completedAt: s.completedAt || nowIso,
+  }));
+
+  return {
+    ...task,
+    status: 'completed_manual',
+    completedAt: nowIso,
+    missedAt: task.missedAt, // Pertahankan missedAt asli
+    rescheduleDecision: 'dismissed', // Tidak memerlukan penjadwalan ulang lagi
+    scheduledSessions: updatedSessions,
+    statusHistory: [
+      ...(task.statusHistory || []),
+      {
+        status: 'completed_manual',
+        changedAt: nowIso,
+        reason,
+      },
+    ],
+  };
+}
+
+/**
  * Menyiapkan kegiatan baru hasil penjadwalan ulang dari kegiatan `missed_auto`,
  * serta menautkan referensi ID kedua kegiatan secara persisten.
  */

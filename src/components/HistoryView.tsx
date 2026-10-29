@@ -40,6 +40,7 @@ interface HistoryViewProps {
   onOpenReschedule: (task: Task) => void;
   onDismissTask: (taskId: string) => void;
   onRefreshAudit: () => void;
+  onMarkMissedTaskCompleted?: (taskId: string) => Promise<void> | void;
 }
 
 export const HistoryView: React.FC<HistoryViewProps> = ({
@@ -48,11 +49,13 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
   onOpenReschedule,
   onDismissTask,
   onRefreshAudit,
+  onMarkMissedTaskCompleted,
 }) => {
   const [filterType, setFilterType] = useState<'ALL' | 'COMPLETED_MANUAL' | 'MISSED_AUTO' | 'PENDING_ACTION'>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortOrder, setSortOrder] = useState<'NEWEST' | 'OLDEST'>('NEWEST');
   const [selectedTaskDetail, setSelectedTaskDetail] = useState<Task | null>(null);
+  const [completingTaskId, setCompletingTaskId] = useState<string | null>(null);
 
   const tz = preferences.timezone || 'Asia/Jakarta';
 
@@ -684,7 +687,25 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                           <span>Penjadwalan ulang diabaikan</span>
                         </div>
                       ) : (
-                        <div className="flex items-center gap-2 w-full sm:w-auto">
+                        <div className="flex items-center gap-2 w-full sm:w-auto flex-wrap">
+                          {onMarkMissedTaskCompleted && (
+                            <button
+                              type="button"
+                              disabled={completingTaskId === item.id}
+                              onClick={async () => {
+                                setCompletingTaskId(item.id);
+                                try {
+                                  await onMarkMissedTaskCompleted(item.id);
+                                } finally {
+                                  setCompletingTaskId(null);
+                                }
+                              }}
+                              className="flex-1 sm:flex-initial flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#16856B] hover:bg-[#126B56] disabled:opacity-50 text-white text-xs font-semibold rounded-xl shadow-2xs transition-colors"
+                            >
+                              <CheckCircle2 size={13} className={completingTaskId === item.id ? 'animate-spin' : ''} />
+                              <span>{completingTaskId === item.id ? 'Menyimpan...' : 'Telah Diselesaikan'}</span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => onOpenReschedule(item)}
@@ -805,21 +826,44 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
               )}
             </div>
 
-            <div className="pt-3 border-t border-[#D9E3EF] flex items-center justify-between">
+            <div className="pt-3 border-t border-[#D9E3EF] flex flex-wrap items-center justify-between gap-2">
               {selectedTaskDetail.status === 'missed_auto' &&
                 !selectedTaskDetail.rescheduledToTaskId &&
                 selectedTaskDetail.rescheduleDecision !== 'dismissed' && (
-                  <button
-                    onClick={() => {
-                      const taskToReschedule = selectedTaskDetail;
-                      setSelectedTaskDetail(null);
-                      onOpenReschedule(taskToReschedule);
-                    }}
-                    className="flex items-center gap-1.5 px-3.5 py-2 bg-[#2457A7] text-white text-xs font-semibold rounded-xl hover:bg-[#1E4889]"
-                  >
-                    <RotateCw size={13} />
-                    <span>Jadwalkan Ulang Kegiatan Ini</span>
-                  </button>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {onMarkMissedTaskCompleted && (
+                      <button
+                        type="button"
+                        disabled={completingTaskId === selectedTaskDetail.id}
+                        onClick={async () => {
+                          const taskId = selectedTaskDetail.id;
+                          setCompletingTaskId(taskId);
+                          try {
+                            await onMarkMissedTaskCompleted(taskId);
+                            setSelectedTaskDetail(null);
+                          } finally {
+                            setCompletingTaskId(null);
+                          }
+                        }}
+                        className="flex items-center gap-1.5 px-3.5 py-2 bg-[#16856B] hover:bg-[#126B56] disabled:opacity-50 text-white text-xs font-semibold rounded-xl shadow-2xs transition-colors"
+                      >
+                        <CheckCircle2 size={13} className={completingTaskId === selectedTaskDetail.id ? 'animate-spin' : ''} />
+                        <span>{completingTaskId === selectedTaskDetail.id ? 'Menyimpan...' : 'Telah Diselesaikan'}</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const taskToReschedule = selectedTaskDetail;
+                        setSelectedTaskDetail(null);
+                        onOpenReschedule(taskToReschedule);
+                      }}
+                      className="flex items-center gap-1.5 px-3.5 py-2 bg-[#2457A7] text-white text-xs font-semibold rounded-xl hover:bg-[#1E4889] transition-colors"
+                    >
+                      <RotateCw size={13} />
+                      <span>Jadwalkan Ulang Kegiatan Ini</span>
+                    </button>
+                  </div>
                 )}
 
               <button

@@ -20,6 +20,7 @@ import {
   completeTaskManually,
   dismissMissedTask,
   prepareRescheduledTask,
+  markMissedTaskAsCompleted,
 } from './lib/activityStatusManager';
 import {
   Task,
@@ -600,6 +601,32 @@ export default function App() {
     }
 
     showToast(`Kegiatan "${targetTask.title}" diabaikan dan disimpan di Riwayat.`, 'info');
+  };
+
+  const handleMarkMissedTaskCompleted = async (taskId: string) => {
+    const targetTask = tasks.find((t) => t.id === taskId);
+    if (!targetTask || targetTask.status !== 'missed_auto') {
+      return;
+    }
+
+    const updatedTask = markMissedTaskAsCompleted(targetTask);
+    const updatedWithUser: Task = {
+      ...updatedTask,
+      userId: userId || targetTask.userId || 'user-default',
+    };
+
+    if (userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'tasks', taskId), sanitizeForFirestore(updatedWithUser));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
+        showToast('Gagal menyimpan status kegiatan ke database.', 'error');
+        return;
+      }
+    }
+
+    setTasks((prev) => prev.map((t) => (t.id === taskId ? updatedWithUser : t)));
+    showToast(`Kegiatan "${targetTask.title}" berhasil ditandai telah selesai!`, 'success');
   };
 
   const handleConfirmReschedule = async (
@@ -1360,6 +1387,7 @@ export default function App() {
                   preferences={preferences}
                   onOpenReschedule={(task) => setRescheduleTaskTarget(task)}
                   onDismissTask={handleDismissMissedTask}
+                  onMarkMissedTaskCompleted={handleMarkMissedTaskCompleted}
                   onRefreshAudit={() => {
                     const { updatedTasks, transitionedCount } = auditAndTransitionOverdueTasks(tasks);
                     if (transitionedCount > 0) {
