@@ -5,6 +5,7 @@ import {
 } from '../src/lib/activityStatusManager';
 import { Task } from '../src/types';
 
+if (process.env.VITEST) {
 describe('Tandai Kegiatan Terlewat sebagai Selesai (markMissedTaskAsCompleted)', () => {
   const baseMissedTask: Task = {
     id: 'task-missed-1',
@@ -146,6 +147,7 @@ describe('Tandai Kegiatan Terlewat sebagai Selesai (markMissedTaskAsCompleted)',
     expect(missedAfter).toBe(0);
   });
 });
+}
 
 export function runMarkMissedCompletedTests() {
   console.log('=== RUNNING MARK MISSED TASK AS COMPLETED TESTS ===');

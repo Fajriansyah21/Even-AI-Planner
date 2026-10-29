@@ -9,6 +9,7 @@ import { runSchedulingBugsTests } from './scheduling-bugs-audit-and-fix.test';
 import { runSchedulingReliabilityPatchTests } from './scheduling-reliability-patch.test';
 import { runCriticalBugsValidationTests } from './critical-bugs-validation.test';
 import { runMarkMissedCompletedTests } from './mark-missed-completed.test';
+import { runAllAiSchedulerRegressionTests } from './ai-reasoning-and-scheduler-regression.test';
 
 async function main() {
   console.log('================================================================');
@@ -53,10 +54,18 @@ async function main() {
     await runSchedulingReliabilityPatchTests();
 
     // 10. Critical Bugs & Regression Validation Suite
-    console.log('\n>>> [10/10] Critical Bugs & Regression Validation Suite...');
+    console.log('\n>>> [10/12] Critical Bugs & Regression Validation Suite...');
     runCriticalBugsValidationTests();
 
-    // 10. Real Google Calendar Integration (Opt-in Check)
+    // 11. Mark Missed Activity as Completed Suite
+    console.log('\n>>> [11/12] Mark Missed Task as Completed Suite...');
+    runMarkMissedCompletedTests();
+
+    // 12. Full AI Reasoning & Deterministic Scheduler Regression Suite
+    console.log('\n>>> [12/12] Full AI Reasoning & Scheduler Regression Suite...');
+    runAllAiSchedulerRegressionTests();
+
+    // Real Google Calendar Integration (Opt-in Check)
     console.log('\n>>> [Opsi] Pengujian Integrasi Google Calendar Nyata...');
     await runRealGoogleCalendarIntegrationTest();
 
