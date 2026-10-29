@@ -241,15 +241,43 @@ export function getNextValidDateForDayOfWeek(
 export function parseIndonesianDayNames(prompt: string): {
   days: ParsedDayInfo[];
   isRecurring: boolean;
+  deadlineDay?: ParsedDayInfo;
 } {
   const p = prompt.toLowerCase();
   const days: ParsedDayInfo[] = [];
 
   const isRecurring = /\b(setiap|tiap|rutin|berulang|mingguan|per minggu|tiap-tiap|selalu)\b/i.test(prompt);
 
+  // 1. Detect explicit deadline day clause first to avoid treating the deadline day as a work day!
+  // e.g. "deadline-nya hari jumat", "deadline hari jumat", "tenggat hari jumat", "sebelum hari jumat", "paling lambat jumat"
+  const deadlineClauseRegex = /(?:deadline(?:-nya)?|tenggat(?:\s+waktu)?|paling\s+lambat|sebelum|due(?:\s+date)?)\s*(?:hari\s+)?(senin|selasa|rabu|kamis|jumat|jum'at|sabtu|ahad|minggu)/i;
+  const deadlineMatch = p.match(deadlineClauseRegex);
+  let deadlineDay: ParsedDayInfo | undefined = undefined;
+  let promptForWorkDays = p;
+
+  if (deadlineMatch) {
+    const rawWord = deadlineMatch[1].toLowerCase();
+    const entry = INDONESIAN_WEEKDAYS.find((w) => w.name === rawWord);
+    if (entry) {
+      deadlineDay = {
+        dayIndex: entry.dayIndex,
+        dayName: DAY_NAMES_ID[entry.dayIndex],
+        rawKeyword: rawWord,
+      };
+    } else if (rawWord === 'minggu') {
+      deadlineDay = {
+        dayIndex: 0,
+        dayName: 'Minggu',
+        rawKeyword: 'minggu',
+      };
+    }
+    // Remove the deadline clause so the deadline day is not added to target work days
+    promptForWorkDays = p.replace(deadlineMatch[0], ' ');
+  }
+
   const weekdayRegex = /\b(senin|selasa|rabu|kamis|jumat|jum'at|sabtu|ahad)\b/gi;
   let match;
-  while ((match = weekdayRegex.exec(p)) !== null) {
+  while ((match = weekdayRegex.exec(promptForWorkDays)) !== null) {
     const word = match[1].toLowerCase();
     const entry = INDONESIAN_WEEKDAYS.find((w) => w.name === word);
     if (entry && !days.some((d) => d.dayIndex === entry.dayIndex)) {
@@ -261,9 +289,9 @@ export function parseIndonesianDayNames(prompt: string): {
     }
   }
 
-  // Check for Sunday ("minggu")
+  // Check for Sunday ("minggu") in work days
   const sundayRegex = /\b(?:hari\s+minggu|minggu\s+(?:pagi|siang|sore|malam|jam|pukul|\d)|(?:dan|sampai|hingga|-)\s+minggu)\b|\bminggu\b(?!\s+depan)/gi;
-  if (sundayRegex.test(p)) {
+  if (sundayRegex.test(promptForWorkDays)) {
     if (!days.some((d) => d.dayIndex === 0)) {
       days.push({
         dayIndex: 0,
@@ -273,7 +301,7 @@ export function parseIndonesianDayNames(prompt: string): {
     }
   }
 
-  return { days, isRecurring };
+  return { days, isRecurring, deadlineDay };
 }
 
 /**
@@ -288,8 +316,17 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   const baseDate = ctx.currentDateTime ? new Date(ctx.currentDateTime) : new Date();
   const baseParts = getPartsInTimezone(baseDate, tz);
 
-  // 1. Detect explicit Indonesian weekdays & recurring intent:
-  const { days: detectedWeekdays, isRecurring: promptIsRecurring } = parseIndonesianDayNames(prompt);
+  // 1. Detect explicit Indonesian weekdays & recurring intent & deadline day:
+  const { days: detectedWeekdays, isRecurring: promptIsRecurring, deadlineDay: detectedDeadlineDay } = parseIndonesianDayNames(prompt);
+
+  // If multiple work days detected (e.g. "Kamis dan Selasa"), sort them chronologically from baseDate
+  if (detectedWeekdays.length > 1) {
+    detectedWeekdays.sort((a, b) => {
+      const offsetA = (a.dayIndex - baseParts.dayOfWeek + 7) % 7;
+      const offsetB = (b.dayIndex - baseParts.dayOfWeek + 7) % 7;
+      return offsetA - offsetB;
+    });
+  }
 
   let hasExplicitDayTarget = false;
   let dayOffset = 0;
@@ -434,14 +471,40 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
 
   // 5. Determine Duration:
   let duration = 60;
-  const durMatch = prompt.match(/(\d+)\s*(?:menit|mnt|jam)/i);
+  const wordToNum: Record<string, number> = {
+    se: 1,
+    satu: 1,
+    dua: 2,
+    tiga: 3,
+    empat: 4,
+    lima: 5,
+    enam: 6,
+    tujuh: 7,
+    delapan: 8,
+  };
+  const durMatch = prompt.match(/(\d+)\s*(menit|mnt|jam)/i);
+  const wordDurMatch = prompt.match(/(?:selama\s+)?(se|satu|dua|tiga|empat|lima|enam|tujuh|delapan)\s*jam/i);
+  const wordMinMatch = prompt.match(/(?:selama\s+)?(tiga puluh|empat puluh lima)\s*(?:menit|mnt)/i);
+
   if (durMatch) {
     const val = parseInt(durMatch[1], 10);
-    if (prompt.includes(`${val} jam`)) {
+    const unit = durMatch[2].toLowerCase();
+    if (unit === 'jam') {
       duration = val * 60;
     } else {
       duration = val;
     }
+  } else if (wordDurMatch) {
+    const word = wordDurMatch[1].toLowerCase();
+    const multiplier = wordToNum[word] || 1;
+    duration = multiplier * 60;
+  } else if (wordMinMatch) {
+    if (wordMinMatch[1].includes('tiga puluh')) duration = 30;
+    else if (wordMinMatch[1].includes('empat puluh lima')) duration = 45;
+  } else if (prompt.includes('sejam') || prompt.includes('1 jam')) {
+    duration = 60;
+  } else if (prompt.includes('setengah jam')) {
+    duration = 30;
   } else if (fixedStartHour !== null && fixedEndHour !== null) {
     let startTotal = fixedStartHour * 60 + fixedStartMin;
     let endTotal = fixedEndHour * 60 + fixedEndMin;
@@ -482,7 +545,10 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   let preferredTimeOfDay: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY' = 'ANY';
 
   // Check if task is explicitly flexible learning/work vs fixed commitment
-  const isFlexibleLearningOrTask = /\b(belajar|kerja|mengerjakan|tugas|baca|membaca|fokus|cicil)\b/i.test(prompt);
+  const isFlexibleLearningOrTask = /\b(belajar|kerja|mengerjakan|ngerjain|tugas|baca|membaca|fokus|cicil|desain|design|ngoding|coding|nulis|menulis|bikin|membuat|lanjut)\b/i.test(prompt);
+
+  // Prayer time anchors (Magrib, Isya, Subuh, Dzuhur, Ashar)
+  const isAfterMagrib = /\b(habis\s+magrib|setelah\s+magrib|sehabis\s+magrib|ba'?da\s+magrib|magrib|habis\s+isya|setelah\s+isya|isya)\b/i.test(prompt);
 
   // Exact fixed event cases:
   // - Explicit range (e.g. "20.00 sampai 21.00", "jam 7 sampai 10 malam")
@@ -575,6 +641,19 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
       0,
       tz
     );
+  } else if (isAfterMagrib) {
+    // Habis magrib / isya evening task
+    timeConstraintType = 'preferred_window';
+    preferredWindow = {
+      startHour: 18,
+      startMinute: 30,
+      endHour: 23,
+      endMinute: 0,
+      label: 'Habis Magrib / Malam (18:30 - 23:00)',
+    };
+    preferredTimeOfDay = 'EVENING';
+    requestedStartAt = undefined;
+    requestedEndAt = undefined;
   } else if (prompt.includes('malam')) {
     // Flexible evening task: e.g. "tidur malam", "belajar malam", "olahraga malam"
     // CRITICAL: requestedStartAt and requestedEndAt MUST BE UNDEFINED!
@@ -605,8 +684,26 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
 
   // 8. Deadline calculation:
   let deadlineIso: string;
-  if (timeConstraintType === 'fixed_event' && requestedEndAt) {
+  let deadlineDaysFromNow: number;
+  if (detectedDeadlineDay) {
+    const nextDeadlineDate = getNextValidDateForDayOfWeek(detectedDeadlineDay.dayIndex, baseDate, tz, {
+      targetHour: 23,
+      targetMinute: 59,
+      forceNextWeek: prompt.includes('depan'),
+    });
+    deadlineDaysFromNow = Math.max(1, nextDeadlineDate.dayOffset);
+    deadlineIso = createIsoInTimezone(
+      nextDeadlineDate.year,
+      nextDeadlineDate.month,
+      nextDeadlineDate.day,
+      23,
+      59,
+      0,
+      tz
+    );
+  } else if (timeConstraintType === 'fixed_event' && requestedEndAt) {
     deadlineIso = requestedEndAt;
+    deadlineDaysFromNow = Math.max(1, dayOffset);
   } else {
     // Target deadline at 23:00 for evening or 18:00 for standard daytime
     const deadlineHour = preferredTimeOfDay === 'EVENING' ? 23 : 18;
@@ -619,6 +716,7 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
       0,
       tz
     );
+    deadlineDaysFromNow = Math.max(1, dayOffset);
   }
 
   // 9. Priority detection:
@@ -649,10 +747,12 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     } else {
       reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, '0') : '00'}:${String(fixedStartMin).padStart(2, '0')} - ${fixedEndHour ? String(fixedEndHour).padStart(2, '0') : '00'}:${String(fixedEndMin).padStart(2, '0')}) sehingga dijaga tanpa digeser.`;
     }
+  } else if (detectedWeekdays.length > 1) {
+    reasoning = `Dua sesi pengerjaan dijadwalkan masing-masing berdurasi ${duration} menit (${Math.round(duration / 60)} jam) pada ${detectedWeekdays.map((d) => d.dayName).join(' dan ')}${preferredWindow ? ` (${preferredWindow.label})` : ''}${detectedDeadlineDay ? `, sebelum batas tenggat waktu hari ${detectedDeadlineDay.dayName}` : ''}. Jika maksud Anda adalah total ${duration} menit dibagi rata untuk kedua hari tersebut, Anda dapat mengaktifkan opsi pembagian sesi.`;
   } else if (preferredWindow) {
     reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu ${preferredTimeOfDay === 'EVENING' ? 'santai atau fokus malam' : preferredTimeOfDay.toLowerCase()} Anda.`;
   } else {
-    reasoning = `AI menetapkan estimasi durasi ${duration} menit dengan tenggat waktu ${dayOffset === 0 ? 'hari ini' : `${dayOffset} hari ke depan`}.`;
+    reasoning = `AI menetapkan estimasi durasi ${duration} menit dengan tenggat waktu ${deadlineDaysFromNow === 0 ? 'hari ini' : `${deadlineDaysFromNow} hari ke depan`}.`;
   }
 
   return {
@@ -671,7 +771,7 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     preferredWindow,
     preferredTimeOfDay,
     deadlineAt: deadlineIso,
-    deadlineDaysFromNow: Math.max(1, dayOffset),
+    deadlineDaysFromNow,
     timezone: tz,
     priority,
     allowSplit,
@@ -679,3 +779,5 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     reasoning,
   };
 }
+
+export { addDaysInTimezone };

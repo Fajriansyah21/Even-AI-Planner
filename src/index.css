@@ -1,6 +1,8 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=Lora:ital,wght@0,400..700;1,400..700&family=Playfair+Display:ital,wght@0,400..900;1,400..900&display=swap');
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --font-sans: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   --font-serif: 'Lora', Georgia, 'Times New Roman', serif;
@@ -20,6 +22,19 @@
     --color-secondary-text: #53657A;
     --color-warning: #B86B12;
     --color-error: #C43D4B;
+  }
+
+  :root.dark, .dark {
+    --color-ocean-blue: #3B82F6;
+    --color-sky-blue: #60A5FA;
+    --color-pale-sky: #1E293B;
+    --color-cloud-white: #0B1120;
+    --color-deep-ink: #F1F5F9;
+    --color-sea-green: #10B981;
+    --color-border: #334155;
+    --color-secondary-text: #94A3B8;
+    --color-warning: #F59E0B;
+    --color-error: #EF4444;
   }
 
   html, body {

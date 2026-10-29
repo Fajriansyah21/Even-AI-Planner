@@ -1,4 +1,16 @@
 import React, { useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  DndContext,
+  DragOverlay,
+  useDraggable,
+  useDroppable,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  DragStartEvent,
+  DragEndEvent,
+} from '@dnd-kit/core';
 import {
   ChevronLeft,
   ChevronRight,
@@ -15,8 +27,11 @@ import {
   Layers,
   AlertTriangle,
   ArrowRight,
+  GripVertical,
+  PanelRightClose,
+  PanelRightOpen,
 } from 'lucide-react';
-import { CalendarEvent, Priority, Task, TaskScheduleSession, UserPreferences } from '../types';
+import type { CalendarEvent, Priority, Task, TaskScheduleSession, UserPreferences } from '../types';
 import {
   normalizeTimezone,
   startOfDayInTimezone,
@@ -45,6 +60,7 @@ interface CalendarViewProps {
   onOpenTaskModal: () => void;
   onSelectSlotToSchedule?: (slotDate: Date, hour: number) => void;
   onOpenAIAssistant: () => void;
+  onScheduleTaskToSlot?: (taskId: string, startIso: string, endIso: string) => void | Promise<void>;
 }
 
 interface SlicedCalendarItem {
@@ -133,6 +149,259 @@ export function calculateVerticalPosition(
   };
 }
 
+export interface HourDensityInfo {
+  occupiedMinutes: number;
+  availableMinutes: number;
+  densityPercentage: number;
+  status: 'empty' | 'low' | 'medium' | 'full';
+}
+
+/**
+ * Menghitung kepadatan waktu terisi pada slot jam (0-60 menit)
+ * untuk memberi visual feedback instan ketersediaan slot.
+ */
+export function calculateHourDensity(
+  dayDate: Date,
+  hour: number,
+  slicedItems: SlicedCalendarItem[],
+  tz: string
+): HourDensityInfo {
+  const dayStart = startOfDayInTimezone(dayDate, tz);
+  const slotStartMs = dayStart.getTime() + hour * 3600000;
+  const slotEndMs = slotStartMs + 3600000;
+
+  let totalOverlapMs = 0;
+  for (const item of slicedItems) {
+    const itemStartMs = item.visibleStart.getTime();
+    const itemEndMs = item.visibleEnd.getTime();
+    const overlap = Math.max(0, Math.min(itemEndMs, slotEndMs) - Math.max(itemStartMs, slotStartMs));
+    totalOverlapMs += overlap;
+  }
+
+  const occupiedMinutes = Math.min(60, Math.round(totalOverlapMs / 60000));
+  const availableMinutes = Math.max(0, 60 - occupiedMinutes);
+  const densityPercentage = Math.round((occupiedMinutes / 60) * 100);
+
+  let status: 'empty' | 'low' | 'medium' | 'full' = 'empty';
+  if (occupiedMinutes >= 50) {
+    status = 'full';
+  } else if (occupiedMinutes >= 25) {
+    status = 'medium';
+  } else if (occupiedMinutes > 0) {
+    status = 'low';
+  }
+
+  return {
+    occupiedMinutes,
+    availableMinutes,
+    densityPercentage,
+    status,
+  };
+}
+
+interface DroppableHourSlotProps {
+  id: string;
+  date: Date;
+  hour: number;
+  isLunch?: boolean;
+  heightPx: number;
+  onSelectSlot?: () => void;
+  density?: HourDensityInfo;
+  children?: React.ReactNode;
+}
+
+function DroppableHourSlot({
+  id,
+  date,
+  hour,
+  isLunch,
+  heightPx,
+  onSelectSlot,
+  density,
+  children,
+}: DroppableHourSlotProps) {
+  const { setNodeRef, isOver } = useDroppable({
+    id,
+    data: { date, hour },
+  });
+
+  const occupied = density?.occupiedMinutes ?? 0;
+  const percentage = density?.densityPercentage ?? 0;
+  const isFull = density?.status === 'full' || occupied >= 50;
+  const isMedium = density?.status === 'medium';
+
+  const barColor = isFull
+    ? 'bg-[#C43D4B] dark:bg-rose-500' // Penuh / Padat
+    : isMedium
+    ? 'bg-[#B86B12] dark:bg-amber-500' // Sedang
+    : 'bg-[#16856B] dark:bg-emerald-500'; // Ringan / Tersedia
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`border-b border-[#D9E3EF]/70 dark:border-slate-800/80 transition-all group relative ${
+        isOver
+          ? 'bg-[#2457A7]/20 ring-2 ring-[#2457A7] ring-inset z-10'
+          : isLunch
+          ? 'bg-amber-50/30 dark:bg-amber-950/20'
+          : 'hover:bg-slate-50/50 dark:hover:bg-slate-800/30'
+      }`}
+      style={{ height: `${heightPx}px` }}
+    >
+      {/* Visual Density Progress Bar per Jam */}
+      {occupied > 0 && (
+        <div
+          className="absolute bottom-0 left-0 right-0 h-1.5 bg-slate-200/50 dark:bg-slate-700/50 overflow-hidden pointer-events-none z-5"
+          title={`Kepadatan jadwal: ${occupied}/60 menit (${percentage}%)`}
+        >
+          <div
+            className={`h-full transition-all duration-300 ${barColor}`}
+            style={{ width: `${Math.min(100, percentage)}%` }}
+          />
+        </div>
+      )}
+
+      {/* Mini hover badge showing occupied and available minutes */}
+      <div className="opacity-0 group-hover:opacity-100 transition-opacity absolute right-1.5 top-1 z-15 pointer-events-none flex items-center gap-1 bg-white/95 dark:bg-slate-800/95 border border-[#D9E3EF] dark:border-slate-700 px-1.5 py-0.5 rounded-md text-[9px] shadow-2xs backdrop-blur-xs">
+        <span
+          className={`w-1.5 h-1.5 rounded-full ${
+            occupied === 0
+              ? 'bg-slate-300 dark:bg-slate-600'
+              : isFull
+              ? 'bg-[#C43D4B]'
+              : isMedium
+              ? 'bg-[#B86B12]'
+              : 'bg-[#16856B]'
+          }`}
+        />
+        <span className="font-semibold text-[#172B42] dark:text-slate-200 font-mono">
+          {occupied > 0 ? `${occupied}/60 mnt` : 'Slot Kosong'}
+        </span>
+        <span className="text-[#53657A] dark:text-slate-400">
+          ({density?.availableMinutes ?? 60}m luang)
+        </span>
+      </div>
+
+      {isOver && (
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
+          <span className="text-[10px] font-bold text-[#2457A7] dark:text-blue-300 bg-white/95 dark:bg-slate-900/95 px-2 py-0.5 rounded-full shadow-xs border border-[#2457A7]/40">
+            Jadwalkan di {String(hour).padStart(2, '0')}:00 WIB
+          </span>
+        </div>
+      )}
+      {onSelectSlot && (
+        <button
+          onClick={onSelectSlot}
+          className="opacity-0 group-hover:opacity-100 transition-opacity absolute inset-0 flex items-center justify-center text-[#53657A] hover:text-[#2457A7] dark:hover:text-blue-400 text-[10px]"
+          title={`Jadwalkan kegiatan di slot ${String(hour).padStart(2, '0')}:00`}
+        >
+          <Plus size={12} />
+        </button>
+      )}
+      {children}
+    </div>
+  );
+}
+
+interface DroppableMonthDayCellProps {
+  id: string;
+  date: Date;
+  hour?: number;
+  onClick: () => void;
+  className?: string;
+  children: React.ReactNode;
+}
+
+function DroppableMonthDayCell({
+  id,
+  date,
+  hour = 9,
+  onClick,
+  className = '',
+  children,
+}: DroppableMonthDayCellProps) {
+  const { setNodeRef, isOver } = useDroppable({
+    id,
+    data: { date, hour },
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      onClick={onClick}
+      className={`${className} ${
+        isOver ? 'ring-2 ring-[#2457A7] ring-inset bg-[#2457A7]/15 z-10' : ''
+      }`}
+    >
+      {children}
+    </div>
+  );
+}
+
+interface DraggableTaskCardProps {
+  task: Task;
+}
+
+function DraggableTaskCard({ task }: DraggableTaskCardProps) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `task-drag-${task.id}`,
+    data: { task },
+  });
+
+  const priorityColor =
+    task.priority === 'HIGH' || task.priority === 'URGENT'
+      ? 'bg-red-50 text-red-700 border-red-200'
+      : task.priority === 'MEDIUM'
+      ? 'bg-amber-50 text-amber-700 border-amber-200'
+      : 'bg-slate-100 text-slate-600 border-slate-200';
+
+  const priorityLabel =
+    task.priority === 'HIGH' || task.priority === 'URGENT'
+      ? 'Tinggi'
+      : task.priority === 'MEDIUM'
+      ? 'Sedang'
+      : 'Rendah';
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`p-2.5 bg-white border border-[#D9E3EF] rounded-xl shadow-2xs hover:shadow-xs transition-all flex flex-col gap-1.5 cursor-grab active:cursor-grabbing select-none ${
+        isDragging ? 'opacity-30 ring-2 ring-[#2457A7]' : 'hover:border-[#2457A7]/50'
+      }`}
+      {...attributes}
+      {...listeners}
+    >
+      <div className="flex items-start justify-between gap-1.5">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <GripVertical size={13} className="text-[#53657A] shrink-0" />
+          <h4 className="text-xs font-semibold text-[#172B42] truncate" title={task.title}>
+            {task.title}
+          </h4>
+        </div>
+        <span className={`text-[9px] font-bold px-1.5 py-0.2 rounded border shrink-0 ${priorityColor}`}>
+          {priorityLabel}
+        </span>
+      </div>
+
+      <div className="flex items-center gap-2 text-[10px] text-[#53657A] pl-5">
+        <div className="flex items-center gap-1">
+          <Clock size={11} className="text-[#2457A7]" />
+          <span>{task.estimatedDurationMinutes || 60}m</span>
+        </div>
+        {task.deadlineAt && (
+          <div className="flex items-center gap-1 text-red-600 font-medium">
+            <AlertCircle size={11} />
+            <span>Tenggat</span>
+          </div>
+        )}
+        <span className="text-[10px] text-[#2457A7] font-medium ml-auto">
+          Tarik ke jam &rarr;
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export const CalendarView: React.FC<CalendarViewProps> = ({
   events,
   tasks,
@@ -141,6 +410,7 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
   onOpenTaskModal,
   onSelectSlotToSchedule,
   onOpenAIAssistant,
+  onScheduleTaskToSlot,
 }) => {
   const tz = normalizeTimezone(preferences.timezone);
   const [viewMode, setViewMode] = useState<'day' | 'week' | 'month'>('week');
@@ -148,6 +418,67 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
   const [selectedEventDetails, setSelectedEventDetails] = useState<CalendarEvent | null>(null);
   const [selectedSessionDetails, setSelectedSessionDetails] = useState<{ task: Task; session: TaskScheduleSession } | null>(null);
   const [selectedDayOverview, setSelectedDayOverview] = useState<{ date: Date; items: SlicedCalendarItem[] } | null>(null);
+  const [hoveredTooltip, setHoveredTooltip] = useState<{
+    item: SlicedCalendarItem;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  // Drag and drop state for unscheduled tasks
+  const [activeDragTask, setActiveDragTask] = useState<Task | null>(null);
+  const [isUnscheduledDrawerOpen, setIsUnscheduledDrawerOpen] = useState(false);
+
+  const unscheduledTasks = tasks.filter((t) => t.status === 'UNSCHEDULED');
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: {
+        distance: 6,
+      },
+    })
+  );
+
+  const handleDragStart = (event: DragStartEvent) => {
+    const task = event.active.data.current?.task as Task | undefined;
+    if (task) {
+      setActiveDragTask(task);
+    }
+  };
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    setActiveDragTask(null);
+    const { active, over } = event;
+    if (!over || !active) return;
+    const task = active.data.current?.task as Task | undefined;
+    const dropData = over.data.current as { date: Date; hour: number } | undefined;
+    if (!task || !dropData) return;
+
+    const targetDate = dropData.date;
+    const targetHour = dropData.hour;
+    const startParts = getZonedDateTimeParts(targetDate, tz);
+    const startIso = createIsoInTimezone(
+      startParts.year,
+      startParts.month,
+      startParts.day,
+      targetHour,
+      0,
+      0,
+      tz
+    );
+
+    const durationMinutes =
+      task.estimatedDurationMinutes && task.estimatedDurationMinutes > 0
+        ? task.estimatedDurationMinutes
+        : 60;
+
+    const startDate = new Date(startIso);
+    const endDate = new Date(startDate.getTime() + durationMinutes * 60 * 1000);
+    const endIso = endDate.toISOString();
+
+    if (onScheduleTaskToSlot) {
+      onScheduleTaskToSlot(task.id, startIso, endIso);
+    }
+  };
 
   // Real-time filter states for category and priority
   const [selectedCategories, setSelectedCategories] = useState<TaskCategory[]>(ALL_CATEGORIES);
@@ -504,35 +835,36 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-[#F8FAFC] overflow-hidden select-none">
+    <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
+      <div className="flex-1 flex flex-col h-full bg-[#F8FAFC] dark:bg-[#0B1120] overflow-hidden select-none transition-colors duration-200">
       {/* Top Toolbar */}
-      <div className="h-14 px-6 bg-white border-b border-[#D9E3EF] flex items-center justify-between shrink-0">
+      <div className="h-14 px-6 bg-white dark:bg-[#0F172A] border-b border-[#D9E3EF] dark:border-slate-800 flex items-center justify-between shrink-0 transition-colors">
         <div className="flex items-center gap-3">
           <button
             onClick={resetToToday}
-            className="px-3 py-1.5 text-xs font-semibold text-[#172B42] hover:bg-slate-100 rounded-xl border border-[#D9E3EF] transition-colors"
+            className="px-3 py-1.5 text-xs font-semibold text-[#172B42] dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl border border-[#D9E3EF] dark:border-slate-700 transition-colors"
           >
             Hari Ini
           </button>
 
-          <div className="flex items-center border border-[#D9E3EF] rounded-xl overflow-hidden bg-white">
+          <div className="flex items-center border border-[#D9E3EF] dark:border-slate-700 rounded-xl overflow-hidden bg-white dark:bg-slate-800">
             <button
               onClick={() => navigateDate('prev')}
-              className="p-1.5 hover:bg-slate-50 text-[#53657A] hover:text-[#172B42] transition-colors"
+              className="p-1.5 hover:bg-slate-50 dark:hover:bg-slate-700 text-[#53657A] dark:text-slate-400 hover:text-[#172B42] dark:hover:text-white transition-colors"
               aria-label="Sebelumnya"
             >
               <ChevronLeft size={16} />
             </button>
             <button
               onClick={() => navigateDate('next')}
-              className="p-1.5 hover:bg-slate-50 text-[#53657A] hover:text-[#172B42] transition-colors"
+              className="p-1.5 hover:bg-slate-50 dark:hover:bg-slate-700 text-[#53657A] dark:text-slate-400 hover:text-[#172B42] dark:hover:text-white transition-colors"
               aria-label="Berikutnya"
             >
               <ChevronRight size={16} />
             </button>
           </div>
 
-          <h2 className="text-sm sm:text-base font-bold text-[#172B42] font-editorial tracking-tight">
+          <h2 className="text-sm sm:text-base font-bold text-[#172B42] dark:text-slate-100 font-editorial tracking-tight">
             {formatHeaderRange()}
           </h2>
         </div>
@@ -551,14 +883,37 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
             totalItemsCount={scheduledSessions.length + events.length}
           />
 
+          {/* Unscheduled Tasks Drawer Toggle Button */}
+          <button
+            onClick={() => setIsUnscheduledDrawerOpen(!isUnscheduledDrawerOpen)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all ${
+              isUnscheduledDrawerOpen
+                ? 'bg-[#2457A7] text-white border-[#2457A7] shadow-xs'
+                : 'bg-white dark:bg-slate-800 text-[#172B42] dark:text-slate-200 border-[#D9E3EF] dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-700'
+            }`}
+            title="Buka panel antrean tugas untuk drag-and-drop ke kalender"
+          >
+            <GripVertical size={14} />
+            <span className="hidden sm:inline">Tugas Antrean</span>
+            {unscheduledTasks.length > 0 && (
+              <span
+                className={`px-1.5 py-0.2 rounded-full text-[10px] font-bold ${
+                  isUnscheduledDrawerOpen ? 'bg-white text-[#2457A7]' : 'bg-[#2457A7] text-white'
+                }`}
+              >
+                {unscheduledTasks.length}
+              </span>
+            )}
+          </button>
+
           {/* View Mode Toggle */}
-          <div className="flex items-center gap-1 p-1 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl text-xs font-medium">
+          <div className="flex items-center gap-1 p-1 bg-[#F8FAFC] dark:bg-slate-800/80 border border-[#D9E3EF] dark:border-slate-700 rounded-xl text-xs font-medium">
             <button
               onClick={() => setViewMode('day')}
               className={`px-3 py-1 rounded-lg transition-all ${
                 viewMode === 'day'
-                  ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
-                  : 'text-[#53657A] hover:text-[#172B42]'
+                  ? 'bg-white dark:bg-slate-700 text-[#2457A7] dark:text-blue-300 font-semibold shadow-2xs'
+                  : 'text-[#53657A] dark:text-slate-400 hover:text-[#172B42] dark:hover:text-white'
               }`}
             >
               Hari
@@ -567,8 +922,8 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               onClick={() => setViewMode('week')}
               className={`px-3 py-1 rounded-lg transition-all ${
                 viewMode === 'week'
-                  ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
-                  : 'text-[#53657A] hover:text-[#172B42]'
+                  ? 'bg-white dark:bg-slate-700 text-[#2457A7] dark:text-blue-300 font-semibold shadow-2xs'
+                  : 'text-[#53657A] dark:text-slate-400 hover:text-[#172B42] dark:hover:text-white'
               }`}
             >
               Minggu
@@ -577,8 +932,8 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
               onClick={() => setViewMode('month')}
               className={`px-3 py-1 rounded-lg transition-all ${
                 viewMode === 'month'
-                  ? 'bg-white text-[#2457A7] font-semibold shadow-2xs'
-                  : 'text-[#53657A] hover:text-[#172B42]'
+                  ? 'bg-white dark:bg-slate-700 text-[#2457A7] dark:text-blue-300 font-semibold shadow-2xs'
+                  : 'text-[#53657A] dark:text-slate-400 hover:text-[#172B42] dark:hover:text-white'
               }`}
             >
               Bulan
@@ -596,14 +951,15 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
         onResetFilters={handleResetFilters}
       />
 
-      {/* Main Calendar Content Area */}
-      <div className="flex-1 overflow-y-auto p-4 sm:p-6">
+      {/* Main Calendar Content Area with Collapsible Unscheduled Tasks Drawer */}
+      <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6">
         {/* Weekly View (01:00 - 24:00) */}
         {viewMode === 'week' && (
-          <div className="bg-white border border-[#D9E3EF] rounded-2xl shadow-xs overflow-hidden flex flex-col min-w-[760px]">
+          <div className="bg-white dark:bg-[#0F172A] border border-[#D9E3EF] dark:border-slate-800 rounded-2xl shadow-xs overflow-hidden flex flex-col min-w-[760px] transition-colors">
             {/* Day Header Row */}
-            <div className="grid grid-cols-[64px_repeat(7,1fr)] border-b border-[#D9E3EF] bg-[#F8FAFC] sticky top-0 z-20">
-              <div className="p-3 text-[11px] font-medium text-[#53657A] border-r border-[#D9E3EF] flex items-center justify-center">
+            <div className="grid grid-cols-[64px_repeat(7,1fr)] border-b border-[#D9E3EF] dark:border-slate-800 bg-[#F8FAFC] dark:bg-slate-900 sticky top-0 z-20">
+              <div className="p-3 text-[11px] font-medium text-[#53657A] dark:text-slate-400 border-r border-[#D9E3EF] dark:border-slate-800 flex items-center justify-center">
                 WIB
               </div>
               {weekDates.map((date, idx) => {
@@ -661,32 +1017,27 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                     key={dayIdx}
                     className="relative border-r border-[#D9E3EF] last:border-r-0 h-full"
                   >
-                    {/* Horizontal Guideline Rows */}
+                    {/* Horizontal Guideline Rows with Droppable Support & Density Bar */}
                     {gridHours.map((hour) => {
                       const isLunch = enableLunch && hour >= lunchStart && hour < lunchEnd;
+                      const density = calculateHourDensity(dayDate, hour, slicedItems, tz);
                       return (
-                        <div
+                        <DroppableHourSlot
                           key={hour}
-                          className={`border-b border-[#D9E3EF]/70 transition-colors group relative ${
-                            isLunch ? 'bg-amber-50/30' : 'hover:bg-slate-50/50'
-                          }`}
-                          style={{ height: `${ROW_HEIGHT}px` }}
-                        >
-                          {/* Quick Add Button */}
-                          <button
-                            onClick={() => {
-                              if (onSelectSlotToSchedule) {
-                                onSelectSlotToSchedule(dayDate, hour);
-                              } else {
-                                onOpenTaskModal();
-                              }
-                            }}
-                            className="opacity-0 group-hover:opacity-100 transition-opacity absolute inset-0 flex items-center justify-center text-[#53657A] hover:text-[#2457A7] text-[10px]"
-                            title={`Jadwalkan kegiatan di slot ${String(hour).padStart(2, '0')}:00`}
-                          >
-                            <Plus size={12} />
-                          </button>
-                        </div>
+                          id={`week-slot-${dayDate.toISOString().slice(0, 10)}-${hour}`}
+                          date={dayDate}
+                          hour={hour}
+                          isLunch={isLunch}
+                          heightPx={ROW_HEIGHT}
+                          density={density}
+                          onSelectSlot={() => {
+                            if (onSelectSlotToSchedule) {
+                              onSelectSlotToSchedule(dayDate, hour);
+                            } else {
+                              onOpenTaskModal();
+                            }
+                          }}
+                        />
                       );
                     })}
 
@@ -708,6 +1059,23 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                               setSelectedSessionDetails({ task: item.task, session: item.session });
                             }
                           }}
+                          onMouseEnter={(e) => {
+                            setHoveredTooltip({
+                              item,
+                              x: e.clientX,
+                              y: e.clientY,
+                            });
+                          }}
+                          onMouseMove={(e) => {
+                            setHoveredTooltip({
+                              item,
+                              x: e.clientX,
+                              y: e.clientY,
+                            });
+                          }}
+                          onMouseLeave={() => {
+                            setHoveredTooltip(null);
+                          }}
                           style={{
                             top: `${item.topPx}px`,
                             height: `${item.heightPx}px`,
@@ -723,7 +1091,6 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                               ? 'bg-slate-100 hover:bg-slate-200 border-slate-400 text-slate-500 line-through'
                               : 'bg-[#EAF3FC] hover:bg-[#d8e9fa] border-[#2457A7] text-[#172B42]'
                           }`}
-                          title={`${item.title} (${item.totalDurationMinutes} menit)${item.hasConflict ? ' [Bentrok Jadwal]' : ''}`}
                         >
                           <div>
                             <div className="flex items-center justify-between gap-1 leading-tight">
@@ -833,18 +1200,40 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                   ))}
                 </div>
 
-                {/* Day Column with Cards */}
-                <div className="relative h-full">
-                  {gridHours.map((hour) => (
-                    <div
-                      key={hour}
-                      className="border-b border-[#D9E3EF]/70 hover:bg-slate-50/50"
-                      style={{ height: `${ROW_HEIGHT}px` }}
-                    />
-                  ))}
+                  {/* Day Column with Cards & Droppable Slots */}
+                  <div className="relative h-full">
+                    {(() => {
+                      const daySlicedItems = getSlicedItemsForDay(currentDate);
+                      return (
+                        <>
+                          {gridHours.map((hour) => {
+                            const enableLunch = preferences.enableLunchBreak !== false;
+                            const lunchStart = preferences.lunchStartHour ?? 12;
+                            const lunchEnd = preferences.lunchEndHour ?? 13;
+                            const isLunch = enableLunch && hour >= lunchStart && hour < lunchEnd;
+                            const density = calculateHourDensity(currentDate, hour, daySlicedItems, tz);
+                            return (
+                              <DroppableHourSlot
+                                key={hour}
+                                id={`day-slot-${currentDate.toISOString().slice(0, 10)}-${hour}`}
+                                date={currentDate}
+                                hour={hour}
+                                isLunch={isLunch}
+                                heightPx={ROW_HEIGHT}
+                                density={density}
+                                onSelectSlot={() => {
+                                  if (onSelectSlotToSchedule) {
+                                    onSelectSlotToSchedule(currentDate, hour);
+                                  } else {
+                                    onOpenTaskModal();
+                                  }
+                                }}
+                              />
+                            );
+                          })}
 
-                  {/* Sliced items for day view */}
-                  {getSlicedItemsForDay(currentDate).map((item) => {
+                          {/* Sliced items for day view */}
+                          {daySlicedItems.map((item) => {
                     const isGoogle = item.sourceType === 'google';
                     const isDone = Boolean(item.isDone);
                     const widthPercent = item.totalCols > 1 ? 100 / item.totalCols : 100;
@@ -859,6 +1248,23 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                           } else if (item.task && item.session) {
                             setSelectedSessionDetails({ task: item.task, session: item.session });
                           }
+                        }}
+                        onMouseEnter={(e) => {
+                          setHoveredTooltip({
+                            item,
+                            x: e.clientX,
+                            y: e.clientY,
+                          });
+                        }}
+                        onMouseMove={(e) => {
+                          setHoveredTooltip({
+                            item,
+                            x: e.clientX,
+                            y: e.clientY,
+                          });
+                        }}
+                        onMouseLeave={() => {
+                          setHoveredTooltip(null);
                         }}
                         style={{
                           top: `${item.topPx}px`,
@@ -929,7 +1335,10 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                       </div>
                     );
                   })}
-                </div>
+                </>
+              );
+            })()}
+          </div>
               </div>
             </div>
           </div>
@@ -959,8 +1368,11 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                 const overflowCount = cell.items.length - maxVisible;
 
                 return (
-                  <div
+                  <DroppableMonthDayCell
                     key={idx}
+                    id={`month-slot-${cell.date.toISOString().slice(0, 10)}`}
+                    date={cell.date}
+                    hour={9}
                     onClick={() => {
                       setCurrentDate(cell.date);
                       setViewMode('day');
@@ -1025,6 +1437,23 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                                   setSelectedSessionDetails({ task: item.task, session: item.session });
                                 }
                               }}
+                              onMouseEnter={(e) => {
+                                setHoveredTooltip({
+                                  item,
+                                  x: e.clientX,
+                                  y: e.clientY,
+                                });
+                              }}
+                              onMouseMove={(e) => {
+                                setHoveredTooltip({
+                                  item,
+                                  x: e.clientX,
+                                  y: e.clientY,
+                                });
+                              }}
+                              onMouseLeave={() => {
+                                setHoveredTooltip(null);
+                              }}
                               className={`px-1.5 py-0.5 rounded-md text-[11px] leading-tight font-medium truncate flex items-center gap-1 cursor-pointer transition-all ${
                                 isGoogle
                                   ? 'bg-[#2457A7]/10 text-[#2457A7] hover:bg-[#2457A7]/20 border border-[#2457A7]/20'
@@ -1032,7 +1461,6 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                                   ? 'bg-slate-100 text-slate-400 line-through border border-slate-200'
                                   : 'bg-[#EAF3FC] text-[#172B42] hover:bg-[#d5e7fa] border border-[#8DBCEB]/50'
                               }`}
-                              title={`${item.title} (${startTimeStr})`}
                             >
                               <span className="font-mono text-[9px] shrink-0 opacity-80">
                                 {startTimeStr}
@@ -1061,12 +1489,73 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
                         +{overflowCount} lainnya
                       </button>
                     )}
-                  </div>
+                  </DroppableMonthDayCell>
                 );
               })}
             </div>
           </div>
         )}
+      </div>
+
+        {/* Collapsible Unscheduled Tasks Drawer */}
+        <AnimatePresence>
+          {isUnscheduledDrawerOpen && (
+            <motion.aside
+              initial={{ width: 0, opacity: 0 }}
+              animate={{ width: 288, opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }}
+              transition={{ duration: 0.18, ease: 'easeOut' }}
+              className="w-72 shrink-0 border-l border-[#D9E3EF] bg-white flex flex-col h-full overflow-hidden shadow-xs z-20"
+            >
+              {/* Drawer header */}
+              <div className="p-3.5 border-b border-[#D9E3EF] flex items-center justify-between bg-[#F8FAFC]">
+                <div className="flex items-center gap-2 min-w-0">
+                  <GripVertical size={16} className="text-[#2457A7] shrink-0" />
+                  <span className="text-xs font-bold text-[#172B42] truncate">Tugas Antrean</span>
+                  <span className="px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-[#2457A7] text-white shrink-0">
+                    {unscheduledTasks.length}
+                  </span>
+                </div>
+                <button
+                  onClick={() => setIsUnscheduledDrawerOpen(false)}
+                  className="p-1 text-[#53657A] hover:text-[#172B42] hover:bg-slate-200/50 rounded-lg transition-colors"
+                  title="Tutup panel antrean"
+                >
+                  <PanelRightClose size={15} />
+                </button>
+              </div>
+
+              {/* Drawer info note */}
+              <div className="px-3.5 py-2.5 bg-blue-50/60 border-b border-blue-100 text-[11px] text-[#2457A7] leading-relaxed">
+                Tarik kegiatan dan letakkan pada slot jam di kalender untuk menjadwalkannya secara langsung.
+              </div>
+
+              {/* Drawer tasks list */}
+              <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
+                {unscheduledTasks.length === 0 ? (
+                  <div className="py-12 text-center text-xs text-[#53657A] flex flex-col items-center justify-center gap-2 px-2">
+                    <CheckCircle2 size={32} className="text-[#16856B]" />
+                    <p className="font-semibold text-[#172B42]">Semua kegiatan terjadwal!</p>
+                    <p className="text-[11px] text-[#53657A]">
+                      Tidak ada tugas dalam antrean belum terjadwal.
+                    </p>
+                    <button
+                      onClick={onOpenTaskModal}
+                      className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#2457A7] text-white text-xs font-semibold hover:bg-[#1d4685] transition-colors shadow-xs"
+                    >
+                      <Plus size={13} />
+                      Tambah Kegiatan Baru
+                    </button>
+                  </div>
+                ) : (
+                  unscheduledTasks.map((task) => (
+                    <DraggableTaskCard key={task.id} task={task} />
+                  ))
+                )}
+              </div>
+            </motion.aside>
+          )}
+        </AnimatePresence>
       </div>
 
       {/* Day Overview Modal for Month View */}
@@ -1343,6 +1832,142 @@ export const CalendarView: React.FC<CalendarViewProps> = ({
           </div>
         </div>
       )}
+      {/* Floating Tooltip Component via Framer Motion */}
+      <AnimatePresence>
+        {hoveredTooltip && (
+          <motion.div
+            initial={{ opacity: 0, y: 6, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 4, scale: 0.96 }}
+            transition={{ duration: 0.12, ease: 'easeOut' }}
+            style={{
+              position: 'fixed',
+              top: `${Math.min(window.innerHeight - 250, Math.max(16, hoveredTooltip.y - 12))}px`,
+              left: `${Math.min(window.innerWidth - 320, Math.max(16, hoveredTooltip.x + 14))}px`,
+            }}
+            className="z-50 pointer-events-none w-72 rounded-xl bg-white/95 backdrop-blur-md p-3.5 shadow-2xl border border-slate-200/90 text-slate-800 space-y-2 text-xs"
+          >
+            {/* Header Badge & Title */}
+            <div>
+              <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                <span
+                  className={`text-[9px] font-semibold px-2 py-0.5 rounded-full ${
+                    hoveredTooltip.item.sourceType === 'google'
+                      ? 'bg-blue-50 text-[#2457A7] border border-blue-200'
+                      : 'bg-[#EAF3FC] text-[#2457A7] border border-[#8DBCEB]/50'
+                  }`}
+                >
+                  {hoveredTooltip.item.sourceType === 'google' ? 'Google Calendar' : 'Tugas EVEN'}
+                </span>
+                {hoveredTooltip.item.isGoogleSynced && hoveredTooltip.item.sourceType !== 'google' && (
+                  <span className="text-[9px] font-semibold bg-blue-100 text-[#2457A7] px-1.5 py-0.5 rounded-full">
+                    Tersinkron GCal
+                  </span>
+                )}
+                {hoveredTooltip.item.hasConflict && (
+                  <span className="text-[9px] font-semibold bg-red-100 text-red-700 px-1.5 py-0.5 rounded-full flex items-center gap-0.5">
+                    <AlertTriangle size={9} /> Bentrok Jadwal
+                  </span>
+                )}
+                {hoveredTooltip.item.isDone && (
+                  <span className="text-[9px] font-semibold bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded-full flex items-center gap-0.5">
+                    <CheckCircle2 size={9} /> Selesai
+                  </span>
+                )}
+              </div>
+
+              <h4 className="font-bold text-sm text-[#172B42] leading-snug line-clamp-2">
+                {hoveredTooltip.item.title}
+              </h4>
+            </div>
+
+            {/* Time and Duration */}
+            <div className="flex items-center gap-1.5 text-[#53657A] text-[11px] font-medium">
+              <Clock size={12} className="text-[#2457A7] shrink-0" />
+              <span>
+                {formatInTimezone(hoveredTooltip.item.itemStart, tz, {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  hour12: false,
+                })}
+                {' - '}
+                {formatInTimezone(hoveredTooltip.item.itemEnd, tz, {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  hour12: false,
+                })}{' '}
+                WIB ({hoveredTooltip.item.totalDurationMinutes} mnt)
+              </span>
+            </div>
+
+            {/* Badges for Category and Priority */}
+            <div className="flex items-center gap-1.5 pt-0.5 flex-wrap">
+              <span
+                className={`inline-flex items-center gap-1 text-[9px] font-medium px-2 py-0.5 rounded-full border ${
+                  CATEGORY_OPTIONS.find((c) => c.id === hoveredTooltip.item.category)?.badgeClass ||
+                  'bg-slate-100 text-slate-700 border-slate-200'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    CATEGORY_OPTIONS.find((c) => c.id === hoveredTooltip.item.category)?.dotClass || 'bg-slate-400'
+                  }`}
+                />
+                {CATEGORY_OPTIONS.find((c) => c.id === hoveredTooltip.item.category)?.label || 'Kegiatan'}
+              </span>
+
+              <span
+                className={`text-[9px] font-medium px-2 py-0.5 rounded-full border ${
+                  PRIORITY_OPTIONS.find((p) => p.id === hoveredTooltip.item.priority)?.badgeClass ||
+                  'bg-slate-100 text-slate-700 border-slate-200'
+                }`}
+              >
+                Prioritas {PRIORITY_OPTIONS.find((p) => p.id === hoveredTooltip.item.priority)?.label || 'Sedang'}
+              </span>
+            </div>
+
+            {/* Location or Meet URL if present */}
+            {hoveredTooltip.item.event?.location && (
+              <p className="text-[10px] text-[#53657A] truncate">
+                📍 {hoveredTooltip.item.event.location}
+              </p>
+            )}
+            {hoveredTooltip.item.event?.meetUrl && (
+              <div className="flex items-center gap-1 text-[10px] text-[#2457A7] font-medium">
+                <Video size={11} /> Google Meet Video
+              </div>
+            )}
+
+            {/* Description or Notes Preview */}
+            {(hoveredTooltip.item.task?.description || hoveredTooltip.item.event?.description) && (
+              <p className="text-[10px] text-slate-500 line-clamp-2 border-t border-slate-100 pt-1.5 mt-1 italic">
+                "{hoveredTooltip.item.task?.description || hoveredTooltip.item.event?.description}"
+              </p>
+            )}
+
+            <div className="text-[9px] text-slate-400 pt-0.5 flex items-center justify-between">
+              <span>Klik untuk membuka detail lengkap</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
+
+    <DragOverlay>
+      {activeDragTask && (
+        <div className="p-3 bg-white border-2 border-[#2457A7] rounded-xl shadow-xl flex flex-col gap-1.5 w-60 rotate-2 scale-105 pointer-events-none opacity-95">
+          <div className="flex items-center justify-between">
+            <h4 className="text-xs font-bold text-[#172B42] truncate">{activeDragTask.title}</h4>
+            <span className="text-[10px] font-bold px-1.5 py-0.2 bg-[#2457A7] text-white rounded">
+              {activeDragTask.estimatedDurationMinutes || 60}m
+            </span>
+          </div>
+          <p className="text-[10px] text-[#53657A] line-clamp-1">
+            {activeDragTask.description || 'Lepaskan pada slot waktu untuk menjadwalkan'}
+          </p>
+        </div>
+      )}
+    </DragOverlay>
+  </DndContext>
   );
 };

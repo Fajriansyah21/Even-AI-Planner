@@ -1,9 +1,17 @@
-import { Task, CalendarEvent, UserPreferences, ScheduleCalculationResult } from '../types';
+import {
+  Task,
+  CalendarEvent,
+  UserPreferences,
+  ScheduleCalculationResult,
+  DateEvaluationDiagnostic,
+  OptimalSlotSuggestion,
+} from '../types';
 import {
   parseTimezoneString,
   getPartsInTimezone,
   createIsoInTimezone,
   formatInTimezone,
+  addDaysInTimezone,
 } from './timezone';
 import { getNextValidDateForDayOfWeek, DAY_NAMES_ID } from './temporalParser';
 
@@ -590,19 +598,39 @@ export function scheduleTaskDeterministically(
         }
       }
 
-      // Find first slot of durationNeeded
-      let allocatedSlot: { start: Date; end: Date } | null = null;
-      for (const block of freeOnDay) {
-        const blockDuration = (block.end.getTime() - block.start.getTime()) / 60000;
-        if (blockDuration >= durationNeeded) {
-          const slotStart = new Date(block.start);
-          const slotEnd = new Date(slotStart.getTime() + durationNeeded * 60000);
-          allocatedSlot = { start: slotStart, end: slotEnd };
-          break;
+      const windowDesc = task.preferredWindow?.label || (hasEveningPref ? 'malam' : 'jam kerja');
+
+      // Check if day start is past deadline
+      if (deadline) {
+        const segCheckStart = (preferredWindowStartHour !== null)
+          ? new Date(createIsoInTimezone(nextDate.year, nextDate.month, nextDate.day, preferredWindowStartHour, task.preferredWindow?.startMinute || 0, 0, userTz))
+          : new Date(createIsoInTimezone(nextDate.year, nextDate.month, nextDate.day, preferences.workStartHour ?? 9, 0, 0, userTz));
+        if (segCheckStart >= deadline) {
+          failedOccurrences.push({
+            dayName,
+            timeStr: windowDesc,
+            reason: `jadwal hari ${dayName} (${formatIndonesianDate(segCheckStart, userTz)}) berada setelah batas tenggat waktu (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)} WIB)`,
+          });
+          continue;
         }
       }
 
-      const windowDesc = task.preferredWindow?.label || (hasEveningPref ? 'malam' : 'jam kerja');
+      // Find first slot of durationNeeded
+      let allocatedSlot: { start: Date; end: Date } | null = null;
+      for (const block of freeOnDay) {
+        if (deadline && block.start >= deadline) continue;
+        const effectiveEnd = deadline && block.end > deadline ? deadline : block.end;
+        const blockDuration = (effectiveEnd.getTime() - block.start.getTime()) / 60000;
+        if (blockDuration >= durationNeeded) {
+          const slotStart = new Date(block.start);
+          const slotEnd = new Date(slotStart.getTime() + durationNeeded * 60000);
+          if (!deadline || slotEnd <= deadline) {
+            allocatedSlot = { start: slotStart, end: slotEnd };
+            break;
+          }
+        }
+      }
+
       if (allocatedSlot) {
         validSessions.push({
           startAt: allocatedSlot.start.toISOString(),
@@ -678,6 +706,7 @@ export function scheduleTaskDeterministically(
   // Phase A: Search within PREFERRED WINDOW first (if requested)
   if (preferredWindowStartHour !== null && preferredWindowEndHour !== null) {
     const preferredSegments: TimeInterval[] = [];
+    const evaluatedDaysPreferred: DateEvaluationDiagnostic[] = [];
 
     for (const day of candidateDays) {
       const pStartIso = createIsoInTimezone(
@@ -704,6 +733,60 @@ export function scheduleTaskDeterministically(
 
       if (pEnd > pStart) {
         preferredSegments.push({ start: pStart, end: pEnd });
+
+        // Collect diagnostics for this preferred day window
+        const dayConflicts: string[] = [];
+        for (const evt of existingEvents) {
+          const eStart = new Date(evt.startAt);
+          const eEnd = new Date(evt.endAt);
+          if (pStart < eEnd && pEnd > eStart) {
+            dayConflicts.push(`${evt.title} (${formatTime(eStart, userTz)} - ${formatTime(eEnd, userTz)} WIB)`);
+          }
+        }
+        for (const t of existingTasks) {
+          if (t.id === task.id) continue;
+          if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
+          if (t.scheduledSessions) {
+            for (const s of t.scheduledSessions) {
+              if (
+                s.status !== 'CANCELLED' &&
+                s.status !== 'completed_manual' &&
+                s.status !== 'missed_auto' &&
+                s.status !== 'COMPLETED'
+              ) {
+                const sStart = new Date(s.startAt);
+                const sEnd = new Date(s.endAt);
+                if (pStart < sEnd && pEnd > sStart) {
+                  dayConflicts.push(
+                    `${t.title} sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)} WIB)`
+                  );
+                }
+              }
+            }
+          }
+        }
+
+        const dayFree = extractFreeBlocks([{ start: pStart, end: pEnd }]);
+        const dayTotalFree = dayFree.reduce((sum, b) => sum + (b.end.getTime() - b.start.getTime()) / 60000, 0);
+        let dayMax = 0;
+        for (const b of dayFree) {
+          const d = (b.end.getTime() - b.start.getTime()) / 60000;
+          if (d > dayMax) dayMax = d;
+        }
+
+        evaluatedDaysPreferred.push({
+          dateStr: `${day.year}-${String(day.month).padStart(2, '0')}-${String(day.day).padStart(2, '0')}`,
+          dayName: formatIndonesianDate(day.dateObj, userTz),
+          windowStart: formatTime(pStart, userTz),
+          windowEnd: formatTime(pEnd, userTz),
+          totalFreeMinutes: Math.round(dayTotalFree),
+          maxContiguousFreeMinutes: Math.round(dayMax),
+          conflicts: dayConflicts,
+          rejectionReason:
+            dayTotalFree === 0
+              ? 'Jendela waktu penuh oleh agenda lain'
+              : `Slot bebas terbesar hanya ${Math.round(dayMax)} menit (dibutuhkan ${durationNeeded} menit tanpa opsi split)`,
+        });
       }
     }
 
@@ -734,6 +817,9 @@ export function scheduleTaskDeterministically(
             },
           ],
           explanation: `Ditemukan waktu fokus ${durationNeeded} menit pada ${dayStr}, pukul ${timeStr} WIB tepat di jendela waktu ${windowDesc} yang Anda inginkan.`,
+          diagnostics: {
+            evaluatedDays: evaluatedDaysPreferred,
+          },
         };
       }
     }
@@ -770,7 +856,6 @@ export function scheduleTaskDeterministically(
       if (remainingMinutes <= 0 && splitSessions.length > 0) {
         const total = splitSessions.length;
         splitSessions.forEach((s) => (s.totalSessions = total));
-
         const first = splitSessions[0];
         return {
           success: true,
@@ -778,6 +863,9 @@ export function scheduleTaskDeterministically(
           taskTitle: task.title,
           proposedSessions: splitSessions,
           explanation: `Kegiatan dipecah menjadi ${total} sesi realistis di jendela waktu ${task.preferredWindow?.label || 'malam'} yang diminta. Sesi pertama mulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+          diagnostics: {
+            evaluatedDays: evaluatedDaysPreferred,
+          },
         };
       }
     }
@@ -811,12 +899,15 @@ export function scheduleTaskDeterministically(
   const lunchEndHour = preferences.lunchEndHour ?? 13;
 
   const workSegments: TimeInterval[] = [];
+  const evaluatedDaysWork: DateEvaluationDiagnostic[] = [];
 
   for (const day of candidateDays) {
+    const daySegments: TimeInterval[] = [];
+
     if (isNightShift) {
       // Night shift crossing midnight: starts on `day` at workStartHour, ends on `day + 1` at workEndHour
       const shiftStartIso = createIsoInTimezone(day.year, day.month, day.day, workStartHour, 0, 0, userTz);
-      const nextDayDate = new Date(day.dateObj.getTime() + 86400000);
+      const nextDayDate = addDaysInTimezone(day.dateObj, 1, userTz);
       const nextParts = getPartsInTimezone(nextDayDate, userTz);
       const shiftEndIso = createIsoInTimezone(nextParts.year, nextParts.month, nextParts.day, workEndHour, 0, 0, userTz);
 
@@ -831,13 +922,13 @@ export function scheduleTaskDeterministically(
         const lunchEnd = new Date(lunchEndIso);
 
         if (lunchStart > shiftStart && lunchEnd < shiftEnd) {
-          workSegments.push({ start: shiftStart, end: lunchStart });
-          workSegments.push({ start: lunchEnd, end: shiftEnd });
+          daySegments.push({ start: shiftStart, end: lunchStart });
+          daySegments.push({ start: lunchEnd, end: shiftEnd });
         } else {
-          workSegments.push({ start: shiftStart, end: shiftEnd });
+          daySegments.push({ start: shiftStart, end: shiftEnd });
         }
       } else {
-        workSegments.push({ start: shiftStart, end: shiftEnd });
+        daySegments.push({ start: shiftStart, end: shiftEnd });
       }
     } else {
       // Day shift within same day
@@ -855,15 +946,76 @@ export function scheduleTaskDeterministically(
         const lunchEnd = new Date(lunchEndIso);
 
         if (lunchStart > shiftStart && lunchEnd < shiftEnd) {
-          workSegments.push({ start: shiftStart, end: lunchStart });
-          workSegments.push({ start: lunchEnd, end: shiftEnd });
+          daySegments.push({ start: shiftStart, end: lunchStart });
+          daySegments.push({ start: lunchEnd, end: shiftEnd });
         } else {
-          workSegments.push({ start: shiftStart, end: shiftEnd });
+          daySegments.push({ start: shiftStart, end: shiftEnd });
         }
       } else {
         // Lunch disabled: single continuous work segment!
-        workSegments.push({ start: shiftStart, end: shiftEnd });
+        daySegments.push({ start: shiftStart, end: shiftEnd });
       }
+    }
+
+    for (const seg of daySegments) {
+      workSegments.push(seg);
+    }
+
+    const dayStart = daySegments[0]?.start;
+    const dayEnd = daySegments[daySegments.length - 1]?.end;
+    if (dayStart && dayEnd) {
+      const conflicts: string[] = [];
+      for (const evt of existingEvents) {
+        const eStart = new Date(evt.startAt);
+        const eEnd = new Date(evt.endAt);
+        if (dayStart < eEnd && dayEnd > eStart) {
+          conflicts.push(`${evt.title} (${formatTime(eStart, userTz)} - ${formatTime(eEnd, userTz)} WIB)`);
+        }
+      }
+      for (const t of existingTasks) {
+        if (t.id === task.id) continue;
+        if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
+        if (t.scheduledSessions) {
+          for (const s of t.scheduledSessions) {
+            if (
+              s.status !== 'CANCELLED' &&
+              s.status !== 'completed_manual' &&
+              s.status !== 'missed_auto' &&
+              s.status !== 'COMPLETED'
+            ) {
+              const sStart = new Date(s.startAt);
+              const sEnd = new Date(s.endAt);
+              if (dayStart < sEnd && dayEnd > sStart) {
+                conflicts.push(
+                  `${t.title} sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)} WIB)`
+                );
+              }
+            }
+          }
+        }
+      }
+
+      const dayFree = extractFreeBlocks(daySegments);
+      const dayTotalFree = dayFree.reduce((sum, b) => sum + (b.end.getTime() - b.start.getTime()) / 60000, 0);
+      let dayMax = 0;
+      for (const b of dayFree) {
+        const d = (b.end.getTime() - b.start.getTime()) / 60000;
+        if (d > dayMax) dayMax = d;
+      }
+
+      evaluatedDaysWork.push({
+        dateStr: `${day.year}-${String(day.month).padStart(2, '0')}-${String(day.day).padStart(2, '0')}`,
+        dayName: formatIndonesianDate(day.dateObj, userTz),
+        windowStart: formatTime(dayStart, userTz),
+        windowEnd: formatTime(dayEnd, userTz),
+        totalFreeMinutes: Math.round(dayTotalFree),
+        maxContiguousFreeMinutes: Math.round(dayMax),
+        conflicts,
+        rejectionReason:
+          dayTotalFree === 0
+            ? 'Jendela jam kerja penuh oleh agenda lain'
+            : `Slot bebas terbesar hanya ${Math.round(dayMax)} menit (dibutuhkan ${durationNeeded} menit tanpa opsi split)`,
+      });
     }
   }
 
@@ -895,6 +1047,7 @@ export function scheduleTaskDeterministically(
         explanation: `Ditemukan waktu fokus penuh ${durationNeeded} menit pada ${dayStr}, pukul ${timeStr} WIB.`,
         diagnostics: {
           isNightShift,
+          evaluatedDays: evaluatedDaysWork,
         },
       };
     }
@@ -942,6 +1095,7 @@ export function scheduleTaskDeterministically(
         explanation: `Kegiatan dipecah menjadi ${total} sesi realistis (total ${durationNeeded} menit). Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
         diagnostics: {
           isNightShift,
+          evaluatedDays: evaluatedDaysWork,
         },
       };
     }
@@ -957,19 +1111,31 @@ export function scheduleTaskDeterministically(
     ? ` sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)})`
     : '';
 
+  const diagSummary = evaluatedDaysWork
+    .map(
+      (ed) =>
+        `• ${ed.dayName} (${ed.windowStart} - ${ed.windowEnd} WIB): Total luang ${ed.totalFreeMinutes} menit${
+          ed.maxContiguousFreeMinutes !== undefined ? `, slot bebas terpanjang ${ed.maxContiguousFreeMinutes} menit` : ''
+        }.${ed.conflicts.length > 0 ? ` Terhalang: ${ed.conflicts.join(', ')}.` : ' Tidak ada konflik agenda.'} Alasan: ${ed.rejectionReason}`
+    )
+    .join('\n');
+
   return {
     success: false,
     taskId: task.id,
     taskTitle: task.title,
     failureCode: 'NO_SLOT_BEFORE_DEADLINE',
     proposedSessions: [],
-    explanation: `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit)${deadlineInfo}. Total waktu luang tersisa di jam kerja Anda hanya ${Math.round(totalFreeAvailable)} menit.`,
+    explanation: `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit)${deadlineInfo}. Total waktu luang tersisa di jam kerja Anda hanya ${Math.round(totalFreeAvailable)} menit.${
+      diagSummary ? `\n\nDiagnostik evaluasi slot per tanggal:\n${diagSummary}` : ''
+    }`,
     warning: task.allowSplit
       ? 'Pertimbangkan untuk memperpanjang tenggat atau mengurangi durasi kegiatan.'
       : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau menyesuaikan jam kerja di Pengaturan.',
     diagnostics: {
       freeTimeCalculatedMinutes: Math.round(totalFreeAvailable),
       isNightShift,
+      evaluatedDays: evaluatedDaysWork,
     },
   };
 }
@@ -1037,3 +1203,242 @@ export function scheduleAllPendingTasks(
 
   return { results, updatedTasks: runningTasks };
 }
+
+/**
+ * Memberikan saran slot waktu berdasarkan analisis historis produktivitas pengguna,
+ * di luar sekadar mencari slot kosong pertama.
+ *
+ * Menggabungkan:
+ * 1. Analisis riwayat tugas selesai vs terlewat (pagi/siang/malam & hari terbaik)
+ * 2. Keselarasan prioritas tugas (tugas HIGH/URGENT diarahkan ke jendela produktivitas puncak)
+ * 3. Kualitas slot: durasi blok tanpa gangguan, buffer sehat, jarak ideal dari tenggat
+ */
+export function suggestOptimalSlot(
+  task: Task,
+  existingEvents: CalendarEvent[],
+  existingTasks: Task[],
+  preferences: UserPreferences,
+  referenceDate: Date = new Date()
+): OptimalSlotSuggestion {
+  const durationNeeded = task.estimatedDurationMinutes || 60;
+  const userTz = parseTimezoneString(task.timezone || preferences.timezone || 'Asia/Jakarta');
+
+  // 1. Analisis riwayat produktivitas pengguna
+  const windowStats = {
+    MORNING: { completed: 0, missed: 0 },
+    AFTERNOON: { completed: 0, missed: 0 },
+    EVENING: { completed: 0, missed: 0 },
+  };
+
+  const dayOfWeekStats: Record<number, { completed: number; missed: number }> = {
+    0: { completed: 0, missed: 0 },
+    1: { completed: 0, missed: 0 },
+    2: { completed: 0, missed: 0 },
+    3: { completed: 0, missed: 0 },
+    4: { completed: 0, missed: 0 },
+    5: { completed: 0, missed: 0 },
+    6: { completed: 0, missed: 0 },
+  };
+
+  let totalCompleted = 0;
+  let totalMissed = 0;
+
+  for (const t of existingTasks) {
+    if (t.status === 'completed_manual' || t.status === 'COMPLETED' || t.completedAt) {
+      totalCompleted++;
+      const dateToCheck = t.completedAt
+        ? new Date(t.completedAt)
+        : t.scheduledSessions && t.scheduledSessions[0]
+        ? new Date(t.scheduledSessions[0].startAt)
+        : null;
+      if (dateToCheck && !isNaN(dateToCheck.getTime())) {
+        const parts = getPartsInTimezone(dateToCheck, userTz);
+        if (parts.hour >= 6 && parts.hour < 12) windowStats.MORNING.completed++;
+        else if (parts.hour >= 12 && parts.hour < 18) windowStats.AFTERNOON.completed++;
+        else windowStats.EVENING.completed++;
+
+        if (dayOfWeekStats[parts.dayOfWeek]) {
+          dayOfWeekStats[parts.dayOfWeek].completed++;
+        }
+      }
+    } else if (t.status === 'missed_auto' || t.missedAt) {
+      totalMissed++;
+      const dateToCheck = t.missedAt
+        ? new Date(t.missedAt)
+        : t.scheduledSessions && t.scheduledSessions[0]
+        ? new Date(t.scheduledSessions[0].startAt)
+        : null;
+      if (dateToCheck && !isNaN(dateToCheck.getTime())) {
+        const parts = getPartsInTimezone(dateToCheck, userTz);
+        if (parts.hour >= 6 && parts.hour < 12) windowStats.MORNING.missed++;
+        else if (parts.hour >= 12 && parts.hour < 18) windowStats.AFTERNOON.missed++;
+        else windowStats.EVENING.missed++;
+
+        if (dayOfWeekStats[parts.dayOfWeek]) {
+          dayOfWeekStats[parts.dayOfWeek].missed++;
+        }
+      }
+    }
+  }
+
+  // Hitung persentase keberhasilan per jendela
+  const calcRate = (c: number, m: number) => {
+    const total = c + m;
+    return total > 0 ? Math.round((c / total) * 100) : 0;
+  };
+
+  const morningRate = calcRate(windowStats.MORNING.completed, windowStats.MORNING.missed);
+  const afternoonRate = calcRate(windowStats.AFTERNOON.completed, windowStats.AFTERNOON.missed);
+  const eveningRate = calcRate(windowStats.EVENING.completed, windowStats.EVENING.missed);
+
+  // Tentukan jendela produktivitas puncak
+  let peakProductivityWindow: 'MORNING' | 'AFTERNOON' | 'EVENING' = 'MORNING';
+  let bestRate = morningRate;
+
+  if (totalCompleted >= 2) {
+    if (afternoonRate > bestRate && windowStats.AFTERNOON.completed > 0) {
+      peakProductivityWindow = 'AFTERNOON';
+      bestRate = afternoonRate;
+    }
+    if (eveningRate > bestRate && windowStats.EVENING.completed > 0) {
+      peakProductivityWindow = 'EVENING';
+      bestRate = eveningRate;
+    }
+  } else {
+    // Default standar sains fokus kerja mendalam
+    bestRate = 85;
+  }
+
+  // Tentukan hari produktif terbaik
+  let bestDayIndex = 2; // Selasa default
+  let maxDayCompleted = -1;
+  for (let d = 1; d <= 5; d++) {
+    if (dayOfWeekStats[d].completed > maxDayCompleted) {
+      maxDayCompleted = dayOfWeekStats[d].completed;
+      bestDayIndex = d;
+    }
+  }
+  const bestDayOfWeek = DAY_NAMES_ID[bestDayIndex] || 'Selasa';
+
+  // 2. Kumpulkan slot kosong yang tersedia
+  const baseResult = scheduleTaskDeterministically(
+    task,
+    existingEvents,
+    existingTasks,
+    preferences,
+    referenceDate
+  );
+
+  if (!baseResult.success || baseResult.proposedSessions.length === 0) {
+    return {
+      success: false,
+      taskId: task.id,
+      taskTitle: task.title,
+      productivityScore: 0,
+      historicalAnalysis: {
+        peakProductivityWindow,
+        completionRateInWindow: bestRate,
+        bestDayOfWeek,
+        totalCompletedAnalyzed: totalCompleted,
+        totalMissedAnalyzed: totalMissed,
+      },
+      reasoning: `Tidak dapat memberikan rekomendasi optimal karena tidak ada slot kosong yang tersedia: ${baseResult.explanation}`,
+    };
+  }
+
+  // 3. Skor kandidat slot berdasarkan kecocokan produktivitas
+  const candidateSlots = baseResult.proposedSessions.map((sess) => {
+    const sStart = new Date(sess.startAt);
+    const parts = getPartsInTimezone(sStart, userTz);
+    let score = 55; // baseline
+
+    let slotWindow: 'MORNING' | 'AFTERNOON' | 'EVENING' = 'MORNING';
+    if (parts.hour >= 6 && parts.hour < 12) slotWindow = 'MORNING';
+    else if (parts.hour >= 12 && parts.hour < 18) slotWindow = 'AFTERNOON';
+    else slotWindow = 'EVENING';
+
+    if (slotWindow === peakProductivityWindow) {
+      score += 25;
+    } else if (slotWindow === 'MORNING') {
+      score += 15;
+    }
+
+    if (task.priority === 'HIGH' || task.priority === 'URGENT') {
+      if (slotWindow === 'MORNING' || slotWindow === peakProductivityWindow) {
+        score += 15;
+      }
+    } else {
+      score += 10;
+    }
+
+    if (parts.dayOfWeek === bestDayIndex) {
+      score += 10;
+    } else if (parts.dayOfWeek >= 1 && parts.dayOfWeek <= 4) {
+      score += 5;
+    }
+
+    score = Math.min(100, Math.max(10, score));
+
+    const dayName = formatIndonesianDate(sStart, userTz);
+    const timeRangeStr = `${formatTime(sStart, userTz)} - ${formatTime(new Date(sess.endAt), userTz)} WIB`;
+
+    return {
+      startAt: sess.startAt,
+      endAt: sess.endAt,
+      durationMinutes: sess.durationMinutes,
+      dayName,
+      timeRangeStr,
+      score,
+      label: `${dayName}, ${timeRangeStr} (Skor Produktivitas: ${score}%)`,
+    };
+  });
+
+  candidateSlots.sort((a, b) => b.score - a.score);
+  const bestSlot = candidateSlots[0];
+  const alternatives = candidateSlots.slice(1);
+
+  const windowLabel =
+    peakProductivityWindow === 'MORNING'
+      ? 'Pagi (09:00 - 12:00)'
+      : peakProductivityWindow === 'AFTERNOON'
+      ? 'Siang/Sore (13:00 - 17:00)'
+      : 'Malam (19:00 - 22:00)';
+
+  let reasoning = '';
+  if (totalCompleted >= 3) {
+    reasoning = `Berdasarkan analisis riwayat ${totalCompleted} tugas selesai Anda, jendela ${windowLabel} memiliki tingkat keberhasilan tertinggi (${bestRate}%), dengan performa optimal pada hari ${bestDayOfWeek}. Slot ${bestSlot.dayName} pukul ${bestSlot.timeRangeStr} direkomendasikan dengan skor produktivitas ${bestSlot.score}%.`;
+  } else {
+    reasoning = `Berdasarkan standar fokus kognitif dan jam kerja produktif, jendela ${windowLabel} memberikan konsentrasi tertinggi bebas interupsi. Slot ${bestSlot.dayName} pukul ${bestSlot.timeRangeStr} direkomendasikan dengan skor produktivitas ${bestSlot.score}%.`;
+  }
+
+  return {
+    success: true,
+    taskId: task.id,
+    taskTitle: task.title,
+    recommendedSlot: {
+      startAt: bestSlot.startAt,
+      endAt: bestSlot.endAt,
+      durationMinutes: bestSlot.durationMinutes,
+      dayName: bestSlot.dayName,
+      timeRangeStr: bestSlot.timeRangeStr,
+    },
+    productivityScore: bestSlot.score,
+    historicalAnalysis: {
+      peakProductivityWindow,
+      completionRateInWindow: bestRate,
+      bestDayOfWeek,
+      totalCompletedAnalyzed: totalCompleted,
+      totalMissedAnalyzed: totalMissed,
+    },
+    reasoning,
+    alternativeSlots: alternatives.map((a) => ({
+      startAt: a.startAt,
+      endAt: a.endAt,
+      durationMinutes: a.durationMinutes,
+      score: a.score,
+      label: a.label,
+    })),
+  };
+}
+
+export { addDaysInTimezone };

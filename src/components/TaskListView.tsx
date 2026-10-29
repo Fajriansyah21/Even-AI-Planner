@@ -35,7 +35,21 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
   onScheduleAllTasks,
   onToggleTaskComplete,
 }) => {
-  const [filter, setFilter] = useState<'ALL' | 'UNSCHEDULED' | 'SCHEDULED' | 'COMPLETED'>('ALL');
+  // Multi-select Priority filters: 'HIGH' (includes URGENT & HIGH), 'MEDIUM', 'LOW'
+  const [selectedPriorities, setSelectedPriorities] = useState<Priority[]>([
+    'URGENT',
+    'HIGH',
+    'MEDIUM',
+    'LOW',
+  ]);
+
+  // Multi-select Status filters: 'SCHEDULED', 'UNSCHEDULED', 'COMPLETED'
+  const [selectedStatuses, setSelectedStatuses] = useState<('SCHEDULED' | 'UNSCHEDULED' | 'COMPLETED')[]>([
+    'SCHEDULED',
+    'UNSCHEDULED',
+    'COMPLETED',
+  ]);
+
   const [searchQuery, setSearchQuery] = useState('');
 
   const priorityStyles: Record<Priority, { label: string; badgeClass: string }> = {
@@ -107,14 +121,92 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
     }
   };
 
-  const filteredTasks = tasks.filter((t) => {
-    // missed_auto tasks are archived into Riwayat Kegiatan
-    if (t.status === 'missed_auto') return false;
+  // Active tasks excluding missed_auto archive
+  const activeTasks = tasks.filter((t) => t.status !== 'missed_auto');
 
-    if (filter === 'UNSCHEDULED' && t.status !== 'UNSCHEDULED') return false;
-    if (filter === 'SCHEDULED' && t.status !== 'SCHEDULED') return false;
-    if (filter === 'COMPLETED' && t.status !== 'COMPLETED' && t.status !== 'completed_manual') return false;
+  // Status counts
+  const unscheduledCount = activeTasks.filter((t) => t.status === 'UNSCHEDULED').length;
+  const scheduledCount = activeTasks.filter((t) => t.status === 'SCHEDULED').length;
+  const completedCount = activeTasks.filter((t) => t.status === 'COMPLETED' || t.status === 'completed_manual').length;
 
+  // Priority counts
+  const highPriorityCount = activeTasks.filter((t) => t.priority === 'HIGH' || t.priority === 'URGENT').length;
+  const mediumPriorityCount = activeTasks.filter((t) => t.priority === 'MEDIUM' || !t.priority).length;
+  const lowPriorityCount = activeTasks.filter((t) => t.priority === 'LOW').length;
+
+  // Toggle Handlers
+  const handleTogglePriority = (prioGroup: 'HIGH' | 'MEDIUM' | 'LOW') => {
+    if (prioGroup === 'HIGH') {
+      const isHighActive = selectedPriorities.includes('HIGH') || selectedPriorities.includes('URGENT');
+      if (isHighActive) {
+        setSelectedPriorities((prev) => prev.filter((p) => p !== 'HIGH' && p !== 'URGENT'));
+      } else {
+        setSelectedPriorities((prev) => [...prev, 'HIGH', 'URGENT']);
+      }
+    } else {
+      if (selectedPriorities.includes(prioGroup)) {
+        setSelectedPriorities((prev) => prev.filter((p) => p !== prioGroup));
+      } else {
+        setSelectedPriorities((prev) => [...prev, prioGroup]);
+      }
+    }
+  };
+
+  const handleToggleStatus = (status: 'SCHEDULED' | 'UNSCHEDULED' | 'COMPLETED') => {
+    if (selectedStatuses.includes(status)) {
+      setSelectedStatuses((prev) => prev.filter((s) => s !== status));
+    } else {
+      setSelectedStatuses((prev) => [...prev, status]);
+    }
+  };
+
+  const isAllPrioritiesSelected = selectedPriorities.length === 4;
+  const isAllStatusesSelected = selectedStatuses.length === 3;
+  const hasActiveFilterModifications =
+    !isAllPrioritiesSelected || !isAllStatusesSelected || searchQuery.trim().length > 0;
+
+  const handleResetAllFilters = () => {
+    setSelectedPriorities(['URGENT', 'HIGH', 'MEDIUM', 'LOW']);
+    setSelectedStatuses(['SCHEDULED', 'UNSCHEDULED', 'COMPLETED']);
+    setSearchQuery('');
+  };
+
+  const handleSelectAllPriorities = () => {
+    if (isAllPrioritiesSelected) {
+      setSelectedPriorities([]);
+    } else {
+      setSelectedPriorities(['URGENT', 'HIGH', 'MEDIUM', 'LOW']);
+    }
+  };
+
+  const handleSelectAllStatuses = () => {
+    if (isAllStatusesSelected) {
+      setSelectedStatuses([]);
+    } else {
+      setSelectedStatuses(['SCHEDULED', 'UNSCHEDULED', 'COMPLETED']);
+    }
+  };
+
+  const filteredTasks = activeTasks.filter((t) => {
+    // 1. Status Filter
+    const taskStatusGroup: 'SCHEDULED' | 'UNSCHEDULED' | 'COMPLETED' =
+      t.status === 'COMPLETED' || t.status === 'completed_manual'
+        ? 'COMPLETED'
+        : t.status === 'SCHEDULED'
+        ? 'SCHEDULED'
+        : 'UNSCHEDULED';
+
+    if (!selectedStatuses.includes(taskStatusGroup)) {
+      return false;
+    }
+
+    // 2. Priority Filter
+    const taskPrio = t.priority || 'MEDIUM';
+    if (!selectedPriorities.includes(taskPrio)) {
+      return false;
+    }
+
+    // 3. Search query
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       return (
@@ -124,8 +216,6 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
     }
     return true;
   });
-
-  const unscheduledCount = tasks.filter((t) => t.status === 'UNSCHEDULED').length;
 
   return (
     <div className="flex-1 flex flex-col h-full bg-[#F8FAFC] overflow-y-auto p-4 sm:p-6">
@@ -163,59 +253,207 @@ export const TaskListView: React.FC<TaskListViewProps> = ({
         </div>
 
         {/* Filter bar & Search */}
-        <div className="bg-white p-3 border border-[#D9E3EF] rounded-2xl shadow-xs flex flex-col sm:flex-row items-center justify-between gap-3">
-          {/* Status Tabs */}
-          <div className="flex items-center gap-1 w-full sm:w-auto overflow-x-auto text-xs font-medium">
-            <button
-              onClick={() => setFilter('ALL')}
-              className={`px-3 py-1.5 rounded-xl transition-colors whitespace-nowrap ${
-                filter === 'ALL'
-                  ? 'bg-[#2457A7] text-white font-semibold'
-                  : 'text-[#53657A] hover:text-[#172B42] hover:bg-slate-100'
-              }`}
-            >
-              Semua ({tasks.length})
-            </button>
-            <button
-              onClick={() => setFilter('UNSCHEDULED')}
-              className={`px-3 py-1.5 rounded-xl transition-colors whitespace-nowrap ${
-                filter === 'UNSCHEDULED'
-                  ? 'bg-[#2457A7] text-white font-semibold'
-                  : 'text-[#53657A] hover:text-[#172B42] hover:bg-slate-100'
-              }`}
-            >
-              Belum Terjadwal ({unscheduledCount})
-            </button>
-            <button
-              onClick={() => setFilter('SCHEDULED')}
-              className={`px-3 py-1.5 rounded-xl transition-colors whitespace-nowrap ${
-                filter === 'SCHEDULED'
-                  ? 'bg-[#2457A7] text-white font-semibold'
-                  : 'text-[#53657A] hover:text-[#172B42] hover:bg-slate-100'
-              }`}
-            >
-              Terjadwal ({tasks.filter((t) => t.status === 'SCHEDULED').length})
-            </button>
-            <button
-              onClick={() => setFilter('COMPLETED')}
-              className={`px-3 py-1.5 rounded-xl transition-colors whitespace-nowrap ${
-                filter === 'COMPLETED'
-                  ? 'bg-[#2457A7] text-white font-semibold'
-                  : 'text-[#53657A] hover:text-[#172B42] hover:bg-slate-100'
-              }`}
-            >
-              Selesai ({tasks.filter((t) => t.status === 'COMPLETED').length})
-            </button>
+        <div className="bg-white p-4 border border-[#D9E3EF] rounded-2xl shadow-xs space-y-3.5">
+          {/* Top row: Search and Reset */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="relative flex-1 max-w-md">
+              <input
+                type="text"
+                placeholder="Cari kegiatan berdasarkan nama atau catatan..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full px-3.5 py-2 text-xs rounded-xl border border-[#D9E3EF] bg-[#F8FAFC] focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-[#2457A7] transition-all"
+              />
+            </div>
+
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-[#53657A]">
+                Menampilkan <strong className="text-[#172B42]">{filteredTasks.length}</strong> dari{' '}
+                <strong className="text-[#172B42]">{activeTasks.length}</strong> kegiatan
+              </span>
+              {hasActiveFilterModifications && (
+                <button
+                  onClick={handleResetAllFilters}
+                  className="px-2.5 py-1 text-xs font-semibold text-[#C43D4B] hover:bg-red-50 rounded-lg transition-colors border border-red-200/60"
+                >
+                  Reset Filter
+                </button>
+              )}
+            </div>
           </div>
 
-          {/* Search input */}
-          <input
-            type="text"
-            placeholder="Cari kegiatan..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full sm:w-48 px-3 py-1.5 text-xs rounded-xl border border-[#D9E3EF] bg-[#F8FAFC] focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-[#2457A7]"
-          />
+          {/* Toggle Groups: Status & Priority */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1 border-t border-[#D9E3EF]/60">
+            {/* Status Toggles */}
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+              <div className="flex items-center justify-between sm:justify-start gap-1.5 shrink-0">
+                <span className="text-xs font-bold text-[#172B42] flex items-center gap-1">
+                  <Layers size={13} className="text-[#2457A7]" /> Status:
+                </span>
+                <button
+                  onClick={handleSelectAllStatuses}
+                  className="text-[11px] text-[#2457A7] hover:underline"
+                >
+                  {isAllStatusesSelected ? 'Batal' : 'Semua'}
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                {/* Unscheduled Toggle */}
+                <button
+                  onClick={() => handleToggleStatus('UNSCHEDULED')}
+                  className={`px-2.5 py-1 rounded-xl text-xs font-medium border transition-all flex items-center gap-1.5 ${
+                    selectedStatuses.includes('UNSCHEDULED')
+                      ? 'bg-amber-500 text-white border-amber-600 shadow-2xs font-semibold'
+                      : 'bg-white text-[#53657A] border-[#D9E3EF] hover:bg-slate-50 opacity-60'
+                  }`}
+                  title="Toggle filter: Belum Terjadwal"
+                >
+                  <AlertCircle size={12} />
+                  <span>Belum Terjadwal</span>
+                  <span
+                    className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                      selectedStatuses.includes('UNSCHEDULED')
+                        ? 'bg-amber-600 text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {unscheduledCount}
+                  </span>
+                </button>
+
+                {/* Scheduled Toggle */}
+                <button
+                  onClick={() => handleToggleStatus('SCHEDULED')}
+                  className={`px-2.5 py-1 rounded-xl text-xs font-medium border transition-all flex items-center gap-1.5 ${
+                    selectedStatuses.includes('SCHEDULED')
+                      ? 'bg-[#2457A7] text-white border-[#1E4889] shadow-2xs font-semibold'
+                      : 'bg-white text-[#53657A] border-[#D9E3EF] hover:bg-slate-50 opacity-60'
+                  }`}
+                  title="Toggle filter: Terjadwal"
+                >
+                  <Clock size={12} />
+                  <span>Terjadwal</span>
+                  <span
+                    className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                      selectedStatuses.includes('SCHEDULED')
+                        ? 'bg-[#1E4889] text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {scheduledCount}
+                  </span>
+                </button>
+
+                {/* Completed Toggle */}
+                <button
+                  onClick={() => handleToggleStatus('COMPLETED')}
+                  className={`px-2.5 py-1 rounded-xl text-xs font-medium border transition-all flex items-center gap-1.5 ${
+                    selectedStatuses.includes('COMPLETED')
+                      ? 'bg-emerald-600 text-white border-emerald-700 shadow-2xs font-semibold'
+                      : 'bg-white text-[#53657A] border-[#D9E3EF] hover:bg-slate-50 opacity-60'
+                  }`}
+                  title="Toggle filter: Selesai"
+                >
+                  <CheckCircle2 size={12} />
+                  <span>Selesai</span>
+                  <span
+                    className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                      selectedStatuses.includes('COMPLETED')
+                        ? 'bg-emerald-700 text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {completedCount}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {/* Priority Toggles */}
+            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+              <div className="flex items-center justify-between sm:justify-start gap-1.5 shrink-0">
+                <span className="text-xs font-bold text-[#172B42] flex items-center gap-1">
+                  <Sparkles size={13} className="text-[#B86B12]" /> Prioritas:
+                </span>
+                <button
+                  onClick={handleSelectAllPriorities}
+                  className="text-[11px] text-[#2457A7] hover:underline"
+                >
+                  {isAllPrioritiesSelected ? 'Batal' : 'Semua'}
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                {/* High / Urgent Toggle */}
+                <button
+                  onClick={() => handleTogglePriority('HIGH')}
+                  className={`px-2.5 py-1 rounded-xl text-xs font-medium border transition-all flex items-center gap-1.5 ${
+                    selectedPriorities.includes('HIGH') || selectedPriorities.includes('URGENT')
+                      ? 'bg-red-500 text-white border-red-600 shadow-2xs font-semibold'
+                      : 'bg-white text-[#53657A] border-[#D9E3EF] hover:bg-slate-50 opacity-60'
+                  }`}
+                  title="Toggle filter prioritas: Tinggi / Mendesak"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                  <span>Tinggi</span>
+                  <span
+                    className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                      selectedPriorities.includes('HIGH') || selectedPriorities.includes('URGENT')
+                        ? 'bg-red-700 text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {highPriorityCount}
+                  </span>
+                </button>
+
+                {/* Medium Toggle */}
+                <button
+                  onClick={() => handleTogglePriority('MEDIUM')}
+                  className={`px-2.5 py-1 rounded-xl text-xs font-medium border transition-all flex items-center gap-1.5 ${
+                    selectedPriorities.includes('MEDIUM')
+                      ? 'bg-[#2457A7] text-white border-[#1E4889] shadow-2xs font-semibold'
+                      : 'bg-white text-[#53657A] border-[#D9E3EF] hover:bg-slate-50 opacity-60'
+                  }`}
+                  title="Toggle filter prioritas: Sedang"
+                >
+                  <span>Sedang</span>
+                  <span
+                    className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                      selectedPriorities.includes('MEDIUM')
+                        ? 'bg-[#1E4889] text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {mediumPriorityCount}
+                  </span>
+                </button>
+
+                {/* Low Toggle */}
+                <button
+                  onClick={() => handleTogglePriority('LOW')}
+                  className={`px-2.5 py-1 rounded-xl text-xs font-medium border transition-all flex items-center gap-1.5 ${
+                    selectedPriorities.includes('LOW')
+                      ? 'bg-slate-700 text-white border-slate-800 shadow-2xs font-semibold'
+                      : 'bg-white text-[#53657A] border-[#D9E3EF] hover:bg-slate-50 opacity-60'
+                  }`}
+                  title="Toggle filter prioritas: Rendah"
+                >
+                  <span>Rendah</span>
+                  <span
+                    className={`text-[10px] px-1.5 py-0.2 rounded-full ${
+                      selectedPriorities.includes('LOW')
+                        ? 'bg-slate-800 text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {lowPriorityCount}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* Task List */}

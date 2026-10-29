@@ -273,6 +273,8 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.allowSplit = false;
         if (baselinePlan.targetOccurrences) {
           sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
+        }
+        if (baselinePlan.targetDays) {
           sanitizedPlan.targetDays = baselinePlan.targetDays;
         }
       } else if (baselinePlan.timeConstraintType === 'preferred_window') {
@@ -285,6 +287,16 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.timeConstraintType = 'deadline_only';
         delete sanitizedPlan.requestedStartAt;
         delete sanitizedPlan.requestedEndAt;
+        delete sanitizedPlan.preferredWindow;
+        sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
+      }
+
+      // Propagate targetDays and targetOccurrences deterministically from baseline
+      if (baselinePlan.targetDays && baselinePlan.targetDays.length > 0) {
+        sanitizedPlan.targetDays = baselinePlan.targetDays;
+      }
+      if (baselinePlan.targetOccurrences && baselinePlan.targetOccurrences.length > 0) {
+        sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
       }
 
       // 2. Preferred time of day
@@ -293,8 +305,16 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       }
 
       // 3. Duration validation
-      const promptHasExplicitDuration = /(\d+)\s*(?:menit|mnt|jam)/i.test(trimmedPrompt);
-      if (promptHasExplicitDuration && baselinePlan.estimatedDurationMinutes) {
+      const promptHasExplicitDuration =
+        /(\d+)\s*(?:menit|mnt|jam)/i.test(trimmedPrompt) ||
+        /(?:selama\s+)?(se|satu|dua|tiga|empat|lima|enam|tujuh|delapan)\s*jam/i.test(trimmedPrompt) ||
+        /\b(sejam|setengah jam)\b/i.test(trimmedPrompt) ||
+        /(?:tiga puluh|empat puluh lima|sembilan puluh)\s*(?:menit|mnt)/i.test(trimmedPrompt);
+
+      if (
+        (promptHasExplicitDuration || (baselinePlan.estimatedDurationMinutes && baselinePlan.estimatedDurationMinutes !== 60)) &&
+        baselinePlan.estimatedDurationMinutes
+      ) {
         sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
       } else if (!sanitizedPlan.estimatedDurationMinutes || sanitizedPlan.estimatedDurationMinutes <= 0) {
         sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes || 60;
@@ -309,6 +329,11 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       if (baselinePlan.deadlineAt) {
         sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
         sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
+      }
+
+      // 5b. Multi-day explicit reasoning override
+      if (baselinePlan.targetDays && baselinePlan.targetDays.length > 1) {
+        sanitizedPlan.reasoning = baselinePlan.reasoning;
       }
 
       // 6. Title and Description Sanitization:

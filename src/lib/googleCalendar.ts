@@ -306,3 +306,101 @@ export async function deleteGoogleCalendarEvent(
     throw new Error(`Gagal menghapus event dari Google Calendar (${res.status}): ${sanitized}`);
   }
 }
+
+export interface BatchCreateEventItem {
+  id: string; // local session or task id
+  title: string;
+  description?: string;
+  startAt: string;
+  endAt: string;
+  timezone?: string;
+  isAllDay?: boolean;
+}
+
+export interface BatchCreateResult {
+  success: boolean;
+  totalRequested: number;
+  successfulCount: number;
+  failedCount: number;
+  results: Array<{
+    localId: string;
+    googleCalendarEventId?: string;
+    htmlLink?: string;
+    error?: string;
+  }>;
+}
+
+/**
+ * Mengunggah agenda masa depan ke Google Calendar secara efisien dalam chunk batch
+ * untuk menghemat kuota API Google Calendar dan meminimalkan latensi jaringan.
+ */
+export async function batchCreateGoogleCalendarEvents(
+  accessToken: string,
+  events: BatchCreateEventItem[],
+  chunkSize: number = 5
+): Promise<BatchCreateResult> {
+  if (!accessToken || !accessToken.trim()) {
+    throw new Error('Token Google Calendar tidak tersedia (HTTP 401). Silakan hubungkan ulang akun Google Anda.');
+  }
+
+  if (!events || events.length === 0) {
+    return {
+      success: true,
+      totalRequested: 0,
+      successfulCount: 0,
+      failedCount: 0,
+      results: [],
+    };
+  }
+
+  const results: Array<{
+    localId: string;
+    googleCalendarEventId?: string;
+    htmlLink?: string;
+    error?: string;
+  }> = [];
+
+  for (let i = 0; i < events.length; i += chunkSize) {
+    const chunk = events.slice(i, i + chunkSize);
+    const chunkPromises = chunk.map(async (ev) => {
+      try {
+        const created = await createGoogleCalendarEvent(accessToken, {
+          title: ev.title,
+          description: ev.description,
+          startAt: ev.startAt,
+          endAt: ev.endAt,
+          timezone: ev.timezone,
+          isAllDay: ev.isAllDay,
+        });
+        return {
+          localId: ev.id,
+          googleCalendarEventId: created.id,
+          htmlLink: created.htmlLink,
+        };
+      } catch (err: any) {
+        return {
+          localId: ev.id,
+          error: err.message || 'Gagal menyimpan agenda ke Google Calendar.',
+        };
+      }
+    });
+
+    const chunkResults = await Promise.all(chunkPromises);
+    results.push(...chunkResults);
+
+    if (i + chunkSize < events.length) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  const successfulCount = results.filter((r) => Boolean(r.googleCalendarEventId)).length;
+  const failedCount = results.filter((r) => Boolean(r.error)).length;
+
+  return {
+    success: successfulCount > 0,
+    totalRequested: events.length,
+    successfulCount,
+    failedCount,
+    results,
+  };
+}

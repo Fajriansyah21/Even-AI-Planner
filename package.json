@@ -12,6 +12,8 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/utilities": "^3.2.2",
     "@google/genai": "^2.4.0",
     "@hookform/resolvers": "^5.2.1",
     "@types/cors": "^2.8.19",

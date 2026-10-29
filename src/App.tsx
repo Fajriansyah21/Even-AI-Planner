@@ -682,6 +682,58 @@ export default function App() {
     );
   };
 
+  // Schedule a task to an exact slot chosen via Drag and Drop or slot click
+  const handleScheduleTaskToSlot = async (taskId: string, startIso: string, endIso: string) => {
+    const targetTask = tasks.find((t) => t.id === taskId);
+    if (!targetTask) return;
+
+    const currentUserId = userId || targetTask.userId || 'user-default';
+    const duration = Math.round((new Date(endIso).getTime() - new Date(startIso).getTime()) / 60000);
+
+    const sessionId = `sess-${taskId}-${Date.now()}`;
+    const scheduledSession: TaskScheduleSession = {
+      id: sessionId,
+      taskId: targetTask.id,
+      taskTitle: targetTask.title,
+      sessionIndex: 1,
+      totalSessions: 1,
+      startAt: startIso,
+      endAt: endIso,
+      durationMinutes: duration > 0 ? duration : targetTask.estimatedDurationMinutes || 60,
+      status: 'SCHEDULED',
+      syncStatus: 'pending',
+    };
+
+    const updatedTask: Task = {
+      ...targetTask,
+      userId: currentUserId,
+      status: 'SCHEDULED',
+      timeConstraintType: 'fixed_event',
+      requestedStartAt: startIso,
+      requestedEndAt: endIso,
+      scheduledSessions: [scheduledSession],
+    };
+
+    setTasks((prev) => prev.map((t) => (t.id === taskId ? updatedTask : t)));
+
+    if (userId && userId !== 'user-default') {
+      try {
+        await setDoc(doc(db, 'users', userId, 'tasks', taskId), sanitizeForFirestore(updatedTask));
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${taskId}`);
+      }
+    }
+
+    const startFormatted = formatInTimezone(new Date(startIso), preferences.timezone || 'Asia/Jakarta', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    showToast(`Kegiatan "${targetTask.title}" dijadwalkan pada ${startFormatted} WIB.`, 'success');
+  };
+
   // Schedule Single Task
   const handleScheduleSingleTask = (task: Task) => {
     const res = scheduleTaskDeterministically(task, events, tasks, preferences);
@@ -1267,6 +1319,7 @@ export default function App() {
                     setIsTaskModalOpen(true);
                   }}
                   onOpenAIAssistant={() => setCurrentTab('ai')}
+                  onScheduleTaskToSlot={handleScheduleTaskToSlot}
                 />
               )}
 

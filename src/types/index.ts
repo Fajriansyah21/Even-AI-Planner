@@ -177,6 +177,35 @@ export interface ScheduleCalculationResult {
   };
 }
 
+export interface OptimalSlotSuggestion {
+  success: boolean;
+  taskId: string;
+  taskTitle: string;
+  recommendedSlot?: {
+    startAt: string; // ISO
+    endAt: string;   // ISO
+    durationMinutes: number;
+    dayName: string;
+    timeRangeStr: string;
+  };
+  productivityScore: number; // 0 - 100
+  historicalAnalysis: {
+    peakProductivityWindow: 'MORNING' | 'AFTERNOON' | 'EVENING';
+    completionRateInWindow: number; // 0 - 100 (%)
+    bestDayOfWeek: string;          // e.g. "Selasa"
+    totalCompletedAnalyzed: number;
+    totalMissedAnalyzed: number;
+  };
+  reasoning: string;
+  alternativeSlots?: {
+    startAt: string;
+    endAt: string;
+    durationMinutes: number;
+    score: number;
+    label: string;
+  }[];
+}
+
 export interface AIPlanDraft {
   title: string;
   description?: string;
