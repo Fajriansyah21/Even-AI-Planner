@@ -8,6 +8,7 @@ import {
 import {
   scheduleTaskDeterministically,
   scheduleAllPendingTasks,
+  verifyAndNormalizeReferenceDate,
 } from '../src/lib/scheduler';
 import { markMissedTaskAsCompleted } from '../src/lib/activityStatusManager';
 import {
@@ -571,17 +572,26 @@ export function runAiSchedulerSuite() {
   if (c23.plan.estimatedDurationMinutes !== 180) {
     throw new Error(`Kasus 23 Gagal: Durasi per hari harus tetap 180 menit, didapat ${c23.plan.estimatedDurationMinutes}`);
   }
-  console.log('✅ Kasus 23 LULUS: Alokasi 180 menit penuh di setiap hari.');
+  // --- KASUS 24 (Utilitas Pemeriksaan Zona Waktu ReferenceDate) ---
+  console.log('\n>>> [24/24] Kasus 24: Utilitas verifikasi zona waktu referenceDate selalu merujuk Asia/Jakarta');
+  const tzCheck = verifyAndNormalizeReferenceDate(MOCK_REFERENCE_DATE, 'Asia/Jakarta');
+  if (!tzCheck.isJakartaTimezone) {
+    throw new Error('Kasus 24 Gagal: isJakartaTimezone harus bernilai true untuk Asia/Jakarta!');
+  }
+  if (tzCheck.parts.year !== 2024 || tzCheck.parts.month !== 5 || tzCheck.parts.day !== 20 || tzCheck.parts.hour !== 16) {
+    throw new Error(`Kasus 24 Gagal: Komponen waktu di Asia/Jakarta harus 2024-05-20 pukul 16:00, didapat ${tzCheck.parts.year}-${tzCheck.parts.month}-${tzCheck.parts.day} ${tzCheck.parts.hour}:${tzCheck.parts.minute}`);
+  }
+  console.log('✅ Kasus 24 LULUS: Utilitas verifyAndNormalizeReferenceDate memastikan referenceDate selalu presisi pada Asia/Jakarta (20 Mei 2024, 16:00 WIB).');
 
   console.log('\n========================================================================');
-  console.log('🎉 SELURUH 23 PENGUJIAN AI SCHEDULER & TEMPORAL PARSER BERHASIL 100%! 🎉');
+  console.log('🎉 SELURUH 24 PENGUJIAN AI SCHEDULER, TIMEZONE & PARSER BERHASIL 100%! 🎉');
   console.log('========================================================================\n');
 }
 
 // Integrasi Vitest Runner jika dijalankan via vitest
 if (process.env.VITEST) {
   describe('AI Scheduler & Temporal Parser Automated Regression', () => {
-    it('menjalankan seluruh 23 kasus pengujian AI scheduler dan temporal parser secara menyeluruh', () => {
+    it('menjalankan seluruh 24 kasus pengujian AI scheduler dan temporal parser secara menyeluruh', () => {
       expect(() => runAiSchedulerSuite()).not.toThrow();
     });
   });

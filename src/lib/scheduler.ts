@@ -37,6 +37,46 @@ function formatTime(d: Date, tz: string = 'Asia/Jakarta'): string {
 }
 
 /**
+ * Utilitas pemeriksaan zona waktu scheduler:
+ * Memverifikasi dan menormalisasi referenceDate agar selalu merujuk pada zona waktu target
+ * (Asia/Jakarta sebagai domain utama EVEN) sebelum memproses perhitungan jadwal,
+ * guna menghindari kesalahan offset waktu atau pergeseran tanggal akibat lingkungan runner.
+ */
+export function verifyAndNormalizeReferenceDate(
+  referenceDate: Date = new Date(),
+  targetTimezone: string = 'Asia/Jakarta'
+): {
+  normalizedDate: Date;
+  timezone: string;
+  isJakartaTimezone: boolean;
+  parts: ReturnType<typeof getPartsInTimezone>;
+} {
+  const tz = parseTimezoneString(targetTimezone || 'Asia/Jakarta');
+  const isJakartaTimezone = tz === 'Asia/Jakarta' || tz.includes('Jakarta');
+
+  // Ekstrak komponen tanggal dan jam secara presisi pada zona waktu target
+  const parts = getPartsInTimezone(referenceDate, tz);
+
+  // Rekonstruksi ISO absolut yang terikat langsung pada zona waktu target
+  const iso = createIsoInTimezone(
+    parts.year,
+    parts.month,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+    tz
+  );
+
+  return {
+    normalizedDate: new Date(iso),
+    timezone: tz,
+    isJakartaTimezone,
+    parts,
+  };
+}
+
+/**
  * Deterministic Scheduler Engine for EVEN
  * Strictly respects:
  * 1. Fixed events: Cannot be shifted; placed precisely at requestedStartAt - requestedEndAt; checks collisions.
@@ -53,7 +93,12 @@ export function scheduleTaskDeterministically(
   referenceDate: Date = new Date()
 ): ScheduleCalculationResult {
   const durationNeeded = task.estimatedDurationMinutes || 60;
-  const userTz = parseTimezoneString(task.timezone || preferences.timezone || 'Asia/Jakarta');
+  const { normalizedDate, timezone: userTz } = verifyAndNormalizeReferenceDate(
+    referenceDate,
+    task.timezone || preferences.timezone || 'Asia/Jakarta'
+  );
+  // Gunakan normalizedDate terverifikasi
+  referenceDate = normalizedDate;
 
   // -------------------------------------------------------------
   // 1. HARD CONSTRAINT: MULTI-DAY FIXED COMMITMENTS (targetOccurrences or targetDays)
@@ -1221,7 +1266,11 @@ export function suggestOptimalSlot(
   referenceDate: Date = new Date()
 ): OptimalSlotSuggestion {
   const durationNeeded = task.estimatedDurationMinutes || 60;
-  const userTz = parseTimezoneString(task.timezone || preferences.timezone || 'Asia/Jakarta');
+  const { normalizedDate, timezone: userTz } = verifyAndNormalizeReferenceDate(
+    referenceDate,
+    task.timezone || preferences.timezone || 'Asia/Jakarta'
+  );
+  referenceDate = normalizedDate;
 
   // 1. Analisis riwayat produktivitas pengguna
   const windowStats = {

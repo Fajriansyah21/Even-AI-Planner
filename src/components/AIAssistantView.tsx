@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Sparkles,
   Send,
@@ -14,6 +14,9 @@ import {
   Loader2,
   Info,
   RotateCcw,
+  XCircle,
+  CircleDot,
+  CheckCircle,
 } from 'lucide-react';
 import { Task, CalendarEvent, UserPreferences, AIPlanDraft, ScheduleCalculationResult } from '../types';
 import { scheduleTaskDeterministically } from '../lib/scheduler';
@@ -28,7 +31,47 @@ interface AIAssistantViewProps {
   onNavigateToCalendar: () => void;
 }
 
-type LoadingPhase = 'idle' | 'interpreting' | 'checking_slots' | 'saving_calendar';
+export type LoadingPhase =
+  | 'idle'
+  | 'reading'
+  | 'analyzing'
+  | 'drafting'
+  | 'checking_slots'
+  | 'saving_calendar';
+
+export interface LoadingStepConfig {
+  phase: 'reading' | 'analyzing' | 'drafting' | 'checking_slots';
+  stepNumber: number;
+  label: string;
+  detail: string;
+}
+
+export const LOADING_STEPS: LoadingStepConfig[] = [
+  {
+    phase: 'reading',
+    stepNumber: 1,
+    label: 'Membaca Instruksi',
+    detail: 'Memvalidasi format teks dan kelengkapan permintaan Anda...',
+  },
+  {
+    phase: 'analyzing',
+    stepNumber: 2,
+    label: 'Menganalisis Maksud & Waktu',
+    detail: 'Menafsirkan kegiatan, durasi, jam, dan konteks waktu Asia/Jakarta...',
+  },
+  {
+    phase: 'drafting',
+    stepNumber: 3,
+    label: 'Menyusun Usulan Rencana',
+    detail: 'Menghubungi AI Gemini untuk menyusun draf jadwal terstruktur...',
+  },
+  {
+    phase: 'checking_slots',
+    stepNumber: 4,
+    label: 'Memeriksa Konflik Jadwal',
+    detail: 'Menjalankan scheduler deterministik menguji slot kalender bebas benturan...',
+  },
+];
 
 export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   tasks,
@@ -47,7 +90,29 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const [planSource, setPlanSource] = useState<'gemini' | 'rule_fallback_on_error' | 'rule_fallback'>('gemini');
   const [appliedSuccess, setAppliedSuccess] = useState(false);
 
-  const isAnalyzing = loadingPhase === 'interpreting' || loadingPhase === 'checking_slots';
+  // Active cancellation and timer references to prevent race conditions and memory leaks
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const timeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+      if (timeoutTimerRef.current) {
+        clearTimeout(timeoutTimerRef.current);
+        timeoutTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const isAnalyzing =
+    loadingPhase === 'reading' ||
+    loadingPhase === 'analyzing' ||
+    loadingPhase === 'drafting' ||
+    loadingPhase === 'checking_slots';
   const isSaving = loadingPhase === 'saving_calendar';
 
   const userTimezone = preferences.timezone
@@ -61,6 +126,19 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     'Membaca ringkasan kontrak hukum 45 menit besok pagi sebelum makan siang.',
   ];
 
+  const handleCancelAnalysis = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    if (timeoutTimerRef.current) {
+      clearTimeout(timeoutTimerRef.current);
+      timeoutTimerRef.current = null;
+    }
+    setLoadingPhase('idle');
+    setErrorMessage('Proses analisis dibatalkan oleh pengguna.');
+  };
+
   const handlePlanSubmit = async (text: string) => {
     const trimmed = text.trim();
     if (!trimmed || isAnalyzing || isSaving) return;
@@ -69,33 +147,53 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     setPromptInput(text);
     setLastSubmittedPrompt(trimmed);
 
-    setLoadingPhase('interpreting');
+    // Abort previous running request if any
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    if (timeoutTimerRef.current) {
+      clearTimeout(timeoutTimerRef.current);
+      timeoutTimerRef.current = null;
+    }
+
+    // Step 1: Membaca instruksi & validasi
+    setLoadingPhase('reading');
     setErrorMessage('');
     setWarningMessage('');
     setProposedPlan(null);
     setScheduleTestResult(null);
     setAppliedSuccess(false);
 
+    // Step 2: Menganalisis konteks waktu lokal & preferensi
+    setLoadingPhase('analyzing');
+    const now = new Date();
+    const effectiveTimezone = preferences.timezone
+      ? preferences.timezone.split(' ')[0]
+      : 'Asia/Jakarta';
+
+    const userLocalTimeStr = now.toLocaleDateString('id-ID', {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+    // Step 3: Menyusun usulan rencana (Gemini API via server proxy)
+    setLoadingPhase('drafting');
     const abortController = new AbortController();
-    const clientTimeoutId = setTimeout(() => {
+    abortControllerRef.current = abortController;
+    let didTimeout = false;
+
+    // Timeout disinkronkan tepat 30 detik (30000ms)
+    timeoutTimerRef.current = setTimeout(() => {
+      didTimeout = true;
       abortController.abort();
-    }, 35000); // 35-second client timeout
+    }, 30000);
 
     try {
-      const now = new Date();
-      const userTimezone = preferences.timezone
-        ? preferences.timezone.split(' ')[0]
-        : 'Asia/Jakarta';
-
-      const userLocalTimeStr = now.toLocaleDateString('id-ID', {
-        weekday: 'long',
-        day: 'numeric',
-        month: 'long',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-
       const response = await fetch('/api/gemini/plan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -104,7 +202,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
           userPrompt: trimmed,
           currentDateTime: now.toISOString(),
           userLocalTimeStr,
-          userTimezone,
+          userTimezone: effectiveTimezone,
           workHours: {
             workStartHour: preferences.workStartHour,
             workEndHour: preferences.workEndHour,
@@ -112,7 +210,10 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         }),
       });
 
-      clearTimeout(clientTimeoutId);
+      if (timeoutTimerRef.current) {
+        clearTimeout(timeoutTimerRef.current);
+        timeoutTimerRef.current = null;
+      }
 
       let data: any = null;
       try {
@@ -131,10 +232,10 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       }
 
       const plan: AIPlanDraft = data.plan;
-      setPlanSource(data.source || (data.isAiGenerated ? 'gemini' : 'rule_fallback_on_error'));
-      setProposedPlan(plan);
+      const resolvedSource = data.source || (data.isAiGenerated ? 'gemini' : 'rule_fallback_on_error');
+      setPlanSource(resolvedSource);
 
-      // Phase 2: Memeriksa waktu kosong via scheduler
+      // Step 4: Memeriksa konflik ketersediaan slot via scheduler deterministik
       setLoadingPhase('checking_slots');
 
       if (plan.isOperational) {
@@ -171,21 +272,32 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         targetDays: plan.targetDays,
         targetOccurrences: plan.targetOccurrences,
         preferredWindow: plan.preferredWindow,
-        timezone: plan.timezone || userTimezone,
+        timezone: plan.timezone || effectiveTimezone,
         createdAt: new Date().toISOString(),
       };
 
       const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
+
+      // Step 5: Tampilkan hasil secara lengkap setelah uji slot selesai
+      setProposedPlan(plan);
       setScheduleTestResult(schedRes);
     } catch (err: any) {
       if (err.name === 'AbortError') {
-        setErrorMessage('Permintaan dibatalkan karena melebihi batas waktu (timeout 20 detik). Silakan coba lagi.');
+        if (didTimeout) {
+          setErrorMessage('Permintaan dibatalkan karena melebihi batas waktu (timeout 30 detik). Silakan coba lagi.');
+        } else {
+          setErrorMessage('Proses analisis dibatalkan oleh pengguna.');
+        }
       } else {
         const safeMessage = formatUserErrorMessage(undefined, undefined, err?.message);
         setErrorMessage(safeMessage);
       }
     } finally {
-      clearTimeout(clientTimeoutId);
+      if (timeoutTimerRef.current) {
+        clearTimeout(timeoutTimerRef.current);
+        timeoutTimerRef.current = null;
+      }
+      abortControllerRef.current = null;
       setLoadingPhase('idle');
     }
   };
@@ -249,18 +361,22 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     }
   };
 
-  const getPhaseText = (): string => {
-    switch (loadingPhase) {
-      case 'interpreting':
-        return 'Menafsirkan permintaan...';
+  const getStepIndex = (phase: LoadingPhase): number => {
+    switch (phase) {
+      case 'reading':
+        return 1;
+      case 'analyzing':
+        return 2;
+      case 'drafting':
+        return 3;
       case 'checking_slots':
-        return 'Memeriksa waktu kosong...';
-      case 'saving_calendar':
-        return 'Menyimpan ke Google Calendar...';
+        return 4;
       default:
-        return '';
+        return 0;
     }
   };
+
+  const currentStepNumber = getStepIndex(loadingPhase);
 
   return (
     <div className="flex-1 flex flex-col h-full bg-[#F8FAFC] overflow-y-auto p-4 sm:p-6">
@@ -312,11 +428,96 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             </button>
           </div>
 
-          {/* Phase loading indicator */}
-          {loadingPhase !== 'idle' && (
-            <div className="flex items-center gap-2 px-3 py-2 bg-[#EAF3FC] text-[#2457A7] text-xs font-medium rounded-xl animate-in fade-in">
+          {/* Stepper Progres Analisis Multi-Tahap (Jujur & Transparan) */}
+          {isAnalyzing && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="p-4 bg-[#F8FAFC] border border-[#2457A7]/25 rounded-2xl space-y-4 animate-in fade-in"
+            >
+              <div className="flex items-center justify-between border-b border-[#D9E3EF] pb-3">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-lg bg-[#EAF3FC] text-[#2457A7]">
+                    <Sparkles size={16} className="animate-pulse" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs font-bold text-[#172B42]">
+                      Memproses Penjadwalan
+                    </h3>
+                    <p className="text-[11px] text-[#53657A]">
+                      Tahap {currentStepNumber} dari 4: {LOADING_STEPS.find((s) => s.stepNumber === currentStepNumber)?.label}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCancelAnalysis}
+                  className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-[#53657A] hover:text-[#C43D4B] hover:bg-red-50 rounded-lg transition-colors border border-transparent hover:border-[#C43D4B]/30"
+                  title="Batalkan proses analisis saat ini"
+                >
+                  <XCircle size={14} />
+                  <span>Batalkan</span>
+                </button>
+              </div>
+
+              {/* Step indicator items */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                {LOADING_STEPS.map((step) => {
+                  const isDone = currentStepNumber > step.stepNumber;
+                  const isCurrent = currentStepNumber === step.stepNumber;
+
+                  return (
+                    <div
+                      key={step.phase}
+                      className={`p-2.5 rounded-xl border text-left transition-all ${
+                        isCurrent
+                          ? 'bg-white border-[#2457A7] shadow-xs ring-1 ring-[#2457A7]/20'
+                          : isDone
+                          ? 'bg-[#EAF3FC]/40 border-[#16856B]/30'
+                          : 'bg-white/50 border-[#D9E3EF]/70 opacity-60'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        {isDone ? (
+                          <CheckCircle2 size={15} className="text-[#16856B] shrink-0" />
+                        ) : isCurrent ? (
+                          <Loader2 size={15} className="text-[#2457A7] animate-spin shrink-0" />
+                        ) : (
+                          <div className="w-4 h-4 rounded-full border border-[#53657A]/40 flex items-center justify-center text-[10px] font-bold text-[#53657A] shrink-0">
+                            {step.stepNumber}
+                          </div>
+                        )}
+                        <span
+                          className={`text-xs font-bold ${
+                            isCurrent
+                              ? 'text-[#2457A7]'
+                              : isDone
+                              ? 'text-[#16856B]'
+                              : 'text-[#53657A]'
+                          }`}
+                        >
+                          {step.label}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-[#53657A] leading-tight mt-1 pl-6">
+                        {step.detail}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Saving phase indicator */}
+          {isSaving && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="flex items-center gap-2 px-3 py-2 bg-[#EAF3FC] text-[#2457A7] text-xs font-medium rounded-xl animate-in fade-in"
+            >
               <Loader2 size={14} className="animate-spin" />
-              <span>{getPhaseText()}</span>
+              <span>Menyimpan jadwal ke Google Calendar...</span>
             </div>
           )}
 

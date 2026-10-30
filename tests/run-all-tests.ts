@@ -11,6 +11,7 @@ import { runCriticalBugsValidationTests } from './critical-bugs-validation.test'
 import { runMarkMissedCompletedTests } from './mark-missed-completed.test';
 import { runAllAiSchedulerRegressionTests } from './ai-reasoning-and-scheduler-regression.test';
 import { runAiSchedulerSuite } from './aiScheduler.test';
+import { runLoadingUxTests } from './loadingUx.test';
 
 async function main() {
   console.log('================================================================');
@@ -19,56 +20,60 @@ async function main() {
 
   try {
     // 1. Core Parser & Deterministic Scheduler Suite
-    console.log('>>> [1/10] Parser & Scheduler Test Suite...');
+    console.log('>>> [1/14] Parser & Scheduler Test Suite...');
     await import('./parser-scheduler.test');
 
     // 2. Night Scheduling & Asia/Jakarta Timezone Suite
-    console.log('\n>>> [2/10] Night Scheduling & Timezone Suite...');
+    console.log('\n>>> [2/14] Night Scheduling & Timezone Suite...');
     await runNightAndTimezoneTests();
 
     // 3. Gemini Error Classification & Exponential Backoff Suite
-    console.log('\n>>> [3/10] Gemini Error Handling & Resilience Suite...');
+    console.log('\n>>> [3/14] Gemini Error Handling & Resilience Suite...');
     await import('./gemini-error-handling.test');
 
     // 4. Auth Integrity & Zero Fake Login Suite
-    console.log('\n>>> [4/10] Auth Integrity & Status Truth Suite...');
+    console.log('\n>>> [4/14] Auth Integrity & Status Truth Suite...');
     await import('./auth-and-truth.test');
 
     // 5. Calendar Vertical Position & Scale Mapping Suite
-    console.log('\n>>> [5/10] Calendar Vertical Position Mapping Suite...');
+    console.log('\n>>> [5/14] Calendar Vertical Position Mapping Suite...');
     runCalendarVerticalPositionTests();
 
     // 6. Activity History & Status Automation Suite
-    console.log('\n>>> [6/10] Activity History & Automated Status Suite...');
+    console.log('\n>>> [6/14] Activity History & Automated Status Suite...');
     await runActivityHistoryAndStatusTests();
 
     // 7. Google Calendar Mock Read/Write Suite
-    console.log('\n>>> [7/10] Google Calendar Mock API Suite...');
+    console.log('\n>>> [7/14] Google Calendar Mock API Suite...');
     await runGoogleCalendarUnitTests();
 
     // 8. Scheduling Bugs Audit & Multi-day Fix Suite
-    console.log('\n>>> [8/10] Scheduling Bugs Audit & Multi-day Fix Suite...');
+    console.log('\n>>> [8/14] Scheduling Bugs Audit & Multi-day Fix Suite...');
     await runSchedulingBugsTests();
 
     // 9. Scheduling Reliability Patch & Optimal Slot Suite
-    console.log('\n>>> [9/10] Scheduling Reliability Patch & Optimal Slot Suite...');
+    console.log('\n>>> [9/14] Scheduling Reliability Patch & Optimal Slot Suite...');
     await runSchedulingReliabilityPatchTests();
 
     // 10. Critical Bugs & Regression Validation Suite
-    console.log('\n>>> [10/12] Critical Bugs & Regression Validation Suite...');
+    console.log('\n>>> [10/14] Critical Bugs & Regression Validation Suite...');
     runCriticalBugsValidationTests();
 
     // 11. Mark Missed Activity as Completed Suite
-    console.log('\n>>> [11/12] Mark Missed Task as Completed Suite...');
+    console.log('\n>>> [11/14] Mark Missed Task as Completed Suite...');
     runMarkMissedCompletedTests();
 
     // 12. Full AI Reasoning & Deterministic Scheduler Regression Suite
-    console.log('\n>>> [12/13] Full AI Reasoning & Scheduler Regression Suite...');
+    console.log('\n>>> [12/14] Full AI Reasoning & Scheduler Regression Suite...');
     runAllAiSchedulerRegressionTests();
 
     // 13. Comprehensive AI Scheduler & Mock 2024 Reference Suite
-    console.log('\n>>> [13/13] Comprehensive AI Scheduler Suite (tests/aiScheduler.test.ts)...');
+    console.log('\n>>> [13/14] Comprehensive AI Scheduler Suite (tests/aiScheduler.test.ts)...');
     runAiSchedulerSuite();
+
+    // 14. AI Analysis Loading UX & Honest Fallback Suite
+    console.log('\n>>> [14/14] Loading UX, AI Analysis Stages & Fallback Transparency Suite...');
+    await runLoadingUxTests();
 
     // Real Google Calendar Integration (Opt-in Check)
     console.log('\n>>> [Opsi] Pengujian Integrasi Google Calendar Nyata...');
