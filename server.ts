@@ -61,6 +61,18 @@ async function startServer() {
       // Calculate baseline deterministic rule-based plan
       const baselinePlan = parseIndonesianTemporalRules(ctx);
 
+      // Jika instruksi adalah intent operasional (seperti mencari slot kosong atau memindahkan jadwal bentrok)
+      if (baselinePlan.isOperational) {
+        const elapsedMs = Date.now() - startTime;
+        console.log(`[AI Plan Diagnostics] Duration: ${elapsedMs}ms | Intent: Operational (${baselinePlan.operationalAction})`);
+        return res.json({
+          success: true,
+          isAiGenerated: false,
+          source: 'operational_intent',
+          plan: baselinePlan,
+        });
+      }
+
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
         const elapsedMs = Date.now() - startTime;
@@ -331,9 +343,13 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
       }
 
-      // 5b. Multi-day explicit reasoning override
+      // 5b. Multi-day explicit reasoning override and duration ambiguity
       if (baselinePlan.targetDays && baselinePlan.targetDays.length > 1) {
         sanitizedPlan.reasoning = baselinePlan.reasoning;
+        sanitizedPlan.isDurationAmbiguous = baselinePlan.isDurationAmbiguous;
+        sanitizedPlan.totalDurationMinutes = baselinePlan.totalDurationMinutes;
+        sanitizedPlan.durationPerDayMinutes = baselinePlan.durationPerDayMinutes;
+        sanitizedPlan.clarificationPrompt = baselinePlan.clarificationPrompt;
       }
 
       // 6. Title and Description Sanitization:

@@ -94,6 +94,8 @@ export interface Task {
   rescheduledFromTaskId?: string;
   dismissedAt?: string;
   statusHistory?: StatusHistoryEntry[];
+  isDurationAmbiguous?: boolean;
+  clarificationPrompt?: string;
 }
 
 export interface CalendarEvent {
@@ -229,6 +231,13 @@ export interface AIPlanDraft {
   allowSplit: boolean;
   minimumSessionMinutes: number;
   reasoning: string;
+  isOperational?: boolean;
+  operationalAction?: 'find_free_slot' | 'resolve_conflicts' | 'view_schedule' | 'other';
+  operationalMessage?: string;
+  isDurationAmbiguous?: boolean;
+  totalDurationMinutes?: number;
+  durationPerDayMinutes?: number;
+  clarificationPrompt?: string;
 }
 
 export interface KeepChecklistItem {

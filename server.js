@@ -143,11 +143,39 @@ function toTitleCase(str) {
     return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
   }).join(" ");
 }
+function detectOperationalIntent(prompt) {
+  const p = prompt.trim().toLowerCase();
+  const isFindSlot = /\b(?:cari(?:kan)?|tunjuk(?:kan)?|lihat|cek)\s*(?:kan)?\s*(?:waktu|slot)?\s*(?:terdekat\s+yang\s+kosong|slot\s+kosong|waktu\s+luang|waktu\s+kosong|jadwal\s+kosong)\b/i.test(p) || /\b(?:kapan\s+(?:saya\s+)?(?:ada\s+)?(?:waktu\s+luang|slot\s+kosong|free\s+time))\b/i.test(p) || /^(?:tunjukkan|cari)\s+slot\s+kosong/i.test(p);
+  if (isFindSlot) {
+    return {
+      isOperational: true,
+      operationalAction: "find_free_slot",
+      operationalMessage: "Instruksi Anda adalah untuk mencari atau menampilkan slot waktu kosong pada jadwal Anda, bukan untuk membuat agenda kegiatan baru. Silakan periksa tampilan Kalender atau gunakan fitur saran slot optimal untuk memilih waktu pengerjaan yang tersedia."
+    };
+  }
+  const isResolveConflict = /\b(?:pindah(?:kan)?|geser|jadwalkan\s+ulang|atur\s+ulang|selesaikan|atasi)\s*(?:semua|seluruh)?\s*(?:jadwal|rapat|kegiatan|agenda)?\s*(?:yang\s+)?(?:bentrok|bertabrakan|konflik)\b/i.test(p);
+  if (isResolveConflict) {
+    return {
+      isOperational: true,
+      operationalAction: "resolve_conflicts",
+      operationalMessage: "Instruksi Anda adalah tindakan pemindahan atau penyelesaian jadwal yang saling bertabrakan (bentrok), bukan untuk menambahkan kegiatan baru. Sistem EVEN menjaga komitmen waktu tetap agar tidak digeser sepihak tanpa konfirmasi. Silakan buka tampilan Kalender atau Riwayat untuk meninjau dan menjadwalkan ulang kegiatan terkait secara terarah."
+    };
+  }
+  const isViewSchedule = /^(?:tampil(?:kan)?|lihat|buka)\s+(?:jadwal|kalender|agenda)\s*(?:saya|hari\s+ini|besok|minggu\s+ini)?$/i.test(p);
+  if (isViewSchedule) {
+    return {
+      isOperational: true,
+      operationalAction: "view_schedule",
+      operationalMessage: "Instruksi Anda adalah untuk meninjau jadwal kegiatan yang sudah ada. Anda dapat langsung membuka tab Kalender atau Daftar Kegiatan."
+    };
+  }
+  return { isOperational: false };
+}
 function extractCleanActivityTitle(prompt, aiTitle) {
   if (aiTitle && typeof aiTitle === "string") {
     const trimmedAi = aiTitle.trim();
     const promptTrimmed = prompt.trim();
-    if (trimmedAi.length >= 3 && trimmedAi.length <= 60 && trimmedAi.toLowerCase() !== promptTrimmed.toLowerCase() && !/^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|bikin\s+jadwal)\b/i.test(trimmedAi)) {
+    if (trimmedAi.length >= 3 && trimmedAi.length <= 60 && trimmedAi.toLowerCase() !== promptTrimmed.toLowerCase() && !/^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|bikin\s+jadwal)\b/i.test(trimmedAi) && !/\b(setiap\s+belajar|setiap\s+senin|setiap\s+hari)\b/i.test(trimmedAi)) {
       return trimmedAi;
     }
   }
@@ -174,15 +202,16 @@ function extractCleanActivityTitle(prompt, aiTitle) {
     return `Melanjutkan ${subject}`;
   }
   let text = raw;
+  text = text.replace(/\b(?:setiap|tiap(?:\s+tiap)?|rutin|selalu|per\s+minggu)\b/gi, "");
   text = text.replace(
     /^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|bikin)?\s*(?:jadwal\s+)?(?:aku\s+|saya\s+|kami\s+)?(?:mau\s+|ingin\s+|pengen\s+|rencananya\s+)?(?:akan\s+ada\s+|ada\s+)?/i,
     ""
   );
   text = text.replace(
-    /\b(?:hari\s+)?(?:senin|selasa|rabu|kamis|jumat|jum'at|sabtu|minggu|ahad)(?:\s+(?:dan|sampai|hingga|-)\s+(?:senin|selasa|rabu|kamis|jumat|jum'at|sabtu|minggu|ahad))*\b/gi,
+    /\b(?:pada\s+hari|hari\s+)?(?:senin|selasa|rabu|kamis|jumat|jum'at|sabtu|minggu|ahad)(?:\s+(?:dan|sampai|hingga|s\/d|-|–)\s+(?:senin|selasa|rabu|kamis|jumat|jum'at|sabtu|minggu|ahad))*\b/gi,
     ""
   );
-  text = text.replace(/\b(?:besok\s+lusa|besok|lusa|kemarin|minggu\s+depan|hari\s+ini|nanti)\b/gi, "");
+  text = text.replace(/\b(?:besok\s+lusa|besok|lusa|kemarin|minggu\s+depan|minggu\s+ini|minggu\s+lalu|hari\s+ini|nanti)\b/gi, "");
   text = text.replace(
     /(?:dari\s+)?(?:jam|pukul)?\s*\d{1,2}(?:[:.]\d{2})?\s*(?:pagi|siang|sore|malam)?\s*(?:sampai|hingga|s\/d|-|–)\s*(?:jam|pukul)?\s*\d{1,2}(?:[:.]\d{2})?\s*(?:pagi|siang|sore|malam)?/gi,
     ""
@@ -194,11 +223,28 @@ function extractCleanActivityTitle(prompt, aiTitle) {
     /\b(?:selama\s+)?(?:\d+|satu|dua|tiga|empat|lima|enam|tujuh|delapan|sembilan|sepuluh|setengah)\s*(?:setengah)?\s*(?:jam|menit|mnt)\b/gi,
     ""
   );
-  text = text.replace(/\b(?:deadline[-a-zA-Z0-9]*|tenggat\s+waktu|paling\s+lambat)\s*(?:hari\s+\w+|\w+)?\b/gi, "");
+  text = text.replace(/\b(?:deadline[-a-zA-Z0-9]*|tenggat(?:\s+waktu)?|paling\s+lambat)\s*(?:hari\s+\w+|\w+)?\b/gi, "");
   text = text.replace(/\b(?:kalo|kalau|jika|bila)\s+belum\s+selesai\b/gi, "");
-  text = text.replace(/\b(?:akan\s+ada|ada|mau|selama)\b/gi, "");
+  text = text.replace(/\b(?:akan\s+ada|ada|mau|selama|dan|atau|serta|yang|untuk|ini|itu|pada|di|ke)\b/gi, "");
   text = text.replace(/[,;:.–—-]+/g, " ").replace(/\s+/g, " ").trim();
-  if (!text || text.length < 2) {
+  const invalidSingleWords = /* @__PURE__ */ new Set([
+    "setiap",
+    "tiap",
+    "dan",
+    "atau",
+    "ini",
+    "itu",
+    "jadwal",
+    "kegiatan",
+    "agenda",
+    "yang",
+    "untuk",
+    "akan",
+    "ada",
+    "mau",
+    "selama"
+  ]);
+  if (!text || text.length < 2 || invalidSingleWords.has(text.toLowerCase())) {
     return "Kegiatan Terjadwal";
   }
   return toTitleCase(text);
@@ -247,9 +293,37 @@ function parseIndonesianDayNames(prompt) {
   const p = prompt.toLowerCase();
   const days = [];
   const isRecurring = /\b(setiap|tiap|rutin|berulang|mingguan|per minggu|tiap-tiap|selalu)\b/i.test(prompt);
+  const deadlineClauseRegex = /(?:deadline(?:-nya)?|tenggat(?:\s+waktu)?|paling\s+lambat|sebelum|due(?:\s+date)?)\s*(?:hari\s+)?(senin|selasa|rabu|kamis|jumat|jum'at|sabtu|ahad|minggu)/i;
+  const deadlineMatch = p.match(deadlineClauseRegex);
+  let deadlineDay = void 0;
+  let promptForWorkDays = p;
+  if (deadlineMatch) {
+    const rawWord = deadlineMatch[1].toLowerCase();
+    const entry = INDONESIAN_WEEKDAYS.find((w) => w.name === rawWord);
+    const matchIndex = deadlineMatch.index || 0;
+    const matchFull = deadlineMatch[0].toLowerCase();
+    const afterMatch = p.slice(matchIndex + matchFull.length).trim();
+    const isWeekUnitPhrase = rawWord === "minggu" && !matchFull.includes("hari minggu") && /^(?:depan|ini|lalu|kemarin|berikutnya|lagi)\b/i.test(afterMatch);
+    if (!isWeekUnitPhrase) {
+      if (entry && entry.name !== "minggu") {
+        deadlineDay = {
+          dayIndex: entry.dayIndex,
+          dayName: DAY_NAMES_ID[entry.dayIndex],
+          rawKeyword: rawWord
+        };
+      } else if (rawWord === "minggu") {
+        deadlineDay = {
+          dayIndex: 0,
+          dayName: "Minggu",
+          rawKeyword: "minggu"
+        };
+      }
+      promptForWorkDays = p.replace(deadlineMatch[0], " ");
+    }
+  }
   const weekdayRegex = /\b(senin|selasa|rabu|kamis|jumat|jum'at|sabtu|ahad)\b/gi;
   let match;
-  while ((match = weekdayRegex.exec(p)) !== null) {
+  while ((match = weekdayRegex.exec(promptForWorkDays)) !== null) {
     const word = match[1].toLowerCase();
     const entry = INDONESIAN_WEEKDAYS.find((w) => w.name === word);
     if (entry && !days.some((d) => d.dayIndex === entry.dayIndex)) {
@@ -260,24 +334,51 @@ function parseIndonesianDayNames(prompt) {
       });
     }
   }
-  const sundayRegex = /\b(?:hari\s+minggu|minggu\s+(?:pagi|siang|sore|malam|jam|pukul|\d)|(?:dan|sampai|hingga|-)\s+minggu)\b|\bminggu\b(?!\s+depan)/gi;
-  if (sundayRegex.test(p)) {
-    if (!days.some((d) => d.dayIndex === 0)) {
-      days.push({
-        dayIndex: 0,
-        dayName: "Minggu",
-        rawKeyword: "minggu"
-      });
-    }
+  const isSundayExplicit = /\b(?:hari\s+minggu|minggu\s+(?:pagi|siang|sore|malam|subuh|jam|pukul|\d{1,2}[:.]\d{2})|(?:dan|sampai|hingga|s\/d|-|–)\s*minggu\b|\bminggu\s*(?:dan|sampai|hingga|s\/d|-|–)\s*(?:senin|selasa|rabu|kamis|jumat|jum'at|sabtu|ahad))\b/i.test(
+    promptForWorkDays
+  );
+  const isSundayStandalone = /\bminggu\b/i.test(promptForWorkDays) && !/\b(?:setiap|tiap|per|akhir|awal|tengah|sepanjang|dalam|\d+|satu|dua|tiga|empat|beberapa)\s+minggu\b/i.test(
+    promptForWorkDays
+  ) && !/\bminggu\s+(?:ini|depan|lalu|kemarin|berikutnya|lagi)\b/i.test(promptForWorkDays);
+  if ((isSundayExplicit || isSundayStandalone) && !days.some((d) => d.dayIndex === 0)) {
+    days.push({
+      dayIndex: 0,
+      dayName: "Minggu",
+      rawKeyword: "minggu"
+    });
   }
-  return { days, isRecurring };
+  return { days, isRecurring, deadlineDay };
 }
 function parseIndonesianTemporalRules(ctx) {
   const prompt = ctx.userPrompt.trim().toLowerCase();
   const tz = parseTimezoneString(ctx.userTimezone || "Asia/Jakarta");
+  const operationalResult = detectOperationalIntent(ctx.userPrompt);
+  if (operationalResult.isOperational) {
+    return {
+      title: "Permintaan Operasional",
+      description: operationalResult.operationalMessage || ctx.userPrompt,
+      estimatedDurationMinutes: 0,
+      timeConstraintType: "deadline_only",
+      isOperational: true,
+      operationalAction: operationalResult.operationalAction,
+      operationalMessage: operationalResult.operationalMessage,
+      reasoning: operationalResult.operationalMessage || "",
+      priority: "LOW",
+      allowSplit: false,
+      minimumSessionMinutes: 0,
+      timezone: tz
+    };
+  }
   const baseDate = ctx.currentDateTime ? new Date(ctx.currentDateTime) : /* @__PURE__ */ new Date();
   const baseParts = getPartsInTimezone(baseDate, tz);
-  const { days: detectedWeekdays, isRecurring: promptIsRecurring } = parseIndonesianDayNames(prompt);
+  const { days: detectedWeekdays, isRecurring: promptIsRecurring, deadlineDay: detectedDeadlineDay } = parseIndonesianDayNames(prompt);
+  if (detectedWeekdays.length > 1) {
+    detectedWeekdays.sort((a, b) => {
+      const offsetA = (a.dayIndex - baseParts.dayOfWeek + 7) % 7;
+      const offsetB = (b.dayIndex - baseParts.dayOfWeek + 7) % 7;
+      return offsetA - offsetB;
+    });
+  }
   let hasExplicitDayTarget = false;
   let dayOffset = 0;
   if (detectedWeekdays.length > 0) {
@@ -301,7 +402,10 @@ function parseIndonesianTemporalRules(ctx) {
     hasExplicitDayTarget = true;
   } else if (prompt.includes("minggu depan")) {
     dayOffset = 7;
-    hasExplicitDayTarget = true;
+    hasExplicitDayTarget = false;
+  } else if (prompt.includes("minggu ini")) {
+    dayOffset = 0;
+    hasExplicitDayTarget = false;
   } else if (prompt.includes("hari ini") || prompt.includes("malam ini") || prompt.includes("pagi ini") || prompt.includes("siang ini") || prompt.includes("sore ini")) {
     dayOffset = 0;
     hasExplicitDayTarget = true;
@@ -448,7 +552,8 @@ function parseIndonesianTemporalRules(ctx) {
   let requestedEndAt = void 0;
   let preferredWindow = void 0;
   let preferredTimeOfDay = "ANY";
-  const isFlexibleLearningOrTask = /\b(belajar|kerja|mengerjakan|tugas|baca|membaca|fokus|cicil)\b/i.test(prompt);
+  const isFlexibleLearningOrTask = /\b(belajar|kerja|mengerjakan|ngerjain|tugas|baca|membaca|fokus|cicil|desain|design|ngoding|coding|nulis|menulis|bikin|membuat|lanjut)\b/i.test(prompt);
+  const isAfterMagrib = /\b(habis\s+magrib|setelah\s+magrib|sehabis\s+magrib|ba'?da\s+magrib|magrib|habis\s+isya|setelah\s+isya|isya)\b/i.test(prompt);
   const isExactFixedEvent = fixedStartHour !== null && (hasExplicitRange || isCommitmentKeyword || !isFlexibleLearningOrTask && (prompt.includes("pukul") || prompt.includes("jam")) || prompt.includes("tidur pukul") || prompt.includes("tidur jam"));
   let targetOccurrences = void 0;
   let targetDays = detectedWeekdays.length > 0 ? detectedWeekdays.map((dw) => dw.dayIndex) : void 0;
@@ -518,6 +623,18 @@ function parseIndonesianTemporalRules(ctx) {
       0,
       tz
     );
+  } else if (isAfterMagrib) {
+    timeConstraintType = "preferred_window";
+    preferredWindow = {
+      startHour: 18,
+      startMinute: 30,
+      endHour: 23,
+      endMinute: 0,
+      label: "Habis Magrib / Malam (18:30 - 23:00)"
+    };
+    preferredTimeOfDay = "EVENING";
+    requestedStartAt = void 0;
+    requestedEndAt = void 0;
   } else if (prompt.includes("malam")) {
     timeConstraintType = "preferred_window";
     preferredWindow = { startHour: 19, startMinute: 0, endHour: 23, endMinute: 0, label: "Malam (19:00 - 23:00)" };
@@ -544,8 +661,40 @@ function parseIndonesianTemporalRules(ctx) {
     requestedEndAt = void 0;
   }
   let deadlineIso;
-  if (timeConstraintType === "fixed_event" && requestedEndAt) {
+  let deadlineDaysFromNow;
+  if (detectedDeadlineDay) {
+    const nextDeadlineDate = getNextValidDateForDayOfWeek(detectedDeadlineDay.dayIndex, baseDate, tz, {
+      targetHour: 23,
+      targetMinute: 59,
+      forceNextWeek: prompt.includes("depan")
+    });
+    deadlineDaysFromNow = Math.max(1, nextDeadlineDate.dayOffset);
+    deadlineIso = createIsoInTimezone(
+      nextDeadlineDate.year,
+      nextDeadlineDate.month,
+      nextDeadlineDate.day,
+      23,
+      59,
+      0,
+      tz
+    );
+  } else if (prompt.includes("minggu ini")) {
+    const daysUntilEndOfWeek = (7 - baseParts.dayOfWeek) % 7;
+    const endOfWeekObj = addDaysInTimezone(baseDate, daysUntilEndOfWeek, tz);
+    const endOfWeekParts = getPartsInTimezone(endOfWeekObj, tz);
+    deadlineDaysFromNow = Math.max(1, daysUntilEndOfWeek);
+    deadlineIso = createIsoInTimezone(
+      endOfWeekParts.year,
+      endOfWeekParts.month,
+      endOfWeekParts.day,
+      23,
+      59,
+      0,
+      tz
+    );
+  } else if (timeConstraintType === "fixed_event" && requestedEndAt) {
     deadlineIso = requestedEndAt;
+    deadlineDaysFromNow = Math.max(1, dayOffset);
   } else {
     const deadlineHour = preferredTimeOfDay === "EVENING" ? 23 : 18;
     deadlineIso = createIsoInTimezone(
@@ -557,6 +706,33 @@ function parseIndonesianTemporalRules(ctx) {
       0,
       tz
     );
+    deadlineDaysFromNow = Math.max(1, dayOffset);
+  }
+  let isDurationAmbiguous = false;
+  let totalDurationMinutes = void 0;
+  let durationPerDayMinutes = void 0;
+  let clarificationPrompt = void 0;
+  const isMultiDay = detectedWeekdays.length > 1;
+  const promptHasPerDayKeyword = /\b(per\s+hari|setiap\s+hari|tiap\s+hari|masing-masing|tiap\s+sesi|setiap\s+sesi)\b/i.test(prompt);
+  const promptHasTotalSplitKeyword = /\b(total|dibagi|dibagi\s+rata|dipecah|dicicil)\b/i.test(prompt);
+  if (isMultiDay && (durMatch || wordDurMatch)) {
+    if (promptHasTotalSplitKeyword) {
+      isDurationAmbiguous = false;
+      totalDurationMinutes = duration;
+      durationPerDayMinutes = Math.round(duration / detectedWeekdays.length);
+      duration = durationPerDayMinutes;
+    } else if (promptHasPerDayKeyword) {
+      isDurationAmbiguous = false;
+      durationPerDayMinutes = duration;
+      totalDurationMinutes = duration * detectedWeekdays.length;
+    } else {
+      isDurationAmbiguous = true;
+      totalDurationMinutes = duration;
+      durationPerDayMinutes = duration;
+      const hours = Math.round(duration / 60);
+      const splitMinutes = Math.round(duration / detectedWeekdays.length);
+      clarificationPrompt = `Apakah durasi ${hours} jam ini merupakan total yang dibagi rata untuk ${detectedWeekdays.length} hari (${splitMinutes} menit/hari), atau ${hours} jam penuh di setiap hari?`;
+    }
   }
   let priority = "MEDIUM";
   if (prompt.includes("urgent") || prompt.includes("segera") || prompt.includes("penting sekali")) {
@@ -566,7 +742,7 @@ function parseIndonesianTemporalRules(ctx) {
   } else if (prompt.includes("santai") || prompt.includes("low")) {
     priority = "LOW";
   }
-  const allowSplit = timeConstraintType !== "fixed_event" && (prompt.includes("bagi") || prompt.includes("sesi") || prompt.includes("cicil"));
+  const allowSplit = timeConstraintType !== "fixed_event" && (promptHasTotalSplitKeyword || prompt.includes("bagi") || prompt.includes("sesi") || prompt.includes("cicil"));
   const minSession = 30;
   const title = extractCleanActivityTitle(ctx.userPrompt);
   let reasoning = "";
@@ -576,10 +752,18 @@ function parseIndonesianTemporalRules(ctx) {
     } else {
       reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, "0") : "00"}:${String(fixedStartMin).padStart(2, "0")} - ${fixedEndHour ? String(fixedEndHour).padStart(2, "0") : "00"}:${String(fixedEndMin).padStart(2, "0")}) sehingga dijaga tanpa digeser.`;
     }
+  } else if (isDurationAmbiguous && clarificationPrompt) {
+    reasoning = `AI mendeteksi alokasi waktu pada ${detectedWeekdays.map((d) => d.dayName).join(" dan ")} dengan durasi ${duration} menit (${Math.round(duration / 60)} jam). ${clarificationPrompt}`;
+  } else if (detectedWeekdays.length > 1) {
+    if (promptHasTotalSplitKeyword && totalDurationMinutes && durationPerDayMinutes) {
+      reasoning = `Total waktu ${totalDurationMinutes} menit dibagi rata menjadi ${durationPerDayMinutes} menit per hari pada ${detectedWeekdays.map((d) => d.dayName).join(" dan ")}${preferredWindow ? ` (${preferredWindow.label})` : ""}${detectedDeadlineDay ? `, sebelum batas tenggat waktu hari ${detectedDeadlineDay.dayName}` : ""}.`;
+    } else {
+      reasoning = `Dua sesi pengerjaan dijadwalkan masing-masing berdurasi ${duration} menit (${Math.round(duration / 60)} jam) pada ${detectedWeekdays.map((d) => d.dayName).join(" dan ")}${preferredWindow ? ` (${preferredWindow.label})` : ""}${detectedDeadlineDay ? `, sebelum batas tenggat waktu hari ${detectedDeadlineDay.dayName}` : ""}.`;
+    }
   } else if (preferredWindow) {
     reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu ${preferredTimeOfDay === "EVENING" ? "santai atau fokus malam" : preferredTimeOfDay.toLowerCase()} Anda.`;
   } else {
-    reasoning = `AI menetapkan estimasi durasi ${duration} menit dengan tenggat waktu ${dayOffset === 0 ? "hari ini" : `${dayOffset} hari ke depan`}.`;
+    reasoning = `AI menetapkan estimasi durasi ${duration} menit dengan tenggat waktu ${deadlineDaysFromNow === 0 ? "hari ini" : `${deadlineDaysFromNow} hari ke depan`}.`;
   }
   return {
     title,
@@ -594,10 +778,14 @@ function parseIndonesianTemporalRules(ctx) {
     recurrenceRule: promptIsRecurring || detectedWeekdays.length > 1 ? "WEEKLY_ON_DAYS" : void 0,
     hasExplicitDayTarget,
     isDayAmbiguous: isCommitmentKeyword && !hasExplicitDayTarget,
+    isDurationAmbiguous,
+    totalDurationMinutes,
+    durationPerDayMinutes,
+    clarificationPrompt,
     preferredWindow,
     preferredTimeOfDay,
     deadlineAt: deadlineIso,
-    deadlineDaysFromNow: Math.max(1, dayOffset),
+    deadlineDaysFromNow,
     timezone: tz,
     priority,
     allowSplit,
@@ -807,6 +995,16 @@ async function startServer() {
         workHours
       };
       const baselinePlan = parseIndonesianTemporalRules(ctx);
+      if (baselinePlan.isOperational) {
+        const elapsedMs2 = Date.now() - startTime;
+        console.log(`[AI Plan Diagnostics] Duration: ${elapsedMs2}ms | Intent: Operational (${baselinePlan.operationalAction})`);
+        return res.json({
+          success: true,
+          isAiGenerated: false,
+          source: "operational_intent",
+          plan: baselinePlan
+        });
+      }
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
         const elapsedMs2 = Date.now() - startTime;
@@ -1005,6 +1203,8 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.allowSplit = false;
         if (baselinePlan.targetOccurrences) {
           sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
+        }
+        if (baselinePlan.targetDays) {
           sanitizedPlan.targetDays = baselinePlan.targetDays;
         }
       } else if (baselinePlan.timeConstraintType === "preferred_window") {
@@ -1017,12 +1217,20 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.timeConstraintType = "deadline_only";
         delete sanitizedPlan.requestedStartAt;
         delete sanitizedPlan.requestedEndAt;
+        delete sanitizedPlan.preferredWindow;
+        sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
+      }
+      if (baselinePlan.targetDays && baselinePlan.targetDays.length > 0) {
+        sanitizedPlan.targetDays = baselinePlan.targetDays;
+      }
+      if (baselinePlan.targetOccurrences && baselinePlan.targetOccurrences.length > 0) {
+        sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
       }
       if (baselinePlan.preferredTimeOfDay !== "ANY") {
         sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
       }
-      const promptHasExplicitDuration = /(\d+)\s*(?:menit|mnt|jam)/i.test(trimmedPrompt);
-      if (promptHasExplicitDuration && baselinePlan.estimatedDurationMinutes) {
+      const promptHasExplicitDuration = /(\d+)\s*(?:menit|mnt|jam)/i.test(trimmedPrompt) || /(?:selama\s+)?(se|satu|dua|tiga|empat|lima|enam|tujuh|delapan)\s*jam/i.test(trimmedPrompt) || /\b(sejam|setengah jam)\b/i.test(trimmedPrompt) || /(?:tiga puluh|empat puluh lima|sembilan puluh)\s*(?:menit|mnt)/i.test(trimmedPrompt);
+      if ((promptHasExplicitDuration || baselinePlan.estimatedDurationMinutes && baselinePlan.estimatedDurationMinutes !== 60) && baselinePlan.estimatedDurationMinutes) {
         sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
       } else if (!sanitizedPlan.estimatedDurationMinutes || sanitizedPlan.estimatedDurationMinutes <= 0) {
         sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes || 60;
@@ -1033,6 +1241,13 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       if (baselinePlan.deadlineAt) {
         sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
         sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
+      }
+      if (baselinePlan.targetDays && baselinePlan.targetDays.length > 1) {
+        sanitizedPlan.reasoning = baselinePlan.reasoning;
+        sanitizedPlan.isDurationAmbiguous = baselinePlan.isDurationAmbiguous;
+        sanitizedPlan.totalDurationMinutes = baselinePlan.totalDurationMinutes;
+        sanitizedPlan.durationPerDayMinutes = baselinePlan.durationPerDayMinutes;
+        sanitizedPlan.clarificationPrompt = baselinePlan.clarificationPrompt;
       }
       sanitizedPlan.title = extractCleanActivityTitle(trimmedPrompt, rawPlan.title || baselinePlan.title);
       if (!sanitizedPlan.description || sanitizedPlan.description.trim() === "") {

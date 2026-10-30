@@ -137,6 +137,12 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       // Phase 2: Memeriksa waktu kosong via scheduler
       setLoadingPhase('checking_slots');
 
+      if (plan.isOperational) {
+        setProposedPlan(plan);
+        setScheduleTestResult(null);
+        return;
+      }
+
       // Construct deadline date if specified
       let calculatedDeadlineAt: string | null = plan.deadlineAt || null;
       if (!calculatedDeadlineAt && typeof plan.deadlineDaysFromNow === 'number') {
@@ -182,6 +188,51 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       clearTimeout(clientTimeoutId);
       setLoadingPhase('idle');
     }
+  };
+
+  const handleResolveDurationAmbiguity = (mode: 'split' | 'per_day') => {
+    if (!proposedPlan) return;
+    const totalMins = proposedPlan.totalDurationMinutes || proposedPlan.estimatedDurationMinutes || 180;
+    const daysCount = proposedPlan.targetDays?.length || 2;
+    const splitMins = Math.round(totalMins / daysCount);
+
+    const updatedPlan: AIPlanDraft = {
+      ...proposedPlan,
+      isDurationAmbiguous: false,
+      allowSplit: mode === 'split',
+      estimatedDurationMinutes: mode === 'split' ? splitMins : totalMins,
+      reasoning:
+        mode === 'split'
+          ? `Total waktu ${totalMins} menit dibagi rata menjadi ${splitMins} menit per hari pada ${proposedPlan.targetOccurrences?.map((o) => o.dayName).join(' dan ') || 'hari yang dipilih'}.`
+          : `Waktu pengerjaan ditetapkan ${totalMins} menit penuh di setiap hari yang diminta.`,
+    };
+
+    setProposedPlan(updatedPlan);
+
+    const pseudoTask: Task = {
+      id: `ai-draft-${Date.now()}`,
+      userId: 'user-default',
+      title: updatedPlan.title,
+      description: updatedPlan.description,
+      estimatedDurationMinutes: updatedPlan.estimatedDurationMinutes,
+      deadlineAt: updatedPlan.deadlineAt,
+      priority: updatedPlan.priority,
+      status: 'UNSCHEDULED',
+      allowSplit: updatedPlan.allowSplit,
+      minimumSessionMinutes: updatedPlan.minimumSessionMinutes || 30,
+      preferredTimeOfDay: updatedPlan.preferredTimeOfDay,
+      timeConstraintType: updatedPlan.timeConstraintType,
+      requestedStartAt: updatedPlan.requestedStartAt,
+      requestedEndAt: updatedPlan.requestedEndAt,
+      targetDays: updatedPlan.targetDays,
+      targetOccurrences: updatedPlan.targetOccurrences,
+      preferredWindow: updatedPlan.preferredWindow,
+      timezone: updatedPlan.timezone || userTimezone,
+      createdAt: new Date().toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
+    setScheduleTestResult(schedRes);
   };
 
   const handleConfirmAndApply = async () => {
@@ -324,8 +375,47 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
           </div>
         )}
 
+        {/* Operational Intent Response (Bukan Pembuatan Tugas Baru) */}
+        {proposedPlan && proposedPlan.isOperational && (
+          <div className="bg-white border border-[#2457A7]/30 rounded-2xl p-5 shadow-xs space-y-4 animate-in fade-in slide-in-from-bottom-2">
+            <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-[#2457A7] bg-[#EAF3FC] px-3 py-1 rounded-full w-fit">
+              <Sparkles size={14} /> Permintaan Operasional
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-[#172B42]">
+                {proposedPlan.operationalAction === 'find_free_slot'
+                  ? 'Pencarian Slot Waktu Kosong'
+                  : proposedPlan.operationalAction === 'resolve_conflicts'
+                  ? 'Resolusi Jadwal Bertabrakan'
+                  : 'Tinjauan Jadwal'}
+              </h3>
+              <p className="text-xs text-[#53657A] leading-relaxed mt-1.5">
+                {proposedPlan.operationalMessage || proposedPlan.reasoning}
+              </p>
+            </div>
+            <div className="pt-2 flex items-center gap-3">
+              <button
+                onClick={onNavigateToCalendar}
+                className="flex items-center gap-1.5 px-4 py-2 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs"
+              >
+                <span>Buka Kalender</span>
+                <ArrowRight size={13} />
+              </button>
+              <button
+                onClick={() => {
+                  setProposedPlan(null);
+                  setScheduleTestResult(null);
+                }}
+                className="px-4 py-2 text-xs font-semibold text-[#53657A] hover:text-[#172B42]"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* AI Proposal & Deterministic Validation Result */}
-        {proposedPlan && scheduleTestResult && (
+        {proposedPlan && !proposedPlan.isOperational && scheduleTestResult && (
           <div className="bg-white border border-[#D9E3EF] rounded-2xl p-5 shadow-xs space-y-5 animate-in fade-in slide-in-from-bottom-2">
             <div className="flex items-start justify-between border-b border-[#D9E3EF] pb-4">
               <div>
@@ -443,6 +533,40 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
               </div>
             </div>
 
+            {/* Multi-day Duration Ambiguity Clarification Banner */}
+            {proposedPlan.isDurationAmbiguous && (
+              <div className="p-4 bg-amber-50/95 border border-amber-300 rounded-xl space-y-3 animate-in fade-in">
+                <div className="flex items-start gap-2.5">
+                  <Info size={16} className="shrink-0 mt-0.5 text-amber-700" />
+                  <div className="space-y-1">
+                    <span className="text-xs font-bold text-amber-900">
+                      Konfirmasi Alokasi Durasi Diperlukan
+                    </span>
+                    <p className="text-xs text-amber-800 leading-relaxed">
+                      {proposedPlan.clarificationPrompt ||
+                        'Apakah durasi ini merupakan total waktu yang dibagi rata untuk semua hari, atau durasi penuh di setiap hari?'}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => handleResolveDurationAmbiguity('split')}
+                    className="px-3.5 py-2 bg-white border border-amber-300 hover:border-amber-500 text-amber-900 rounded-lg text-xs font-semibold shadow-2xs hover:bg-amber-100/60 transition-colors"
+                  >
+                    Total {Math.round((proposedPlan.totalDurationMinutes || proposedPlan.estimatedDurationMinutes) / 60)} Jam (Dibagi Rata {Math.round((proposedPlan.totalDurationMinutes || proposedPlan.estimatedDurationMinutes) / (proposedPlan.targetDays?.length || 2))} Menit/Hari)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleResolveDurationAmbiguity('per_day')}
+                    className="px-3.5 py-2 bg-white border border-amber-300 hover:border-amber-500 text-amber-900 rounded-lg text-xs font-semibold shadow-2xs hover:bg-amber-100/60 transition-colors"
+                  >
+                    {Math.round((proposedPlan.totalDurationMinutes || proposedPlan.estimatedDurationMinutes) / 60)} Jam Penuh Setiap Hari ({proposedPlan.totalDurationMinutes || proposedPlan.estimatedDurationMinutes} Menit/Hari)
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* AI or Rule Reasoning */}
             <div className="p-3.5 bg-[#EAF3FC]/50 border border-[#8DBCEB]/30 rounded-xl space-y-1">
               <span className="text-[11px] font-bold text-[#2457A7] uppercase tracking-wider">
@@ -548,8 +672,13 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                 {scheduleTestResult.success && (
                   <button
                     onClick={handleConfirmAndApply}
-                    disabled={isSaving}
-                    className="flex items-center gap-1.5 px-5 py-2.5 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs disabled:opacity-60"
+                    disabled={isSaving || Boolean(proposedPlan.isDurationAmbiguous)}
+                    title={
+                      proposedPlan.isDurationAmbiguous
+                        ? 'Harap konfirmasi pilihan alokasi durasi di atas terlebih dahulu'
+                        : 'Terapkan ke Jadwal & Kalender'
+                    }
+                    className="flex items-center gap-1.5 px-5 py-2.5 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {isSaving ? (
                       <>
@@ -559,7 +688,11 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                     ) : (
                       <>
                         <Check size={14} />
-                        <span>Terapkan ke Jadwal & Kalender</span>
+                        <span>
+                          {proposedPlan.isDurationAmbiguous
+                            ? 'Pilih Alokasi Durasi Terlebih Dahulu'
+                            : 'Terapkan ke Jadwal & Kalender'}
+                        </span>
                       </>
                     )}
                   </button>
