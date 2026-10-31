@@ -18,6 +18,8 @@ export function getInitialKeepNotes(): KeepNote[] {
       color: 'sage',
       isPinned: true,
       isArchived: false,
+      tags: ['workspace', 'roadmap', 'projek'],
+      priority: 'HIGH',
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     },
@@ -30,6 +32,8 @@ export function getInitialKeepNotes(): KeepNote[] {
       color: 'sand',
       isPinned: false,
       isArchived: false,
+      tags: ['belajar', 'algoritma'],
+      priority: 'MEDIUM',
       createdAt: new Date(Date.now() - 86400000).toISOString(),
       updatedAt: new Date(Date.now() - 86400000).toISOString(),
     },
@@ -47,12 +51,15 @@ export function convertKeepNoteToTask(note: KeepNote): Partial<Task> {
   tomorrow.setDate(tomorrow.getDate() + 1);
   tomorrow.setHours(17, 0, 0, 0);
 
+  const baseDescription = note.content || note.checklist?.map((c) => (c.checked ? `[x] ${c.text}` : `[ ] ${c.text}`)).join('\n') || '';
+  const tagsText = note.tags && note.tags.length > 0 ? `\n\nTag: ${note.tags.map((t) => `#${t.replace(/^#/, '')}`).join(' ')}` : '';
+
   return {
     title: note.title || 'Tugas dari Catatan Keep',
-    description: note.content || note.checklist?.map((c) => (c.checked ? `[x] ${c.text}` : `[ ] ${c.text}`)).join('\n'),
+    description: `${baseDescription}${tagsText}`.trim(),
     estimatedDurationMinutes: estimatedDuration,
     deadlineAt: tomorrow.toISOString(),
-    priority: 'MEDIUM',
+    priority: note.priority || 'MEDIUM',
     allowSplit: true,
     minimumSessionMinutes: 30,
   };

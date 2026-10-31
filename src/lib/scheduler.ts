@@ -37,6 +37,92 @@ function formatTime(d: Date, tz: string = 'Asia/Jakarta'): string {
 }
 
 /**
+ * Format batas waktu jendela jam kerja atau preferensi.
+ * Menghindari kerancuan "00:00" jika batas akhir jendela merupakan penutup hari/tengah malam
+ * (misalnya rentang jam 07:00 sampai 24:00 WIB, bukan 07:00 - 00:00 WIB).
+ */
+export function formatWindowTime(d: Date, tz: string = 'Asia/Jakarta', isEndBoundary: boolean = false): string {
+  const parts = getPartsInTimezone(d, tz);
+  const formatted = formatInTimezone(d, tz, {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  if (isEndBoundary && parts.hour === 0 && parts.minute === 0) {
+    const separator = formatted.includes('.') ? '.' : ':';
+    return `24${separator}00`;
+  }
+  return formatted;
+}
+
+/**
+ * Membangun alasan penolakan slot harian secara akurat dan transparan.
+ * Tidak pernah menyatakan "Jendela jam kerja penuh oleh agenda lain" jika daftar conflicts kosong.
+ */
+function buildDayRejectionReason(params: {
+  dayStart: Date;
+  dayEnd: Date;
+  searchStart: Date;
+  deadline: Date | null;
+  dayTotalFree: number;
+  dayMax: number;
+  durationNeeded: number;
+  conflicts: string[];
+  userTz: string;
+  isPreferredWindow?: boolean;
+}): string {
+  const {
+    dayStart,
+    dayEnd,
+    searchStart,
+    deadline,
+    dayTotalFree,
+    dayMax,
+    durationNeeded,
+    conflicts,
+    userTz,
+    isPreferredWindow,
+  } = params;
+
+  const windowLabel = isPreferredWindow ? 'jendela preferensi' : 'jam kerja';
+
+  // 1. Tanggal/jam berada setelah batas tenggat waktu
+  if (deadline && dayStart >= deadline) {
+    return `Tanggal ini berada setelah batas tenggat waktu (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)} WIB), tidak ada konflik agenda lain.`;
+  }
+
+  // 2. Waktu jam kerja / preferensi hari ini sudah berakhir (dilewati waktu saat ini)
+  if (searchStart >= dayEnd) {
+    return `Waktu ${windowLabel} hari ini sudah berakhir (waktu saat ini telah melewati ${formatWindowTime(dayEnd, userTz, true)} WIB), tidak ada konflik agenda lain.`;
+  }
+
+  // 3. Jika total waktu luang adalah 0
+  if (dayTotalFree === 0) {
+    if (conflicts.length > 0) {
+      return `Seluruh ${windowLabel} terisi penuh oleh agenda kalender/tugas lain (${conflicts.join(', ')}).`;
+    }
+    if (deadline && deadline <= searchStart) {
+      return `Batas tenggat waktu (${formatTime(deadline, userTz)} WIB) sudah terlewati oleh waktu saat ini, tidak ada konflik agenda lain.`;
+    }
+    if (deadline && deadline <= dayEnd) {
+      return `Tenggat waktu (${formatTime(deadline, userTz)} WIB) jatuh sebelum waktu kerja dimulai atau menyisakan 0 menit waktu luang, tidak ada konflik agenda lain.`;
+    }
+    if (searchStart >= dayStart) {
+      return `Sisa ${windowLabel} hari ini sudah habis terlewati oleh waktu saat ini, tidak ada konflik agenda lain.`;
+    }
+    return `Tidak ada waktu kerja yang tersedia pada rentang ini, tidak ada konflik agenda lain.`;
+  }
+
+  // 4. Jika ada waktu luang (dayTotalFree > 0), tetapi slot bebas terpanjang (dayMax) kurang dari durationNeeded
+  if (conflicts.length > 0) {
+    return `Slot bebas terbesar hanya ${Math.round(dayMax)} menit (dibutuhkan ${durationNeeded} menit tanpa opsi split), terpotong oleh agenda lain (${conflicts.join(', ')}).`;
+  }
+
+  // 5. Jika tidak ada konflik agenda lain (conflicts.length === 0), namun sisa waktu luang < durationNeeded
+  return `Sisa waktu ${windowLabel} yang tersedia hanya ${Math.round(dayTotalFree)} menit (slot terbesar ${Math.round(dayMax)} menit, kurang dari durasi ${durationNeeded} menit tanpa opsi split), tidak ada konflik agenda lain.`;
+}
+
+/**
  * Utilitas pemeriksaan zona waktu scheduler:
  * Memverifikasi dan menormalisasi referenceDate agar selalu merujuk pada zona waktu target
  * (Asia/Jakarta sebagai domain utama EVEN) sebelum memproses perhitungan jadwal,
@@ -749,9 +835,9 @@ export function scheduleTaskDeterministically(
   }
 
   // Phase A: Search within PREFERRED WINDOW first (if requested)
+  const evaluatedDaysPreferred: DateEvaluationDiagnostic[] = [];
   if (preferredWindowStartHour !== null && preferredWindowEndHour !== null) {
     const preferredSegments: TimeInterval[] = [];
-    const evaluatedDaysPreferred: DateEvaluationDiagnostic[] = [];
 
     for (const day of candidateDays) {
       const pStartIso = createIsoInTimezone(
@@ -780,31 +866,36 @@ export function scheduleTaskDeterministically(
         preferredSegments.push({ start: pStart, end: pEnd });
 
         // Collect diagnostics for this preferred day window
+        const activeStart = pStart > searchStart ? pStart : searchStart;
+        const activeEnd = deadline && pEnd > deadline ? deadline : pEnd;
         const dayConflicts: string[] = [];
-        for (const evt of existingEvents) {
-          const eStart = new Date(evt.startAt);
-          const eEnd = new Date(evt.endAt);
-          if (pStart < eEnd && pEnd > eStart) {
-            dayConflicts.push(`${evt.title} (${formatTime(eStart, userTz)} - ${formatTime(eEnd, userTz)} WIB)`);
+
+        if (activeStart < activeEnd) {
+          for (const evt of existingEvents) {
+            const eStart = new Date(evt.startAt);
+            const eEnd = new Date(evt.endAt);
+            if (activeStart < eEnd && activeEnd > eStart) {
+              dayConflicts.push(`${evt.title} (${formatTime(eStart, userTz)} - ${formatTime(eEnd, userTz)} WIB)`);
+            }
           }
-        }
-        for (const t of existingTasks) {
-          if (t.id === task.id) continue;
-          if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
-          if (t.scheduledSessions) {
-            for (const s of t.scheduledSessions) {
-              if (
-                s.status !== 'CANCELLED' &&
-                s.status !== 'completed_manual' &&
-                s.status !== 'missed_auto' &&
-                s.status !== 'COMPLETED'
-              ) {
-                const sStart = new Date(s.startAt);
-                const sEnd = new Date(s.endAt);
-                if (pStart < sEnd && pEnd > sStart) {
-                  dayConflicts.push(
-                    `${t.title} sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)} WIB)`
-                  );
+          for (const t of existingTasks) {
+            if (t.id === task.id) continue;
+            if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
+            if (t.scheduledSessions) {
+              for (const s of t.scheduledSessions) {
+                if (
+                  s.status !== 'CANCELLED' &&
+                  s.status !== 'completed_manual' &&
+                  s.status !== 'missed_auto' &&
+                  s.status !== 'COMPLETED'
+                ) {
+                  const sStart = new Date(s.startAt);
+                  const sEnd = new Date(s.endAt);
+                  if (activeStart < sEnd && activeEnd > sStart) {
+                    dayConflicts.push(
+                      `${t.title} sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)} WIB)`
+                    );
+                  }
                 }
               }
             }
@@ -822,15 +913,23 @@ export function scheduleTaskDeterministically(
         evaluatedDaysPreferred.push({
           dateStr: `${day.year}-${String(day.month).padStart(2, '0')}-${String(day.day).padStart(2, '0')}`,
           dayName: formatIndonesianDate(day.dateObj, userTz),
-          windowStart: formatTime(pStart, userTz),
-          windowEnd: formatTime(pEnd, userTz),
+          windowStart: formatWindowTime(pStart, userTz),
+          windowEnd: formatWindowTime(pEnd, userTz, true),
           totalFreeMinutes: Math.round(dayTotalFree),
           maxContiguousFreeMinutes: Math.round(dayMax),
           conflicts: dayConflicts,
-          rejectionReason:
-            dayTotalFree === 0
-              ? 'Jendela waktu penuh oleh agenda lain'
-              : `Slot bebas terbesar hanya ${Math.round(dayMax)} menit (dibutuhkan ${durationNeeded} menit tanpa opsi split)`,
+          rejectionReason: buildDayRejectionReason({
+            dayStart: pStart,
+            dayEnd: pEnd,
+            searchStart,
+            deadline,
+            dayTotalFree,
+            dayMax,
+            durationNeeded,
+            conflicts: dayConflicts,
+            userTz,
+            isPreferredWindow: true,
+          }),
         });
       }
     }
@@ -920,18 +1019,60 @@ export function scheduleTaskDeterministically(
   if (hasEveningPref || task.timeConstraintType === 'preferred_window' || hasMorningPref) {
     const windowName = task.preferredWindow?.label || (hasEveningPref ? 'malam (19:00 - 23:00)' : 'pagi (06:00 - 12:00)');
     const deadlineText = deadline
-      ? ` sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)})`
+      ? ` sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)} WIB)`
       : '';
+
+    const totalPreferredConflicts = evaluatedDaysPreferred.reduce(
+      (acc, d) => acc + d.conflicts.length,
+      0
+    );
+    const totalPreferredFree = evaluatedDaysPreferred.reduce(
+      (acc, d) => acc + d.totalFreeMinutes,
+      0
+    );
+    const maxPreferredContiguous = evaluatedDaysPreferred.reduce(
+      (max, d) => Math.max(max, d.maxContiguousFreeMinutes || 0),
+      0
+    );
+
+    let baseExplanation: string;
+    let failureCode: ScheduleCalculationResult['failureCode'];
+
+    if (totalPreferredConflicts > 0) {
+      failureCode = 'PREFERRED_WINDOW_FULL';
+      baseExplanation = `Tidak ditemukan slot waktu luang yang mencukupi (${durationNeeded} menit) di jendela waktu ${windowName}${deadlineText}. Jadwal pada jendela waktu tersebut terhalang oleh agenda lain (${Array.from(new Set(evaluatedDaysPreferred.flatMap((d) => d.conflicts))).join(', ')}).`;
+    } else {
+      failureCode = deadline ? 'NO_SLOT_BEFORE_DEADLINE' : 'TIME_CONFLICT';
+      if (totalPreferredFree === 0) {
+        baseExplanation = `Waktu di jendela ${windowName}${deadlineText} sudah terlewati atau tidak menyisakan waktu aktif, tidak ada konflik agenda lain.`;
+      } else {
+        baseExplanation = `Slot bebas terbesar di jendela ${windowName}${deadlineText} hanya ${maxPreferredContiguous} menit (total luang ${totalPreferredFree} menit, dibutuhkan ${durationNeeded} menit tanpa opsi split), tidak ada konflik agenda lain.`;
+      }
+    }
+
+    const diagSummary = evaluatedDaysPreferred
+      .map(
+        (ed) =>
+          `• ${ed.dayName} (${ed.windowStart} - ${ed.windowEnd} WIB): Total luang ${ed.totalFreeMinutes} menit${
+            ed.maxContiguousFreeMinutes !== undefined ? `, slot bebas terpanjang ${ed.maxContiguousFreeMinutes} menit` : ''
+          }.${ed.conflicts.length > 0 ? ` Terhalang: ${ed.conflicts.join(', ')}.` : ' Tidak ada konflik agenda.'} Alasan: ${ed.rejectionReason}`
+      )
+      .join('\n');
+
     return {
       success: false,
       taskId: task.id,
       taskTitle: task.title,
-      failureCode: 'PREFERRED_WINDOW_FULL',
+      failureCode,
       proposedSessions: [],
-      explanation: `Tidak ditemukan slot waktu luang yang mencukupi (${durationNeeded} menit) di jendela waktu ${windowName}${deadlineText}. Jadwal pada jendela waktu tersebut penuh atau terhalang agenda lain.`,
+      explanation: `${baseExplanation}${diagSummary ? `\n\nDiagnostik evaluasi jendela per tanggal:\n${diagSummary}` : ''}`,
       warning: task.allowSplit
         ? 'Pertimbangkan untuk memperpanjang batas tenggat atau mengurangi durasi kegiatan.'
         : 'Saran: Anda dapat mengaktifkan opsi "Boleh dipecah menjadi beberapa sesi" atau menyesuaikan preferensi waktu.',
+      diagnostics: {
+        freeTimeCalculatedMinutes: totalPreferredFree,
+        evaluatedDays: evaluatedDaysPreferred,
+      },
     };
   }
 
@@ -1009,31 +1150,36 @@ export function scheduleTaskDeterministically(
     const dayStart = daySegments[0]?.start;
     const dayEnd = daySegments[daySegments.length - 1]?.end;
     if (dayStart && dayEnd) {
+      const activeStart = dayStart > searchStart ? dayStart : searchStart;
+      const activeEnd = deadline && dayEnd > deadline ? deadline : dayEnd;
       const conflicts: string[] = [];
-      for (const evt of existingEvents) {
-        const eStart = new Date(evt.startAt);
-        const eEnd = new Date(evt.endAt);
-        if (dayStart < eEnd && dayEnd > eStart) {
-          conflicts.push(`${evt.title} (${formatTime(eStart, userTz)} - ${formatTime(eEnd, userTz)} WIB)`);
+
+      if (activeStart < activeEnd) {
+        for (const evt of existingEvents) {
+          const eStart = new Date(evt.startAt);
+          const eEnd = new Date(evt.endAt);
+          if (activeStart < eEnd && activeEnd > eStart) {
+            conflicts.push(`${evt.title} (${formatTime(eStart, userTz)} - ${formatTime(eEnd, userTz)} WIB)`);
+          }
         }
-      }
-      for (const t of existingTasks) {
-        if (t.id === task.id) continue;
-        if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
-        if (t.scheduledSessions) {
-          for (const s of t.scheduledSessions) {
-            if (
-              s.status !== 'CANCELLED' &&
-              s.status !== 'completed_manual' &&
-              s.status !== 'missed_auto' &&
-              s.status !== 'COMPLETED'
-            ) {
-              const sStart = new Date(s.startAt);
-              const sEnd = new Date(s.endAt);
-              if (dayStart < sEnd && dayEnd > sStart) {
-                conflicts.push(
-                  `${t.title} sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)} WIB)`
-                );
+        for (const t of existingTasks) {
+          if (t.id === task.id) continue;
+          if (t.status === 'completed_manual' || t.status === 'missed_auto' || t.status === 'COMPLETED') continue;
+          if (t.scheduledSessions) {
+            for (const s of t.scheduledSessions) {
+              if (
+                s.status !== 'CANCELLED' &&
+                s.status !== 'completed_manual' &&
+                s.status !== 'missed_auto' &&
+                s.status !== 'COMPLETED'
+              ) {
+                const sStart = new Date(s.startAt);
+                const sEnd = new Date(s.endAt);
+                if (activeStart < sEnd && activeEnd > sStart) {
+                  conflicts.push(
+                    `${t.title} sesi ${s.sessionIndex} (${formatTime(sStart, userTz)} - ${formatTime(sEnd, userTz)} WIB)`
+                  );
+                }
               }
             }
           }
@@ -1051,15 +1197,23 @@ export function scheduleTaskDeterministically(
       evaluatedDaysWork.push({
         dateStr: `${day.year}-${String(day.month).padStart(2, '0')}-${String(day.day).padStart(2, '0')}`,
         dayName: formatIndonesianDate(day.dateObj, userTz),
-        windowStart: formatTime(dayStart, userTz),
-        windowEnd: formatTime(dayEnd, userTz),
+        windowStart: formatWindowTime(dayStart, userTz),
+        windowEnd: formatWindowTime(dayEnd, userTz, true),
         totalFreeMinutes: Math.round(dayTotalFree),
         maxContiguousFreeMinutes: Math.round(dayMax),
         conflicts,
-        rejectionReason:
-          dayTotalFree === 0
-            ? 'Jendela jam kerja penuh oleh agenda lain'
-            : `Slot bebas terbesar hanya ${Math.round(dayMax)} menit (dibutuhkan ${durationNeeded} menit tanpa opsi split)`,
+        rejectionReason: buildDayRejectionReason({
+          dayStart,
+          dayEnd,
+          searchStart,
+          deadline,
+          dayTotalFree,
+          dayMax,
+          durationNeeded,
+          conflicts,
+          userTz,
+          isPreferredWindow: false,
+        }),
       });
     }
   }
@@ -1153,8 +1307,30 @@ export function scheduleTaskDeterministically(
   );
 
   const deadlineInfo = deadline
-    ? ` sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)})`
+    ? ` sebelum tenggat (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)} WIB)`
     : '';
+
+  const totalConflictsWork = evaluatedDaysWork.reduce(
+    (acc, d) => acc + d.conflicts.length,
+    0
+  );
+  const maxContiguousWork = evaluatedDaysWork.reduce(
+    (max, d) => Math.max(max, d.maxContiguousFreeMinutes || 0),
+    0
+  );
+
+  let baseExplanation: string;
+  const failureCode: ScheduleCalculationResult['failureCode'] = deadline
+    ? 'NO_SLOT_BEFORE_DEADLINE'
+    : 'TIME_CONFLICT';
+
+  if (totalConflictsWork > 0) {
+    baseExplanation = `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit)${deadlineInfo}. Total waktu luang tersisa di jam kerja Anda hanya ${Math.round(totalFreeAvailable)} menit, terpotong oleh agenda lain.`;
+  } else if (totalFreeAvailable === 0) {
+    baseExplanation = `Tidak ditemukan slot waktu kerja yang mencukupi durasi (${durationNeeded} menit)${deadlineInfo}. Seluruh rentang evaluasi berada di luar jam kerja atau setelah batas tenggat, tidak ada konflik agenda lain.`;
+  } else {
+    baseExplanation = `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit)${deadlineInfo}. Total waktu luang tersisa di jam kerja Anda adalah ${Math.round(totalFreeAvailable)} menit (slot bebas terpanjang ${maxContiguousWork} menit tanpa opsi split), tidak ada konflik agenda lain.`;
+  }
 
   const diagSummary = evaluatedDaysWork
     .map(
@@ -1169,9 +1345,9 @@ export function scheduleTaskDeterministically(
     success: false,
     taskId: task.id,
     taskTitle: task.title,
-    failureCode: 'NO_SLOT_BEFORE_DEADLINE',
+    failureCode,
     proposedSessions: [],
-    explanation: `Tidak ditemukan slot waktu kosong yang mencukupi durasi (${durationNeeded} menit)${deadlineInfo}. Total waktu luang tersisa di jam kerja Anda hanya ${Math.round(totalFreeAvailable)} menit.${
+    explanation: `${baseExplanation}${
       diagSummary ? `\n\nDiagnostik evaluasi slot per tanggal:\n${diagSummary}` : ''
     }`,
     warning: task.allowSplit

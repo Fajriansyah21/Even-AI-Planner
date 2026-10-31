@@ -189,7 +189,7 @@ export function extractCleanActivityTitle(prompt: string, aiTitle?: string): str
 
   // Hapus awalan perintah/keinginan percakapan
   text = text.replace(
-    /^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|bikin)?\s*(?:jadwal\s+)?(?:aku\s+|saya\s+|kami\s+)?(?:mau\s+|ingin\s+|pengen\s+|rencananya\s+)?(?:akan\s+ada\s+|ada\s+)?/i,
+    /^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|buat|bikin|atur)?\s*(?:jadwal(?:kan)?\s+)?(?:untuk\s+)?(?:aku\s+|saya\s+|kami\s+)?(?:mau\s+|ingin\s+|pengen\s+|rencananya\s+)?(?:akan\s+ada\s+|ada\s+)?/i,
     ''
   );
 
@@ -805,8 +805,16 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   }
 
   // 8. Deadline calculation:
-  let deadlineIso: string;
-  let deadlineDaysFromNow: number;
+  // Hanya tetapkan tenggat waktu jika pengguna secara eksplisit menyebutkan batas tenggat (deadline),
+  // pekan berjalan ("minggu ini"), atau untuk fixed_event (waktu berakhir kegiatan).
+  // JANGAN PERNAH membuat tenggat baku jam 18:00 hari ini jika pengguna tidak menyebutkan tenggat!
+  let deadlineIso: string | undefined = undefined;
+  let deadlineDaysFromNow: number | undefined = undefined;
+
+  const hasExplicitDeadlineKeyword =
+    /\b(deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\b/i.test(prompt) ||
+    prompt.includes('minggu ini');
+
   if (detectedDeadlineDay) {
     const nextDeadlineDate = getNextValidDateForDayOfWeek(detectedDeadlineDay.dayIndex, baseDate, tz, {
       targetHour: 23,
@@ -841,19 +849,56 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   } else if (timeConstraintType === 'fixed_event' && requestedEndAt) {
     deadlineIso = requestedEndAt;
     deadlineDaysFromNow = Math.max(1, dayOffset);
-  } else {
-    // Target deadline at 23:00 for evening or 18:00 for standard daytime
-    const deadlineHour = preferredTimeOfDay === 'EVENING' ? 23 : 18;
+  } else if (hasExplicitDeadlineKeyword) {
+    // Pengguna menyebutkan kata kunci tenggat (misal: "deadline besok", "sebelum jam 5 sore", "paling lambat lusa")
+    let targetDeadlineOffset = dayOffset;
+    let deadlineHour = preferredTimeOfDay === 'EVENING' ? 23 : 18;
+    let deadlineMinute = 0;
+
+    // Periksa apakah ada jam spesifik setelah kata kunci tenggat
+    // e.g. "sebelum jam 5 sore", "paling lambat jam 17.00", "deadline pukul 20:00"
+    const deadlineTimeMatch = prompt.match(
+      /(?:deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\s*(?:hari\s+ini|besok|lusa)?\s*(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i
+    );
+    if (deadlineTimeMatch) {
+      let dh = parseInt(deadlineTimeMatch[1], 10);
+      const dm = deadlineTimeMatch[2] ? parseInt(deadlineTimeMatch[2], 10) : 0;
+      const dPeriod = deadlineTimeMatch[3];
+      if ((dPeriod === 'malam' || prompt.includes('malam')) && dh < 12) dh += 12;
+      else if ((dPeriod === 'sore' || prompt.includes('sore')) && dh <= 6) dh += 12;
+      else if ((dPeriod === 'siang' || prompt.includes('siang')) && dh >= 1 && dh <= 3) dh += 12;
+      deadlineHour = dh;
+      deadlineMinute = dm;
+    } else if (prompt.includes('besok')) {
+      targetDeadlineOffset = 1;
+      deadlineHour = 23;
+      deadlineMinute = 59;
+    } else if (prompt.includes('lusa')) {
+      targetDeadlineOffset = 2;
+      deadlineHour = 23;
+      deadlineMinute = 59;
+    }
+
+    const dDateObj = addDaysInTimezone(baseDate, targetDeadlineOffset, tz);
+    const dParts = getPartsInTimezone(dDateObj, tz);
+    deadlineDaysFromNow = Math.max(1, targetDeadlineOffset);
     deadlineIso = createIsoInTimezone(
-      targetParts.year,
-      targetParts.month,
-      targetParts.day,
+      dParts.year,
+      dParts.month,
+      dParts.day,
       deadlineHour,
-      0,
+      deadlineMinute,
       0,
       tz
     );
-    deadlineDaysFromNow = Math.max(1, dayOffset);
+  } else {
+    // Pengguna TIDAK menyebutkan tenggat: properti deadlineAt HARUS undefined (bukan 18:00 hari ini)
+    deadlineIso = undefined;
+    if (hasExplicitDayTarget && dayOffset > 0) {
+      deadlineDaysFromNow = Math.max(1, dayOffset);
+    } else {
+      deadlineDaysFromNow = undefined;
+    }
   }
 
   // 9. Multi-day duration ambiguity analysis:
@@ -927,8 +972,10 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     }
   } else if (preferredWindow) {
     reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu ${preferredTimeOfDay === 'EVENING' ? 'santai atau fokus malam' : preferredTimeOfDay.toLowerCase()} Anda.`;
-  } else {
+  } else if (deadlineIso !== undefined && deadlineDaysFromNow !== undefined) {
     reasoning = `AI menetapkan estimasi durasi ${duration} menit dengan tenggat waktu ${deadlineDaysFromNow === 0 ? 'hari ini' : `${deadlineDaysFromNow} hari ke depan`}.`;
+  } else {
+    reasoning = `AI menetapkan estimasi durasi ${duration} menit untuk dijadwalkan pada waktu kerja luang berikutnya yang tersedia.`;
   }
 
   return {

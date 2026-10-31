@@ -144,7 +144,9 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
           }, perAttemptTimeoutMs);
 
           const model = attempt === 0 ? 'gemini-3.8-flash' : 'gemini-3.1-flash-lite';
-          const thinkingLevel = ThinkingLevel.MINIMAL;
+          // gemini-3.8-flash tidak mendukung ThinkingLevel.MINIMAL (mengakibatkan error HTTP 400 Bad Request).
+          // Gunakan ThinkingLevel.LOW untuk gemini-3.8-flash, dan ThinkingLevel.MINIMAL untuk gemini-3.1-flash-lite.
+          const thinkingLevel = attempt === 0 ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL;
 
           try {
             const result = await ai.models.generateContent({
@@ -337,10 +339,15 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.preferredWindow = baselinePlan.preferredWindow;
       }
 
-      // 5. Deadline
+      // 5. Deadline sanitization
+      // Hanya izinkan deadline jika aturan deterministik mendeteksi tenggat eksplisit dari instruksi pengguna.
+      // Jika pengguna tidak menyebutkan tenggat, pastikan deadlineAt dihapus agar AI tidak berhalusinasi.
       if (baselinePlan.deadlineAt) {
         sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
         sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
+      } else {
+        delete sanitizedPlan.deadlineAt;
+        delete sanitizedPlan.deadlineDaysFromNow;
       }
 
       // 5b. Multi-day explicit reasoning override and duration ambiguity

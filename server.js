@@ -204,7 +204,7 @@ function extractCleanActivityTitle(prompt, aiTitle) {
   let text = raw;
   text = text.replace(/\b(?:setiap|tiap(?:\s+tiap)?|rutin|selalu|per\s+minggu)\b/gi, "");
   text = text.replace(
-    /^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|bikin)?\s*(?:jadwal\s+)?(?:aku\s+|saya\s+|kami\s+)?(?:mau\s+|ingin\s+|pengen\s+|rencananya\s+)?(?:akan\s+ada\s+|ada\s+)?/i,
+    /^(?:tolong\s+)?(?:jadwalkan|masukkan|buatkan|buat|bikin|atur)?\s*(?:jadwal(?:kan)?\s+)?(?:untuk\s+)?(?:aku\s+|saya\s+|kami\s+)?(?:mau\s+|ingin\s+|pengen\s+|rencananya\s+)?(?:akan\s+ada\s+|ada\s+)?/i,
     ""
   );
   text = text.replace(
@@ -660,8 +660,9 @@ function parseIndonesianTemporalRules(ctx) {
     requestedStartAt = void 0;
     requestedEndAt = void 0;
   }
-  let deadlineIso;
-  let deadlineDaysFromNow;
+  let deadlineIso = void 0;
+  let deadlineDaysFromNow = void 0;
+  const hasExplicitDeadlineKeyword = /\b(deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\b/i.test(prompt) || prompt.includes("minggu ini");
   if (detectedDeadlineDay) {
     const nextDeadlineDate = getNextValidDateForDayOfWeek(detectedDeadlineDay.dayIndex, baseDate, tz, {
       targetHour: 23,
@@ -695,7 +696,44 @@ function parseIndonesianTemporalRules(ctx) {
   } else if (timeConstraintType === "fixed_event" && requestedEndAt) {
     deadlineIso = requestedEndAt;
     deadlineDaysFromNow = Math.max(1, dayOffset);
-  } else {
+  } else if (hasExplicitDeadlineKeyword) {
+    let targetDeadlineOffset = dayOffset;
+    let deadlineHour = preferredTimeOfDay === "EVENING" ? 23 : 18;
+    let deadlineMinute = 0;
+    const deadlineTimeMatch = prompt.match(
+      /(?:deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\s*(?:hari\s+ini|besok|lusa)?\s*(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i
+    );
+    if (deadlineTimeMatch) {
+      let dh = parseInt(deadlineTimeMatch[1], 10);
+      const dm = deadlineTimeMatch[2] ? parseInt(deadlineTimeMatch[2], 10) : 0;
+      const dPeriod = deadlineTimeMatch[3];
+      if ((dPeriod === "malam" || prompt.includes("malam")) && dh < 12) dh += 12;
+      else if ((dPeriod === "sore" || prompt.includes("sore")) && dh <= 6) dh += 12;
+      else if ((dPeriod === "siang" || prompt.includes("siang")) && dh >= 1 && dh <= 3) dh += 12;
+      deadlineHour = dh;
+      deadlineMinute = dm;
+    } else if (prompt.includes("besok")) {
+      targetDeadlineOffset = 1;
+      deadlineHour = 23;
+      deadlineMinute = 59;
+    } else if (prompt.includes("lusa")) {
+      targetDeadlineOffset = 2;
+      deadlineHour = 23;
+      deadlineMinute = 59;
+    }
+    const dDateObj = addDaysInTimezone(baseDate, targetDeadlineOffset, tz);
+    const dParts = getPartsInTimezone(dDateObj, tz);
+    deadlineDaysFromNow = Math.max(1, targetDeadlineOffset);
+    deadlineIso = createIsoInTimezone(
+      dParts.year,
+      dParts.month,
+      dParts.day,
+      deadlineHour,
+      deadlineMinute,
+      0,
+      tz
+    );
+  } else if (hasExplicitDayTarget && dayOffset > 0) {
     const deadlineHour = preferredTimeOfDay === "EVENING" ? 23 : 18;
     deadlineIso = createIsoInTimezone(
       targetParts.year,
@@ -707,6 +745,9 @@ function parseIndonesianTemporalRules(ctx) {
       tz
     );
     deadlineDaysFromNow = Math.max(1, dayOffset);
+  } else {
+    deadlineIso = void 0;
+    deadlineDaysFromNow = void 0;
   }
   let isDurationAmbiguous = false;
   let totalDurationMinutes = void 0;
@@ -762,8 +803,10 @@ function parseIndonesianTemporalRules(ctx) {
     }
   } else if (preferredWindow) {
     reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu ${preferredTimeOfDay === "EVENING" ? "santai atau fokus malam" : preferredTimeOfDay.toLowerCase()} Anda.`;
-  } else {
+  } else if (deadlineDaysFromNow !== void 0) {
     reasoning = `AI menetapkan estimasi durasi ${duration} menit dengan tenggat waktu ${deadlineDaysFromNow === 0 ? "hari ini" : `${deadlineDaysFromNow} hari ke depan`}.`;
+  } else {
+    reasoning = `AI menetapkan estimasi durasi ${duration} menit untuk dijadwalkan pada waktu kerja luang berikutnya yang tersedia.`;
   }
   return {
     title,
@@ -1072,7 +1115,7 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
             controller.abort();
           }, perAttemptTimeoutMs);
           const model = attempt === 0 ? "gemini-3.8-flash" : "gemini-3.1-flash-lite";
-          const thinkingLevel = ThinkingLevel.MINIMAL;
+          const thinkingLevel = attempt === 0 ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL;
           try {
             const result = await ai.models.generateContent({
               model,
@@ -1241,6 +1284,9 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       if (baselinePlan.deadlineAt) {
         sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
         sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
+      } else {
+        delete sanitizedPlan.deadlineAt;
+        delete sanitizedPlan.deadlineDaysFromNow;
       }
       if (baselinePlan.targetDays && baselinePlan.targetDays.length > 1) {
         sanitizedPlan.reasoning = baselinePlan.reasoning;

@@ -255,6 +255,8 @@ export interface KeepNote {
   color: 'default' | 'sand' | 'coral' | 'sage' | 'fog' | 'storm';
   isPinned: boolean;
   isArchived: boolean;
+  tags?: string[];
+  priority?: Priority;
   createdAt: string;
   updatedAt: string;
 }

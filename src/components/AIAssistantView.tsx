@@ -31,45 +31,53 @@ interface AIAssistantViewProps {
   onNavigateToCalendar: () => void;
 }
 
-export type LoadingPhase =
-  | 'idle'
-  | 'reading'
-  | 'analyzing'
-  | 'drafting'
-  | 'checking_slots'
-  | 'saving_calendar';
+import { parseIndonesianTemporalRules } from '../lib/temporalParser';
+
+export enum LoadingPhase {
+  IDLE = 'IDLE',
+  VALIDATING = 'Validating',
+  ANALYZING = 'Analyzing',
+  PLANNING = 'Planning',
+  CHECKING_CONFLICTS = 'Checking Conflicts',
+  SAVING_CALENDAR = 'Saving Calendar',
+}
 
 export interface LoadingStepConfig {
-  phase: 'reading' | 'analyzing' | 'drafting' | 'checking_slots';
+  phase: LoadingPhase;
   stepNumber: number;
+  stageName: 'Validating' | 'Analyzing' | 'Planning' | 'Checking Conflicts';
   label: string;
   detail: string;
 }
 
 export const LOADING_STEPS: LoadingStepConfig[] = [
   {
-    phase: 'reading',
+    phase: LoadingPhase.VALIDATING,
+    stageName: 'Validating',
     stepNumber: 1,
-    label: 'Membaca Instruksi',
-    detail: 'Memvalidasi format teks dan kelengkapan permintaan Anda...',
+    label: 'Validating',
+    detail: 'Memvalidasi kelengkapan teks dan format instruksi Anda...',
   },
   {
-    phase: 'analyzing',
+    phase: LoadingPhase.ANALYZING,
+    stageName: 'Analyzing',
     stepNumber: 2,
-    label: 'Menganalisis Maksud & Waktu',
-    detail: 'Menafsirkan kegiatan, durasi, jam, dan konteks waktu Asia/Jakarta...',
+    label: 'Analyzing',
+    detail: 'Menafsirkan durasi, jam kegiatan, dan konteks waktu Asia/Jakarta...',
   },
   {
-    phase: 'drafting',
+    phase: LoadingPhase.PLANNING,
+    stageName: 'Planning',
     stepNumber: 3,
-    label: 'Menyusun Usulan Rencana',
-    detail: 'Menghubungi AI Gemini untuk menyusun draf jadwal terstruktur...',
+    label: 'Planning',
+    detail: 'Menyusun draf usulan rencana terstruktur melalui AI Gemini...',
   },
   {
-    phase: 'checking_slots',
+    phase: LoadingPhase.CHECKING_CONFLICTS,
+    stageName: 'Checking Conflicts',
     stepNumber: 4,
-    label: 'Memeriksa Konflik Jadwal',
-    detail: 'Menjalankan scheduler deterministik menguji slot kalender bebas benturan...',
+    label: 'Checking Conflicts',
+    detail: 'Menguji ketersediaan slot kalender bebas benturan via deterministic scheduler...',
   },
 ];
 
@@ -82,7 +90,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 }) => {
   const [promptInput, setPromptInput] = useState('');
   const [lastSubmittedPrompt, setLastSubmittedPrompt] = useState('');
-  const [loadingPhase, setLoadingPhase] = useState<LoadingPhase>('idle');
+  const [loadingPhase, setLoadingPhase] = useState<LoadingPhase>(LoadingPhase.IDLE);
   const [proposedPlan, setProposedPlan] = useState<AIPlanDraft | null>(null);
   const [scheduleTestResult, setScheduleTestResult] = useState<ScheduleCalculationResult | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
@@ -109,11 +117,11 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   }, []);
 
   const isAnalyzing =
-    loadingPhase === 'reading' ||
-    loadingPhase === 'analyzing' ||
-    loadingPhase === 'drafting' ||
-    loadingPhase === 'checking_slots';
-  const isSaving = loadingPhase === 'saving_calendar';
+    loadingPhase === LoadingPhase.VALIDATING ||
+    loadingPhase === LoadingPhase.ANALYZING ||
+    loadingPhase === LoadingPhase.PLANNING ||
+    loadingPhase === LoadingPhase.CHECKING_CONFLICTS;
+  const isSaving = loadingPhase === LoadingPhase.SAVING_CALENDAR;
 
   const userTimezone = preferences.timezone
     ? preferences.timezone.split(' ')[0]
@@ -135,7 +143,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       clearTimeout(timeoutTimerRef.current);
       timeoutTimerRef.current = null;
     }
-    setLoadingPhase('idle');
+    setLoadingPhase(LoadingPhase.IDLE);
     setErrorMessage('Proses analisis dibatalkan oleh pengguna.');
   };
 
@@ -157,16 +165,16 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       timeoutTimerRef.current = null;
     }
 
-    // Step 1: Membaca instruksi & validasi
-    setLoadingPhase('reading');
+    // Stage 1: Validating (Validasi format teks dan kelengkapan)
+    setLoadingPhase(LoadingPhase.VALIDATING);
     setErrorMessage('');
     setWarningMessage('');
     setProposedPlan(null);
     setScheduleTestResult(null);
     setAppliedSuccess(false);
 
-    // Step 2: Menganalisis konteks waktu lokal & preferensi
-    setLoadingPhase('analyzing');
+    // Stage 2: Analyzing (Menganalisis konteks waktu lokal & preferensi)
+    setLoadingPhase(LoadingPhase.ANALYZING);
     const now = new Date();
     const effectiveTimezone = preferences.timezone
       ? preferences.timezone.split(' ')[0]
@@ -181,8 +189,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       minute: '2-digit',
     });
 
-    // Step 3: Menyusun usulan rencana (Gemini API via server proxy)
-    setLoadingPhase('drafting');
+    // Stage 3: Planning (Menyusun usulan rencana terstruktur)
+    setLoadingPhase(LoadingPhase.PLANNING);
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
     let didTimeout = false;
@@ -235,8 +243,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       const resolvedSource = data.source || (data.isAiGenerated ? 'gemini' : 'rule_fallback_on_error');
       setPlanSource(resolvedSource);
 
-      // Step 4: Memeriksa konflik ketersediaan slot via scheduler deterministik
-      setLoadingPhase('checking_slots');
+      // Stage 4: Checking Conflicts (Pemeriksaan konflik ketersediaan slot)
+      setLoadingPhase(LoadingPhase.CHECKING_CONFLICTS);
 
       if (plan.isOperational) {
         setProposedPlan(plan);
@@ -278,7 +286,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
       const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
 
-      // Step 5: Tampilkan hasil secara lengkap setelah uji slot selesai
+      // Selesai: Tampilkan hasil secara lengkap setelah uji slot selesai
       setProposedPlan(plan);
       setScheduleTestResult(schedRes);
     } catch (err: any) {
@@ -289,8 +297,62 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
           setErrorMessage('Proses analisis dibatalkan oleh pengguna.');
         }
       } else {
-        const safeMessage = formatUserErrorMessage(undefined, undefined, err?.message);
-        setErrorMessage(safeMessage);
+        // DETEKSI TRANSISI FALLBACK KE scheduleTaskDeterministically:
+        // Jika AI tidak tersedia atau jaringan/layanan gagal, beralih secara cerdas ke mesin aturan lokal
+        try {
+          setLoadingPhase(LoadingPhase.CHECKING_CONFLICTS);
+          const fallbackParsed = parseIndonesianTemporalRules({
+            userPrompt: trimmed,
+            currentDateTime: now.toISOString(),
+            userLocalTimeStr,
+            userTimezone: effectiveTimezone,
+            workHours: {
+              workStartHour: preferences.workStartHour,
+              workEndHour: preferences.workEndHour,
+            },
+          });
+
+          let calculatedDeadlineAt: string | null = fallbackParsed.deadlineAt || null;
+          if (!calculatedDeadlineAt && typeof fallbackParsed.deadlineDaysFromNow === 'number') {
+            const deadlineDate = new Date();
+            deadlineDate.setDate(deadlineDate.getDate() + fallbackParsed.deadlineDaysFromNow);
+            deadlineDate.setHours(fallbackParsed.preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
+            calculatedDeadlineAt = deadlineDate.toISOString();
+          }
+
+          const fallbackTask: Task = {
+            id: `ai-draft-${Date.now()}`,
+            userId: 'user-default',
+            title: fallbackParsed.title,
+            description: fallbackParsed.description,
+            estimatedDurationMinutes: fallbackParsed.estimatedDurationMinutes,
+            deadlineAt: calculatedDeadlineAt,
+            priority: fallbackParsed.priority,
+            status: 'UNSCHEDULED',
+            allowSplit: fallbackParsed.allowSplit,
+            minimumSessionMinutes: fallbackParsed.minimumSessionMinutes || 30,
+            preferredTimeOfDay: fallbackParsed.preferredTimeOfDay,
+            timeConstraintType: fallbackParsed.timeConstraintType,
+            requestedStartAt: fallbackParsed.requestedStartAt,
+            requestedEndAt: fallbackParsed.requestedEndAt,
+            targetDays: fallbackParsed.targetDays,
+            targetOccurrences: fallbackParsed.targetOccurrences,
+            preferredWindow: fallbackParsed.preferredWindow,
+            timezone: fallbackParsed.timezone || effectiveTimezone,
+            createdAt: new Date().toISOString(),
+          };
+
+          const schedRes = scheduleTaskDeterministically(fallbackTask, events, tasks, preferences);
+          setPlanSource('rule_fallback_on_error');
+          setProposedPlan(fallbackParsed);
+          setScheduleTestResult(schedRes);
+          setWarningMessage(
+            'Pemrosesan AI tidak tersedia saat ini. Jadwal berhasil dialihkan dan disusun menggunakan mesin aturan lokal deterministik (Local Rule-based Engine) EVEN.'
+          );
+        } catch {
+          const safeMessage = formatUserErrorMessage(undefined, undefined, err?.message);
+          setErrorMessage(safeMessage);
+        }
       }
     } finally {
       if (timeoutTimerRef.current) {
@@ -298,7 +360,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         timeoutTimerRef.current = null;
       }
       abortControllerRef.current = null;
-      setLoadingPhase('idle');
+      setLoadingPhase(LoadingPhase.IDLE);
     }
   };
 
@@ -350,26 +412,26 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const handleConfirmAndApply = async () => {
     if (!proposedPlan || !scheduleTestResult || isSaving) return;
 
-    setLoadingPhase('saving_calendar');
+    setLoadingPhase(LoadingPhase.SAVING_CALENDAR);
     try {
       await onApplyAIPlan(proposedPlan, scheduleTestResult);
       setAppliedSuccess(true);
     } catch (err: any) {
       setErrorMessage(`Gagal menyimpan: ${err.message}`);
     } finally {
-      setLoadingPhase('idle');
+      setLoadingPhase(LoadingPhase.IDLE);
     }
   };
 
   const getStepIndex = (phase: LoadingPhase): number => {
     switch (phase) {
-      case 'reading':
+      case LoadingPhase.VALIDATING:
         return 1;
-      case 'analyzing':
+      case LoadingPhase.ANALYZING:
         return 2;
-      case 'drafting':
+      case LoadingPhase.PLANNING:
         return 3;
-      case 'checking_slots':
+      case LoadingPhase.CHECKING_CONFLICTS:
         return 4;
       default:
         return 0;
@@ -663,6 +725,21 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                 {proposedPlan.priority}
               </span>
             </div>
+
+            {/* Fallback Transparency Banner */}
+            {planSource !== 'gemini' && (
+              <div className="p-3.5 bg-amber-50/90 border border-amber-300/80 rounded-xl flex items-start gap-2.5 text-xs text-amber-900 animate-in fade-in">
+                <AlertCircle size={16} className="shrink-0 mt-0.5 text-amber-700" />
+                <div className="space-y-1">
+                  <span className="font-bold text-amber-950 block">
+                    Pemberitahuan: Pemrosesan AI Tidak Tersedia
+                  </span>
+                  <p className="leading-relaxed text-amber-800 text-[11px]">
+                    Layanan pemrosesan AI sedang tidak tersedia atau mengalami pembatasan. Jadwal ini berhasil dialihkan dan dihasilkan menggunakan <strong>Mesin Aturan Lokal Deterministik (Local Rule-Based Engine)</strong> EVEN, dengan seluruh durasi, waktu, dan benturan kalender telah diverifikasi secara akurat oleh scheduler.
+                  </p>
+                </div>
+              </div>
+            )}
 
             {/* Plan Metrics */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

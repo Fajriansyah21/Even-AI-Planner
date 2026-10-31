@@ -12,6 +12,7 @@ import { runMarkMissedCompletedTests } from './mark-missed-completed.test';
 import { runAllAiSchedulerRegressionTests } from './ai-reasoning-and-scheduler-regression.test';
 import { runAiSchedulerSuite } from './aiScheduler.test';
 import { runLoadingUxTests } from './loadingUx.test';
+import { runDeadlineAndSlotDiagnosticsTests } from './deadlineAndSlotDiagnostics.test';
 
 async function main() {
   console.log('================================================================');
@@ -72,8 +73,12 @@ async function main() {
     runAiSchedulerSuite();
 
     // 14. AI Analysis Loading UX & Honest Fallback Suite
-    console.log('\n>>> [14/14] Loading UX, AI Analysis Stages & Fallback Transparency Suite...');
+    console.log('\n>>> [14/15] Loading UX, AI Analysis Stages & Fallback Transparency Suite...');
     await runLoadingUxTests();
+
+    // 15. Deadline Bawaan Parser & Diagnosis Slot Penjadwalan Suite
+    console.log('\n>>> [15/15] Deadline Bawaan Parser & Diagnosis Slot Penjadwalan Suite...');
+    runDeadlineAndSlotDiagnosticsTests();
 
     // Real Google Calendar Integration (Opt-in Check)
     console.log('\n>>> [Opsi] Pengujian Integrasi Google Calendar Nyata...');

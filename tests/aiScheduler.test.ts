@@ -133,6 +133,9 @@ export function simulateBackendPlanPipeline(
   if (baselinePlan.deadlineAt) {
     sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
     sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
+  } else {
+    delete sanitizedPlan.deadlineAt;
+    delete sanitizedPlan.deadlineDaysFromNow;
   }
   if (baselinePlan.targetDays && baselinePlan.targetDays.length > 1) {
     sanitizedPlan.reasoning = baselinePlan.reasoning;

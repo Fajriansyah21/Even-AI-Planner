@@ -226,15 +226,8 @@ function DroppableHourSlot({
   });
 
   const occupied = density?.occupiedMinutes ?? 0;
-  const percentage = density?.densityPercentage ?? 0;
   const isFull = density?.status === 'full' || occupied >= 50;
   const isMedium = density?.status === 'medium';
-
-  const barColor = isFull
-    ? 'bg-[#C43D4B] dark:bg-rose-500' // Penuh / Padat
-    : isMedium
-    ? 'bg-[#B86B12] dark:bg-amber-500' // Sedang
-    : 'bg-[#16856B] dark:bg-emerald-500'; // Ringan / Tersedia
 
   return (
     <div
@@ -248,37 +241,25 @@ function DroppableHourSlot({
       }`}
       style={{ height: `${heightPx}px` }}
     >
-      {/* Visual Density Progress Bar per Jam */}
-      {occupied > 0 && (
-        <div
-          className="absolute bottom-0 left-0 right-0 h-1.5 bg-slate-200/50 dark:bg-slate-700/50 overflow-hidden pointer-events-none z-5"
-          title={`Kepadatan jadwal: ${occupied}/60 menit (${percentage}%)`}
-        >
-          <div
-            className={`h-full transition-all duration-300 ${barColor}`}
-            style={{ width: `${Math.min(100, percentage)}%` }}
-          />
-        </div>
-      )}
 
       {/* Mini hover badge showing occupied and available minutes */}
-      <div className="opacity-0 group-hover:opacity-100 transition-opacity absolute right-1.5 top-1 z-15 pointer-events-none flex items-center gap-1 bg-white/95 dark:bg-slate-800/95 border border-[#D9E3EF] dark:border-slate-700 px-1.5 py-0.5 rounded-md text-[9px] shadow-2xs backdrop-blur-xs">
+      <div className="opacity-0 group-hover:opacity-100 transition-all duration-150 absolute right-1.5 top-1 z-15 pointer-events-none flex items-center gap-1.5 bg-white/95 dark:bg-slate-900/95 border border-[#D9E3EF] dark:border-slate-700/80 px-2 py-0.5 rounded-lg text-[9px] shadow-sm backdrop-blur-md">
         <span
           className={`w-1.5 h-1.5 rounded-full ${
             occupied === 0
               ? 'bg-slate-300 dark:bg-slate-600'
               : isFull
-              ? 'bg-[#C43D4B]'
+              ? 'bg-rose-500 shadow-xs shadow-rose-500/50'
               : isMedium
-              ? 'bg-[#B86B12]'
-              : 'bg-[#16856B]'
+              ? 'bg-amber-500 shadow-xs shadow-amber-500/50'
+              : 'bg-emerald-500 shadow-xs shadow-emerald-500/50'
           }`}
         />
-        <span className="font-semibold text-[#172B42] dark:text-slate-200 font-mono">
-          {occupied > 0 ? `${occupied}/60 mnt` : 'Slot Kosong'}
+        <span className="font-semibold text-[#172B42] dark:text-slate-100 font-mono tracking-tight">
+          {occupied > 0 ? `${occupied}/60 mnt` : 'Slot Luang'}
         </span>
-        <span className="text-[#53657A] dark:text-slate-400">
-          ({density?.availableMinutes ?? 60}m luang)
+        <span className="text-[#53657A] dark:text-slate-400 text-[8.5px]">
+          ({density?.availableMinutes ?? 60}m sisa)
         </span>
       </div>
 

@@ -41,46 +41,46 @@ export async function runLoadingUxTests() {
   test('1. Validasi 4 Langkah Loading Eksplisit dan Berurutan', () => {
     assert.strictEqual(LOADING_STEPS.length, 4, 'Harus memiliki tepat 4 tahap loading');
     
-    assert.strictEqual(LOADING_STEPS[0].phase, 'reading');
+    assert.strictEqual(LOADING_STEPS[0].phase, LoadingPhase.VALIDATING);
+    assert.strictEqual(LOADING_STEPS[0].stageName, 'Validating');
     assert.strictEqual(LOADING_STEPS[0].stepNumber, 1);
-    assert.ok(LOADING_STEPS[0].label.includes('Membaca Instruksi'));
 
-    assert.strictEqual(LOADING_STEPS[1].phase, 'analyzing');
+    assert.strictEqual(LOADING_STEPS[1].phase, LoadingPhase.ANALYZING);
+    assert.strictEqual(LOADING_STEPS[1].stageName, 'Analyzing');
     assert.strictEqual(LOADING_STEPS[1].stepNumber, 2);
-    assert.ok(LOADING_STEPS[1].label.includes('Menganalisis Maksud & Waktu'));
 
-    assert.strictEqual(LOADING_STEPS[2].phase, 'drafting');
+    assert.strictEqual(LOADING_STEPS[2].phase, LoadingPhase.PLANNING);
+    assert.strictEqual(LOADING_STEPS[2].stageName, 'Planning');
     assert.strictEqual(LOADING_STEPS[2].stepNumber, 3);
-    assert.ok(LOADING_STEPS[2].label.includes('Menyusun Usulan Rencana'));
 
-    assert.strictEqual(LOADING_STEPS[3].phase, 'checking_slots');
+    assert.strictEqual(LOADING_STEPS[3].phase, LoadingPhase.CHECKING_CONFLICTS);
+    assert.strictEqual(LOADING_STEPS[3].stageName, 'Checking Conflicts');
     assert.strictEqual(LOADING_STEPS[3].stepNumber, 4);
-    assert.ok(LOADING_STEPS[3].label.includes('Memeriksa Konflik Jadwal'));
   });
 
   // 2. Simulasi Alur State Loading Nyata Tanpa Delay Buatan
-  test('2. Simulasi Transisi State Loading Nyata (Reading -> Analyzing -> Drafting -> Checking -> Idle)', () => {
+  test('2. Simulasi Transisi State Loading Nyata (Validating -> Analyzing -> Planning -> Checking Conflicts -> Idle)', () => {
     const stateTransitions: LoadingPhase[] = [];
     const recordState = (phase: LoadingPhase) => stateTransitions.push(phase);
 
     // Initial state
-    let currentPhase: LoadingPhase = 'idle';
+    let currentPhase: LoadingPhase = LoadingPhase.IDLE;
     recordState(currentPhase);
 
-    // Tahap 1: Membaca instruksi (validasi)
+    // Stage 1: Validating
     const prompt = 'Kelas dari jam 7 malam sampai jam 10 malam';
     assert.ok(prompt.trim().length > 0, 'Prompt tidak boleh kosong');
-    currentPhase = 'reading';
+    currentPhase = LoadingPhase.VALIDATING;
     recordState(currentPhase);
 
-    // Tahap 2: Menganalisis konteks waktu
+    // Stage 2: Analyzing
     const userTimezone = 'Asia/Jakarta';
     const nowIso = '2024-05-20T09:00:00Z';
-    currentPhase = 'analyzing';
+    currentPhase = LoadingPhase.ANALYZING;
     recordState(currentPhase);
 
-    // Tahap 3: Menyusun rencana via engine deterministik (simulasi fallback/offline)
-    currentPhase = 'drafting';
+    // Stage 3: Planning via engine deterministik (simulasi fallback/offline)
+    currentPhase = LoadingPhase.PLANNING;
     recordState(currentPhase);
     const parsed = parseIndonesianTemporalRules({
       userPrompt: prompt,
@@ -90,8 +90,8 @@ export async function runLoadingUxTests() {
     assert.ok(parsed.title, 'Harus menghasilkan judul rencana');
     assert.strictEqual(parsed.estimatedDurationMinutes, 180, 'Durasi harus 180 menit');
 
-    // Tahap 4: Memeriksa konflik ketersediaan slot
-    currentPhase = 'checking_slots';
+    // Stage 4: Checking Conflicts
+    currentPhase = LoadingPhase.CHECKING_CONFLICTS;
     recordState(currentPhase);
 
     const pseudoTask: Task = {
@@ -129,17 +129,17 @@ export async function runLoadingUxTests() {
     assert.strictEqual(schedRes.success, true, 'Scheduler harus berhasil menempatkan slot');
     assert.strictEqual(schedRes.proposedSessions.length, 1);
 
-    // Tahap 5: Selesai (Hasil utuh disajikan serentak)
-    currentPhase = 'idle';
+    // Stage 5: Selesai (Hasil utuh disajikan serentak)
+    currentPhase = LoadingPhase.IDLE;
     recordState(currentPhase);
 
     assert.deepStrictEqual(stateTransitions, [
-      'idle',
-      'reading',
-      'analyzing',
-      'drafting',
-      'checking_slots',
-      'idle',
+      LoadingPhase.IDLE,
+      LoadingPhase.VALIDATING,
+      LoadingPhase.ANALYZING,
+      LoadingPhase.PLANNING,
+      LoadingPhase.CHECKING_CONFLICTS,
+      LoadingPhase.IDLE,
     ]);
   });
 
@@ -203,21 +203,21 @@ export async function runLoadingUxTests() {
   test('5. Validasi Pencegahan Double Submit Saat Analisis Berlangsung', () => {
     const canSubmit = (phase: LoadingPhase, text: string) => {
       const isAnalyzing =
-        phase === 'reading' ||
-        phase === 'analyzing' ||
-        phase === 'drafting' ||
-        phase === 'checking_slots';
-      const isSaving = phase === 'saving_calendar';
+        phase === LoadingPhase.VALIDATING ||
+        phase === LoadingPhase.ANALYZING ||
+        phase === LoadingPhase.PLANNING ||
+        phase === LoadingPhase.CHECKING_CONFLICTS;
+      const isSaving = phase === LoadingPhase.SAVING_CALENDAR;
       return Boolean(text.trim() && !isAnalyzing && !isSaving);
     };
 
-    assert.strictEqual(canSubmit('idle', 'Tugas baru'), true, 'Harus bisa submit saat idle');
-    assert.strictEqual(canSubmit('idle', '   '), false, 'Tidak boleh submit teks kosong');
-    assert.strictEqual(canSubmit('reading', 'Tugas baru'), false, 'Terkunci saat tahap reading');
-    assert.strictEqual(canSubmit('analyzing', 'Tugas baru'), false, 'Terkunci saat tahap analyzing');
-    assert.strictEqual(canSubmit('drafting', 'Tugas baru'), false, 'Terkunci saat tahap drafting');
-    assert.strictEqual(canSubmit('checking_slots', 'Tugas baru'), false, 'Terkunci saat tahap checking_slots');
-    assert.strictEqual(canSubmit('saving_calendar', 'Tugas baru'), false, 'Terkunci saat tahap saving_calendar');
+    assert.strictEqual(canSubmit(LoadingPhase.IDLE, 'Tugas baru'), true, 'Harus bisa submit saat idle');
+    assert.strictEqual(canSubmit(LoadingPhase.IDLE, '   '), false, 'Tidak boleh submit teks kosong');
+    assert.strictEqual(canSubmit(LoadingPhase.VALIDATING, 'Tugas baru'), false, 'Terkunci saat tahap validating');
+    assert.strictEqual(canSubmit(LoadingPhase.ANALYZING, 'Tugas baru'), false, 'Terkunci saat tahap analyzing');
+    assert.strictEqual(canSubmit(LoadingPhase.PLANNING, 'Tugas baru'), false, 'Terkunci saat tahap planning');
+    assert.strictEqual(canSubmit(LoadingPhase.CHECKING_CONFLICTS, 'Tugas baru'), false, 'Terkunci saat tahap checking conflicts');
+    assert.strictEqual(canSubmit(LoadingPhase.SAVING_CALENDAR, 'Tugas baru'), false, 'Terkunci saat tahap saving_calendar');
   });
 
   // 6. Zero Delay Buatan: Memastikan Eksekusi Deterministik Tanpa Delay Tiruan
