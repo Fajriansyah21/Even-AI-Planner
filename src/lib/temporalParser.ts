@@ -489,6 +489,9 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   // Calculate target date parts in the given timezone
   const targetDateObj = addDaysInTimezone(baseDate, dayOffset, tz);
   const targetParts = getPartsInTimezone(targetDateObj, tz);
+  const targetDateStr = `${targetParts.year}-${String(targetParts.month).padStart(2, '0')}-${String(targetParts.day).padStart(2, '0')}`;
+  const targetDayOffset = hasExplicitDayTarget ? dayOffset : undefined;
+  const targetDate = hasExplicitDayTarget ? targetDateStr : undefined;
 
   // 2. Identify fixed commitment keywords vs flexible tasks:
   // e.g. "kelas", "kuliah", "webinar", "rapat", "meeting", "janji", "jadwal", "workshop", "seminar"
@@ -686,6 +689,9 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
 
   let targetOccurrences: TaskOccurrence[] | undefined = undefined;
   let targetDays: number[] | undefined = detectedWeekdays.length > 0 ? detectedWeekdays.map((dw) => dw.dayIndex) : undefined;
+  if (!targetDays && hasExplicitDayTarget && !promptIsRecurring) {
+    targetDays = [targetParts.dayOfWeek];
+  }
 
   if (isExactFixedEvent && fixedStartHour !== null) {
     timeConstraintType = 'fixed_event';
@@ -810,15 +816,33 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   // JANGAN PERNAH membuat tenggat baku jam 18:00 hari ini jika pengguna tidak menyebutkan tenggat!
   let deadlineIso: string | undefined = undefined;
   let deadlineDaysFromNow: number | undefined = undefined;
+  let hasExplicitDeadline = false;
 
   const hasExplicitDeadlineKeyword =
     /\b(deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\b/i.test(prompt) ||
     prompt.includes('minggu ini');
 
   if (detectedDeadlineDay) {
+    hasExplicitDeadline = true;
+    let dHour = 23;
+    let dMinute = 59;
+    const deadlineTimeMatch = prompt.match(
+      /(?:deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\s*(?:hari\s+\w+|\w+)?\s*(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i
+    );
+    if (deadlineTimeMatch) {
+      let dh = parseInt(deadlineTimeMatch[1], 10);
+      const dm = deadlineTimeMatch[2] ? parseInt(deadlineTimeMatch[2], 10) : 0;
+      const dPeriod = deadlineTimeMatch[3];
+      if ((dPeriod === 'malam' || prompt.includes('malam')) && dh < 12) dh += 12;
+      else if ((dPeriod === 'sore' || prompt.includes('sore')) && dh <= 6) dh += 12;
+      else if ((dPeriod === 'siang' || prompt.includes('siang')) && dh >= 1 && dh <= 3) dh += 12;
+      dHour = dh;
+      dMinute = dm;
+    }
+
     const nextDeadlineDate = getNextValidDateForDayOfWeek(detectedDeadlineDay.dayIndex, baseDate, tz, {
-      targetHour: 23,
-      targetMinute: 59,
+      targetHour: dHour,
+      targetMinute: dMinute,
       forceNextWeek: prompt.includes('depan'),
     });
     deadlineDaysFromNow = Math.max(1, nextDeadlineDate.dayOffset);
@@ -826,13 +850,14 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
       nextDeadlineDate.year,
       nextDeadlineDate.month,
       nextDeadlineDate.day,
-      23,
-      59,
+      dHour,
+      dMinute,
       0,
       tz
     );
   } else if (prompt.includes('minggu ini')) {
     // Tenggat waktu akhir pekan berjalan (hari Minggu jam 23:59:00 WIB)
+    hasExplicitDeadline = true;
     const daysUntilEndOfWeek = (7 - baseParts.dayOfWeek) % 7;
     const endOfWeekObj = addDaysInTimezone(baseDate, daysUntilEndOfWeek, tz);
     const endOfWeekParts = getPartsInTimezone(endOfWeekObj, tz);
@@ -847,13 +872,15 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
       tz
     );
   } else if (timeConstraintType === 'fixed_event' && requestedEndAt) {
-    deadlineIso = requestedEndAt;
-    deadlineDaysFromNow = Math.max(1, dayOffset);
+    hasExplicitDeadline = false;
+    deadlineIso = undefined;
+    deadlineDaysFromNow = hasExplicitDayTarget && dayOffset > 0 ? dayOffset : undefined;
   } else if (hasExplicitDeadlineKeyword) {
+    hasExplicitDeadline = true;
     // Pengguna menyebutkan kata kunci tenggat (misal: "deadline besok", "sebelum jam 5 sore", "paling lambat lusa")
     let targetDeadlineOffset = dayOffset;
-    let deadlineHour = preferredTimeOfDay === 'EVENING' ? 23 : 18;
-    let deadlineMinute = 0;
+    let deadlineHour = 23;
+    let deadlineMinute = 59;
 
     // Periksa apakah ada jam spesifik setelah kata kunci tenggat
     // e.g. "sebelum jam 5 sore", "paling lambat jam 17.00", "deadline pukul 20:00"
@@ -893,6 +920,7 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     );
   } else {
     // Pengguna TIDAK menyebutkan tenggat: properti deadlineAt HARUS undefined (bukan 18:00 hari ini)
+    hasExplicitDeadline = false;
     deadlineIso = undefined;
     if (hasExplicitDayTarget && dayOffset > 0) {
       deadlineDaysFromNow = Math.max(1, dayOffset);
@@ -997,6 +1025,10 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     clarificationPrompt,
     preferredWindow,
     preferredTimeOfDay,
+    targetDate,
+    targetDayOffset,
+    hasExplicitDeadline,
+    hasDeadline: hasExplicitDeadline,
     deadlineAt: deadlineIso,
     deadlineDaysFromNow,
     timezone: tz,

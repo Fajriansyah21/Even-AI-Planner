@@ -252,14 +252,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         return;
       }
 
-      // Construct deadline date if specified
-      let calculatedDeadlineAt: string | null = plan.deadlineAt || null;
-      if (!calculatedDeadlineAt && typeof plan.deadlineDaysFromNow === 'number') {
-        const deadlineDate = new Date();
-        deadlineDate.setDate(deadlineDate.getDate() + plan.deadlineDaysFromNow);
-        deadlineDate.setHours(plan.preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
-        calculatedDeadlineAt = deadlineDate.toISOString();
-      }
+      // Pisahkan secara tegas antara batas tenggat eksplisit dan tanggal target:
+      // JANGAN PERNAH menyintesis tenggat buatan jam 18.00/23.00 jika pengguna tidak meminta tenggat!
+      const calculatedDeadlineAt: string | null = plan.deadlineAt || null;
 
       // Pre-flight check via deterministic scheduler
       const pseudoTask: Task = {
@@ -269,6 +264,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         description: plan.description,
         estimatedDurationMinutes: plan.estimatedDurationMinutes,
         deadlineAt: calculatedDeadlineAt,
+        hasExplicitDeadline: Boolean(plan.hasExplicitDeadline || plan.deadlineAt),
+        targetDate: plan.targetDate,
+        targetDayOffset: plan.targetDayOffset,
         priority: plan.priority,
         status: 'UNSCHEDULED',
         allowSplit: plan.allowSplit,
@@ -312,13 +310,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             },
           });
 
-          let calculatedDeadlineAt: string | null = fallbackParsed.deadlineAt || null;
-          if (!calculatedDeadlineAt && typeof fallbackParsed.deadlineDaysFromNow === 'number') {
-            const deadlineDate = new Date();
-            deadlineDate.setDate(deadlineDate.getDate() + fallbackParsed.deadlineDaysFromNow);
-            deadlineDate.setHours(fallbackParsed.preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
-            calculatedDeadlineAt = deadlineDate.toISOString();
-          }
+          const calculatedDeadlineAt: string | null = fallbackParsed.deadlineAt || null;
 
           const fallbackTask: Task = {
             id: `ai-draft-${Date.now()}`,
@@ -327,6 +319,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             description: fallbackParsed.description,
             estimatedDurationMinutes: fallbackParsed.estimatedDurationMinutes,
             deadlineAt: calculatedDeadlineAt,
+            hasExplicitDeadline: Boolean(fallbackParsed.hasExplicitDeadline || fallbackParsed.deadlineAt),
+            targetDate: fallbackParsed.targetDate,
+            targetDayOffset: fallbackParsed.targetDayOffset,
             priority: fallbackParsed.priority,
             status: 'UNSCHEDULED',
             allowSplit: fallbackParsed.allowSplit,
@@ -390,6 +385,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       description: updatedPlan.description,
       estimatedDurationMinutes: updatedPlan.estimatedDurationMinutes,
       deadlineAt: updatedPlan.deadlineAt,
+      hasExplicitDeadline: Boolean(updatedPlan.hasExplicitDeadline || updatedPlan.deadlineAt),
+      targetDate: updatedPlan.targetDate,
+      targetDayOffset: updatedPlan.targetDayOffset,
       priority: updatedPlan.priority,
       status: 'UNSCHEDULED',
       allowSplit: updatedPlan.allowSplit,

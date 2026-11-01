@@ -362,6 +362,207 @@ export function runDeadlineAndSlotDiagnosticsTests() {
     console.log('  ✅ [PASS] Kasus 11: Diagnostik penolakan jendela jujur tanpa tuduhan jendela penuh.');
   }
 
+  // KASUS 12: Pemisahan Tegas Tanggal Target vs Tenggat ("Belajar kimia selama 2 jam besok pagi")
+  console.log('>>> [12/16] Kasus 12: Pemisahan target date vs tenggat ("Belajar kimia selama 2 jam besok pagi")');
+  {
+    const prompt = 'Belajar kimia selama 2 jam besok pagi.';
+    const parsed = parseIndonesianTemporalRules({
+      userPrompt: prompt,
+      currentDateTime: MOCK_REFERENCE_DATE.toISOString(), // Senin, 20 Mei 2024, 16:00 WIB
+      userTimezone: TEST_TIMEZONE,
+    });
+
+    assert(parsed.estimatedDurationMinutes === 120, `Durasi harus 120 menit, dapat: ${parsed.estimatedDurationMinutes}`);
+    assert(parsed.targetDayOffset === 1, `targetDayOffset harus 1, dapat: ${parsed.targetDayOffset}`);
+    assert(parsed.targetDate === '2024-05-21', `targetDate harus '2024-05-21', dapat: '${parsed.targetDate}'`);
+    assert(parsed.hasExplicitDeadline === false, `hasExplicitDeadline harus false, dapat: ${parsed.hasExplicitDeadline}`);
+    assert(parsed.deadlineAt === undefined, `deadlineAt harus undefined, dapat: '${parsed.deadlineAt}'`);
+    assert(parsed.preferredTimeOfDay === 'MORNING', `preferredTimeOfDay harus MORNING, dapat: ${parsed.preferredTimeOfDay}`);
+
+    // Simulasi pembuatan pseudoTask seperti di AIAssistantView.tsx
+    const calculatedDeadlineAt = parsed.hasExplicitDeadline && parsed.deadlineAt ? parsed.deadlineAt : undefined;
+    assert(calculatedDeadlineAt === undefined, 'calculatedDeadlineAt TIDAK boleh dibuat buatan pada jam 18:00 atau 23:00!');
+
+    const task: Task = {
+      id: 'task-chem-besok',
+      userId: 'user-default',
+      title: parsed.title,
+      estimatedDurationMinutes: parsed.estimatedDurationMinutes,
+      deadlineAt: calculatedDeadlineAt,
+      priority: parsed.priority,
+      status: 'UNSCHEDULED',
+      allowSplit: parsed.allowSplit,
+      timeConstraintType: parsed.timeConstraintType,
+      preferredTimeOfDay: parsed.preferredTimeOfDay,
+      preferredWindow: parsed.preferredWindow,
+      targetDays: parsed.targetDays,
+      targetDate: parsed.targetDate,
+      targetDayOffset: parsed.targetDayOffset,
+      hasExplicitDeadline: parsed.hasExplicitDeadline,
+      timezone: TEST_TIMEZONE,
+      createdAt: MOCK_REFERENCE_DATE.toISOString(),
+    };
+
+    const result = scheduleTaskDeterministically(task, [], [], defaultPrefs, MOCK_REFERENCE_DATE);
+    assert(result.success === true, `Jadwal harus sukses, error: ${result.explanation}`);
+    assert(result.proposedSessions.length === 1, 'Harus ada 1 sesi 2 jam');
+    const session = result.proposedSessions[0];
+    const sessionStart = getPartsInTimezone(new Date(session.startAt), TEST_TIMEZONE);
+    assert(sessionStart.day === 21, `Harus dijadwalkan Selasa (21 Mei), dapat: ${sessionStart.day}`);
+    assert(sessionStart.hour >= 6 && sessionStart.hour <= 10, `Harus dalam jendela pagi (06:00 - 12:00 WIB), dapat jam: ${sessionStart.hour}`);
+    assert(session.durationMinutes === 120, `Durasi harus 120 menit, dapat: ${session.durationMinutes}`);
+    console.log('  ✅ [PASS] Kasus 12: Target besok pagi terjadwal Selasa 09:00-11:00 WIB tanpa batas tenggat 18:00.');
+  }
+
+  // KASUS 13: Fixed event dengan tanggal target "Kelas React besok pukul 19.00 selama 1 jam."
+  console.log('>>> [13/16] Kasus 13: Fixed event besok malam terjadwal presisi tanpa tenggat palsu');
+  {
+    const prompt = 'Kelas React besok pukul 19.00 selama 1 jam.';
+    const parsed = parseIndonesianTemporalRules({
+      userPrompt: prompt,
+      currentDateTime: MOCK_REFERENCE_DATE.toISOString(),
+      userTimezone: TEST_TIMEZONE,
+    });
+
+    assert(parsed.timeConstraintType === 'fixed_event', 'Harus fixed_event');
+    assert(parsed.targetDate === '2024-05-21', `targetDate harus '2024-05-21', dapat: ${parsed.targetDate}`);
+    assert(parsed.targetDayOffset === 1, `targetDayOffset harus 1, dapat: ${parsed.targetDayOffset}`);
+    assert(parsed.hasExplicitDeadline === false, 'hasExplicitDeadline harus false');
+    assert(parsed.deadlineAt === undefined, 'deadlineAt harus undefined');
+
+    const task: Task = {
+      id: 'task-react-besok',
+      userId: 'user-default',
+      title: parsed.title,
+      estimatedDurationMinutes: parsed.estimatedDurationMinutes,
+      deadlineAt: undefined,
+      priority: parsed.priority,
+      status: 'UNSCHEDULED',
+      allowSplit: false,
+      timeConstraintType: 'fixed_event',
+      requestedStartAt: parsed.requestedStartAt,
+      requestedEndAt: parsed.requestedEndAt,
+      targetDate: parsed.targetDate,
+      targetDayOffset: parsed.targetDayOffset,
+      hasExplicitDeadline: false,
+      timezone: TEST_TIMEZONE,
+      createdAt: MOCK_REFERENCE_DATE.toISOString(),
+    };
+
+    const result = scheduleTaskDeterministically(task, [], [], defaultPrefs, MOCK_REFERENCE_DATE);
+    assert(result.success === true, `Jadwal harus sukses: ${result.explanation}`);
+    const session = result.proposedSessions[0];
+    const sessionStart = getPartsInTimezone(new Date(session.startAt), TEST_TIMEZONE);
+    assert(sessionStart.day === 21, `Harus Selasa (21), dapat: ${sessionStart.day}`);
+    assert(sessionStart.hour === 19, `Harus jam 19, dapat: ${sessionStart.hour}`);
+    console.log('  ✅ [PASS] Kasus 13: Fixed event besok malam terjadwal presisi Selasa 19:00 WIB.');
+  }
+
+  // KASUS 14: Tenggat eksplisit "Selesaikan laporan selama 90 menit sebelum Jumat pukul 18.00."
+  console.log('>>> [14/16] Kasus 14: Tenggat eksplisit sebelum Jumat pukul 18.00 dipertahankan');
+  {
+    const prompt = 'Selesaikan laporan selama 90 menit sebelum Jumat pukul 18.00.';
+    const parsed = parseIndonesianTemporalRules({
+      userPrompt: prompt,
+      currentDateTime: MOCK_REFERENCE_DATE.toISOString(),
+      userTimezone: TEST_TIMEZONE,
+    });
+
+    assert(parsed.hasExplicitDeadline === true, 'hasExplicitDeadline harus true');
+    assert(parsed.deadlineAt !== undefined, 'deadlineAt harus ada');
+    const deadlineParts = getPartsInTimezone(new Date(parsed.deadlineAt!), TEST_TIMEZONE);
+    assert(deadlineParts.dayOfWeek === 5, `Hari tenggat harus Jumat (5), dapat: ${deadlineParts.dayOfWeek}`);
+    assert(deadlineParts.hour === 18, `Jam tenggat harus 18:00 WIB, dapat: ${deadlineParts.hour}`);
+    assert(deadlineParts.minute === 0, `Menit tenggat harus 0, dapat: ${deadlineParts.minute}`);
+    console.log('  ✅ [PASS] Kasus 14: Tenggat eksplisit Jumat 18:00 WIB terdeteksi akurat.');
+  }
+
+  // KASUS 15: Pembedaan failureCode TARGET_DATE_PASSED vs DEADLINE_PASSED
+  console.log('>>> [15/16] Kasus 15: Pembedaan failureCode TARGET_DATE_PASSED vs DEADLINE_PASSED');
+  {
+    // A: Tanggal target kemarin -> TARGET_DATE_PASSED
+    const pastTargetTask: Task = {
+      id: 'task-yesterday',
+      userId: 'user-default',
+      title: 'Tugas Target Kemarin',
+      estimatedDurationMinutes: 60,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: false,
+      targetDayOffset: -1,
+      targetDate: '2024-05-19',
+      hasExplicitDeadline: false,
+      timezone: TEST_TIMEZONE,
+      createdAt: MOCK_REFERENCE_DATE.toISOString(),
+    };
+    const resultPastTarget = scheduleTaskDeterministically(pastTargetTask, [], [], defaultPrefs, MOCK_REFERENCE_DATE);
+    assert(resultPastTarget.success === false, 'Target date kemarin harus gagal');
+    assert(resultPastTarget.failureCode === 'TARGET_DATE_PASSED', `failureCode harus TARGET_DATE_PASSED, dapat: ${resultPastTarget.failureCode}`);
+    assert(resultPastTarget.explanation.includes('Tanggal target kegiatan'), 'Penjelasan harus menyebutkan tanggal target kegiatan');
+
+    // B: Tenggat kemarin -> DEADLINE_PASSED
+    const pastDeadlineTask: Task = {
+      id: 'task-past-dl',
+      userId: 'user-default',
+      title: 'Tugas Tenggat Kemarin',
+      estimatedDurationMinutes: 60,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: false,
+      deadlineAt: createIsoInTimezone(2024, 5, 19, 18, 0, 0, TEST_TIMEZONE),
+      hasExplicitDeadline: true,
+      timezone: TEST_TIMEZONE,
+      createdAt: MOCK_REFERENCE_DATE.toISOString(),
+    };
+    const resultPastDeadline = scheduleTaskDeterministically(pastDeadlineTask, [], [], defaultPrefs, MOCK_REFERENCE_DATE);
+    assert(resultPastDeadline.success === false, 'Tenggat kemarin harus gagal');
+    assert(resultPastDeadline.failureCode === 'DEADLINE_PASSED', `failureCode harus DEADLINE_PASSED, dapat: ${resultPastDeadline.failureCode}`);
+    assert(resultPastDeadline.explanation.includes('Tenggat waktu'), 'Penjelasan harus menyebutkan tenggat waktu');
+    console.log('  ✅ [PASS] Kasus 15: TARGET_DATE_PASSED dan DEADLINE_PASSED dibedakan secara tegas.');
+  }
+
+  // KASUS 16: Ekuivalensi Fallback & Sanitasi Gemini untuk targetDate dan hasExplicitDeadline
+  console.log('>>> [16/16] Kasus 16: Sanitasi pipeline AI dan fallback memiliki semantik targetDate & deadline yang identik');
+  {
+    const prompt = 'Belajar biologi selama 45 menit besok pagi.';
+    const geminiHallucinatedPlan = {
+      title: 'Belajar Biologi',
+      estimatedDurationMinutes: 45,
+      preferredTimeOfDay: 'MORNING' as const,
+      deadlineAt: '2024-05-21T11:00:00.000Z', // AI mengarang deadline
+      deadlineDaysFromNow: 1,
+      priority: 'MEDIUM' as const,
+      timeConstraintType: 'preferred_window' as const,
+      allowSplit: false,
+    };
+
+    const sanitizedResult = simulateBackendPlanPipeline(prompt, {
+      mockGeminiPlan: geminiHallucinatedPlan,
+      apiKeyConfigured: true,
+      refDate: MOCK_REFERENCE_DATE,
+    });
+
+    assert(sanitizedResult.success === true, 'Pipeline harus sukses');
+    assert(sanitizedResult.plan.hasExplicitDeadline === false, 'hasExplicitDeadline harus false');
+    assert(sanitizedResult.plan.deadlineAt === undefined, 'deadlineAt harus dibersihkan dari halusinasi');
+    assert(sanitizedResult.plan.targetDate === '2024-05-21', `targetDate harus '2024-05-21', dapat: ${sanitizedResult.plan.targetDate}`);
+    assert(sanitizedResult.plan.targetDayOffset === 1, `targetDayOffset harus 1, dapat: ${sanitizedResult.plan.targetDayOffset}`);
+
+    const fallbackResult = simulateBackendPlanPipeline(prompt, {
+      mockGeminiPlan: null,
+      geminiError: new Error('Network error'),
+      apiKeyConfigured: true,
+      refDate: MOCK_REFERENCE_DATE,
+    });
+
+    assert(fallbackResult.success === true, 'Fallback harus sukses');
+    assert(fallbackResult.plan.hasExplicitDeadline === false, 'Fallback hasExplicitDeadline harus false');
+    assert(fallbackResult.plan.deadlineAt === undefined, 'Fallback deadlineAt harus undefined');
+    assert(fallbackResult.plan.targetDate === sanitizedResult.plan.targetDate, 'targetDate fallback dan sanitized harus sama persis');
+    assert(fallbackResult.plan.targetDayOffset === sanitizedResult.plan.targetDayOffset, 'targetDayOffset fallback dan sanitized harus sama');
+    console.log('  ✅ [PASS] Kasus 16: Ekuivalensi semantik AI sanitization dan deterministic fallback sempurna.');
+  }
+
   console.log('\n========================================================================');
   console.log('🎉 SELURUH PENGUJIAN DIAGNOSTIK TENGGAT & SLOT PENJADWALAN BERHASIL 100%! 🎉');
   console.log('========================================================================\n');

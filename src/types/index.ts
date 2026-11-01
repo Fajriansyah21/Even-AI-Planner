@@ -68,6 +68,9 @@ export interface Task {
   description?: string;
   estimatedDurationMinutes: number;
   deadlineAt?: string | null; // ISO date string - strictly optional
+  hasExplicitDeadline?: boolean; // True jika ada batas tenggat eksplisit dari instruksi pengguna
+  targetDate?: string; // Tanggal target pengerjaan (YYYY-MM-DD), terpisah dari tenggat
+  targetDayOffset?: number; // Offset hari pengerjaan dari waktu acuan (0 = hari ini, 1 = besok, 2 = lusa)
   priority: Priority;
   status: TaskStatus;
   allowSplit: boolean;
@@ -153,6 +156,7 @@ export interface ScheduleCalculationResult {
     | 'PREFERRED_WINDOW_FULL'
     | 'NO_SLOT_BEFORE_DEADLINE'
     | 'DEADLINE_PASSED'
+    | 'TARGET_DATE_PASSED'
     | 'INVALID_TIME_RANGE';
   proposedSessions: {
     startAt: string;
@@ -223,7 +227,10 @@ export interface AIPlanDraft {
   isDayAmbiguous?: boolean;
   preferredWindow?: PreferredTimeWindow; // Custom window e.g. 19:00 - 22:00
   preferredTimeOfDay: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY';
-  deadlineAt?: string | null;            // ISO date string (optional)
+  targetDate?: string;                   // Tanggal target pengerjaan (YYYY-MM-DD), terpisah dari tenggat
+  targetDayOffset?: number;              // Offset hari pengerjaan dari waktu acuan (0 = hari ini, 1 = besok, 2 = lusa)
+  deadlineAt?: string | null;            // ISO date string (optional - HANYA jika ada tenggat eksplisit)
+  hasExplicitDeadline?: boolean;         // True jika pengguna secara eksplisit menyebutkan batas tenggat
   hasDeadline?: boolean;
   deadlineDaysFromNow?: number;
   timezone: string;                      // e.g. 'Asia/Jakarta'

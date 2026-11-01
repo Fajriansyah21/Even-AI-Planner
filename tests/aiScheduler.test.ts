@@ -127,15 +127,26 @@ export function simulateBackendPlanPipeline(
   if (baselinePlan.targetOccurrences && baselinePlan.targetOccurrences.length > 0) {
     sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
   }
+  if (baselinePlan.targetDate) {
+    sanitizedPlan.targetDate = baselinePlan.targetDate;
+  }
+  if (typeof baselinePlan.targetDayOffset === 'number') {
+    sanitizedPlan.targetDayOffset = baselinePlan.targetDayOffset;
+  }
+  if (typeof baselinePlan.hasExplicitDayTarget === 'boolean') {
+    sanitizedPlan.hasExplicitDayTarget = baselinePlan.hasExplicitDayTarget;
+  }
   if (baselinePlan.preferredTimeOfDay !== 'ANY') {
     sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
   }
   if (baselinePlan.deadlineAt) {
     sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
     sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
+    sanitizedPlan.hasExplicitDeadline = true;
   } else {
     delete sanitizedPlan.deadlineAt;
     delete sanitizedPlan.deadlineDaysFromNow;
+    sanitizedPlan.hasExplicitDeadline = false;
   }
   if (baselinePlan.targetDays && baselinePlan.targetDays.length > 1) {
     sanitizedPlan.reasoning = baselinePlan.reasoning;

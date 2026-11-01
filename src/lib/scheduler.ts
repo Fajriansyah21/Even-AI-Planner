@@ -494,8 +494,40 @@ export function scheduleTaskDeterministically(
       taskTitle: task.title,
       failureCode: 'DEADLINE_PASSED',
       proposedSessions: [],
-      explanation: `Tenggat waktu (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)}) sudah lewat dari waktu saat ini.`,
+      explanation: `Tenggat waktu (${formatIndonesianDate(deadline, userTz)}, ${formatTime(deadline, userTz)} WIB) sudah lewat dari waktu saat ini.`,
     };
+  }
+
+  // Cek apakah tanggal target pengerjaan di masa lalu (bukan tenggat)
+  if (task.targetDayOffset !== undefined && task.targetDayOffset < 0) {
+    const targetDateObj = addDaysInTimezone(referenceDate, task.targetDayOffset, userTz);
+    return {
+      success: false,
+      taskId: task.id,
+      taskTitle: task.title,
+      failureCode: 'TARGET_DATE_PASSED',
+      proposedSessions: [],
+      explanation: `Tanggal target kegiatan (${formatIndonesianDate(targetDateObj, userTz)}) sudah lewat dari waktu saat ini.`,
+    };
+  }
+
+  if (task.targetDate) {
+    const dateParts = task.targetDate.split('-').map(Number);
+    if (dateParts.length === 3) {
+      const targetEndIso = createIsoInTimezone(dateParts[0], dateParts[1], dateParts[2], 23, 59, 59, userTz);
+      const targetEndDate = new Date(targetEndIso);
+      if (targetEndDate.getTime() < referenceDate.getTime()) {
+        const targetDateObj = new Date(createIsoInTimezone(dateParts[0], dateParts[1], dateParts[2], 12, 0, 0, userTz));
+        return {
+          success: false,
+          taskId: task.id,
+          taskTitle: task.title,
+          failureCode: 'TARGET_DATE_PASSED',
+          proposedSessions: [],
+          explanation: `Tanggal target kegiatan (${formatIndonesianDate(targetDateObj, userTz)}) sudah lewat dari waktu saat ini.`,
+        };
+      }
+    }
   }
 
   // Collect busy windows from calendar events and existing task sessions
@@ -538,21 +570,36 @@ export function scheduleTaskDeterministically(
   const candidateDays: { year: number; month: number; day: number; dayOfWeek: number; dateObj: Date }[] = [];
   const searchStart = new Date(referenceDate);
 
-  // Jika tugas memiliki target hari tunggal eksplisit (misal: "Kamis..."), targetkan hari tersebut!
+  // Jika tugas memiliki target hari tunggal eksplisit (misal: "Kamis...", "besok", targetDayOffset, targetDate), targetkan hari tersebut!
   const hasSpecificSingleTargetDay = Boolean(
-    task.targetDays && task.targetDays.length === 1 && !task.isRecurring
+    (task.targetDayOffset !== undefined && !task.isRecurring && task.targetDayOffset >= 0) ||
+    (task.targetDate && !task.isRecurring) ||
+    (task.targetDays && task.targetDays.length === 1 && !task.isRecurring)
   );
 
-  if (hasSpecificSingleTargetDay && task.targetDays) {
-    const targetDayIndex = task.targetDays[0];
-    const targetDateInfo = getNextValidDateForDayOfWeek(targetDayIndex, referenceDate, userTz);
-    candidateDays.push({
-      year: targetDateInfo.year,
-      month: targetDateInfo.month,
-      day: targetDateInfo.day,
-      dayOfWeek: targetDayIndex,
-      dateObj: targetDateInfo.date,
-    });
+  if (hasSpecificSingleTargetDay) {
+    if (task.targetDayOffset !== undefined && !task.isRecurring && task.targetDayOffset >= 0) {
+      const targetDateObj = addDaysInTimezone(searchStart, task.targetDayOffset, userTz);
+      const parts = getPartsInTimezone(targetDateObj, userTz);
+      candidateDays.push({ ...parts, dateObj: targetDateObj });
+    } else if (task.targetDate && !task.isRecurring) {
+      const parts = task.targetDate.split('-').map(Number);
+      if (parts.length === 3) {
+        const targetDateObj = new Date(createIsoInTimezone(parts[0], parts[1], parts[2], 12, 0, 0, userTz));
+        const p = getPartsInTimezone(targetDateObj, userTz);
+        candidateDays.push({ ...p, dateObj: targetDateObj });
+      }
+    } else if (task.targetDays && task.targetDays.length === 1) {
+      const targetDayIndex = task.targetDays[0];
+      const targetDateInfo = getNextValidDateForDayOfWeek(targetDayIndex, referenceDate, userTz);
+      candidateDays.push({
+        year: targetDateInfo.year,
+        month: targetDateInfo.month,
+        day: targetDateInfo.day,
+        dayOfWeek: targetDayIndex,
+        dateObj: targetDateInfo.date,
+      });
+    }
   } else {
     for (let d = 0; d < maxSearchDays; d++) {
       const dayObj = addDaysInTimezone(searchStart, d, userTz);
