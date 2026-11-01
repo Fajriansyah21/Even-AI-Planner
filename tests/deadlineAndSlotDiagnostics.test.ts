@@ -13,6 +13,10 @@ import {
 } from '../src/lib/timezone';
 import { Task, CalendarEvent, UserPreferences } from '../src/types';
 import { simulateBackendPlanPipeline, MOCK_REFERENCE_DATE, TEST_TIMEZONE } from './aiScheduler.test';
+import {
+  getAvailableSplitOptions,
+  formatPlanTargetDisplay,
+} from '../src/components/AIAssistantView';
 
 function assert(condition: boolean, msg: string) {
   if (!condition) {
@@ -561,6 +565,233 @@ export function runDeadlineAndSlotDiagnosticsTests() {
     assert(fallbackResult.plan.targetDate === sanitizedResult.plan.targetDate, 'targetDate fallback dan sanitized harus sama persis');
     assert(fallbackResult.plan.targetDayOffset === sanitizedResult.plan.targetDayOffset, 'targetDayOffset fallback dan sanitized harus sama');
     console.log('  ✅ [PASS] Kasus 16: Ekuivalensi semantik AI sanitization dan deterministic fallback sempurna.');
+  }
+
+  // KASUS 17: Pilihan Pembagian Sesi Nyata (90m utuh vs 2x45m terpisah, deteksi slot parsial & kegagalan jujur)
+  console.log('>>> [17/20] Kasus 17: Kontrol pembagian sesi berfungsi nyata di deterministic scheduler');
+  {
+    // Kalender memiliki dua slot 45 menit terpisah pada hari Senin:
+    // Slot 1: 10:00 - 10:45 (45 menit)
+    // Acara 1: 10:45 - 14:00 (sibuk)
+    // Slot 2: 14:00 - 14:45 (45 menit)
+    // Acara 2: 14:45 - 18:00 (sibuk)
+    // Di kalender ini: TIDAK ADA slot 90 menit kontigu. Hanya ada 2 slot 45 menit.
+    const busyEvents: CalendarEvent[] = [
+      {
+        id: 'evt-busy-1',
+        userId: 'user-default',
+        title: 'Rapat Koordinasi Tim',
+        startAt: createIsoInTimezone(2024, 5, 20, 10, 45, 0, TEST_TIMEZONE),
+        endAt: createIsoInTimezone(2024, 5, 20, 14, 0, 0, TEST_TIMEZONE),
+        isAllDay: false,
+        source: 'internal',
+        editable: false,
+      },
+      {
+        id: 'evt-busy-2',
+        userId: 'user-default',
+        title: 'Presentasi Proyek',
+        startAt: createIsoInTimezone(2024, 5, 20, 14, 45, 0, TEST_TIMEZONE),
+        endAt: createIsoInTimezone(2024, 5, 20, 18, 0, 0, TEST_TIMEZONE),
+        isAllDay: false,
+        source: 'internal',
+        editable: false,
+      },
+    ];
+
+    // Sub-kasus 17A: Pengguna memilih 'Satu Sesi Utuh' (90 menit) pada hari Senin saja (tenggat jam 18:00)
+    const taskSingle: Task = {
+      id: 'task-single-90',
+      userId: 'user-default',
+      title: 'Mengerjakan Laporan Praktikum',
+      estimatedDurationMinutes: 90,
+      priority: 'HIGH',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      splitConfig: {
+        forcedMode: 'single',
+        targetSessionCount: 1,
+        sessionDurationMinutes: 90,
+      },
+      deadlineAt: createIsoInTimezone(2024, 5, 20, 18, 0, 0, TEST_TIMEZONE),
+      hasExplicitDeadline: true,
+      timezone: TEST_TIMEZONE,
+      createdAt: MOCK_REFERENCE_DATE.toISOString(),
+    };
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      bufferMinutes: 0,
+      enableLunchBreak: false,
+    };
+
+    const morningAnchor = new Date('2024-05-20T03:00:00.000Z'); // 10:00 WIB
+    const resultSingle = scheduleTaskDeterministically(taskSingle, busyEvents, [], cleanPrefs, morningAnchor);
+    assert(resultSingle.success === false, 'Mode satu sesi utuh harus gagal karena tidak ada slot 90 menit kontigu');
+    assert(
+      resultSingle.failureCode === 'NO_CONTIGUOUS_SLOT' || resultSingle.failureCode === 'DEADLINE_INSUFFICIENT_TIME',
+      `failureCode harus melaporkan kegagalan slot kontigu, dapat: ${resultSingle.failureCode}`
+    );
+    assert(
+      resultSingle.explanation.includes('kontigu') || resultSingle.explanation.includes('tidak mencukupi'),
+      'Penjelasan harus jujur menjelaskan slot kontigu tidak cukup'
+    );
+
+    // Sub-kasus 17B: Pengguna beralih ke 'Bagi Menjadi Beberapa Sesi' (2 sesi × 45 menit)
+    const taskSplit: Task = {
+      ...taskSingle,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurationMinutes: 45,
+      },
+    };
+
+    const resultSplit = scheduleTaskDeterministically(taskSplit, busyEvents, [], cleanPrefs, morningAnchor);
+    assert(resultSplit.success === true, `Mode 2x45m harus sukses di kalender ini, dapat false: ${resultSplit.explanation}`);
+    assert(resultSplit.proposedSessions.length === 2, `Harus menghasilkan 2 sesi, dapat: ${resultSplit.proposedSessions.length}`);
+    assert(resultSplit.proposedSessions[0].durationMinutes === 45, `Sesi 1 harus 45m, dapat: ${resultSplit.proposedSessions[0].durationMinutes}`);
+    assert(resultSplit.proposedSessions[1].durationMinutes === 45, `Sesi 2 harus 45m, dapat: ${resultSplit.proposedSessions[1].durationMinutes}`);
+    const totalAllocated = resultSplit.proposedSessions.reduce((acc, s) => acc + s.durationMinutes, 0);
+    assert(totalAllocated === 90, `Total waktu teralokasi harus tepat 90m, dapat: ${totalAllocated}`);
+
+    // Sub-kasus 17C: Deteksi kegagalan parsial jujur (hanya ada 1 slot 45m, slot ke-2 tidak ada)
+    // Tambahkan event sibuk tambahan yang menutupi slot ke-2:
+    const busyEventsOnlyOneSlot: CalendarEvent[] = [
+      ...busyEvents,
+      {
+        id: 'evt-busy-3',
+        userId: 'user-default',
+        title: 'Meeting Tambahan',
+        startAt: createIsoInTimezone(2024, 5, 20, 14, 0, 0, TEST_TIMEZONE),
+        endAt: createIsoInTimezone(2024, 5, 20, 14, 45, 0, TEST_TIMEZONE),
+        isAllDay: false,
+        source: 'internal',
+        editable: false,
+      },
+    ];
+
+    const resultPartialFail = scheduleTaskDeterministically(taskSplit, busyEventsOnlyOneSlot, [], cleanPrefs, morningAnchor);
+    assert(resultPartialFail.success === false, 'Jika hanya ada 1 slot dari 2 sesi yang diminta, scheduler HARUS gagal');
+    assert(
+      resultPartialFail.failureCode === 'INSUFFICIENT_SPLIT_SLOTS' || resultPartialFail.failureCode === 'DEADLINE_INSUFFICIENT_TIME',
+      `failureCode harus INSUFFICIENT_SPLIT_SLOTS, dapat: ${resultPartialFail.failureCode}`
+    );
+    assert(
+      resultPartialFail.explanation.includes('sesi') || resultPartialFail.explanation.includes('tidak mencukupi'),
+      'Penjelasan harus jujur menjelaskan sesi tidak terpenuhi'
+    );
+
+    console.log('  ✅ [PASS] Kasus 17: Kontrol pembagian sesi berfungsi nyata dan jujur melaporkan kegagalan slot parsial.');
+  }
+
+  // KASUS 18: Tampilan Target / Waktu Bebas dari 'undefined hari' untuk Semua Skenario
+  console.log('>>> [18/20] Kasus 18: Tampilan Target / Waktu tidak pernah menampilkan "undefined hari"');
+  {
+    // Skenario A: Prompt murni tanpa tanggal target ("Buat jadwal untuk mengerjakan laporan praktikum selama 90 menit.")
+    const promptNoTarget = 'Buat jadwal untuk mengerjakan laporan praktikum selama 90 menit.';
+    const parsedNoTarget = parseIndonesianTemporalRules({
+      userPrompt: promptNoTarget,
+      currentDateTime: MOCK_REFERENCE_DATE.toISOString(),
+      userTimezone: TEST_TIMEZONE,
+    });
+    const displayNoTarget = formatPlanTargetDisplay(parsedNoTarget, TEST_TIMEZONE);
+    assert(!displayNoTarget.includes('undefined'), `displayNoTarget tidak boleh mengandung 'undefined': '${displayNoTarget}'`);
+    assert(
+      displayNoTarget === 'Fleksibel (Kapan saja)' || displayNoTarget.includes('Fleksibel'),
+      `displayNoTarget harus bernilai Fleksibel, dapat: '${displayNoTarget}'`
+    );
+
+    // Skenario B: Prompt dengan target relatif ("Belajar kimia selama 2 jam besok pagi.")
+    const promptTomorrow = 'Belajar kimia selama 2 jam besok pagi.';
+    const parsedTomorrow = parseIndonesianTemporalRules({
+      userPrompt: promptTomorrow,
+      currentDateTime: MOCK_REFERENCE_DATE.toISOString(),
+      userTimezone: TEST_TIMEZONE,
+    });
+    const displayTomorrow = formatPlanTargetDisplay(parsedTomorrow, TEST_TIMEZONE);
+    assert(!displayTomorrow.includes('undefined'), `displayTomorrow tidak boleh mengandung 'undefined': '${displayTomorrow}'`);
+    assert(
+      displayTomorrow.includes('Besok') || displayTomorrow.includes('Pagi'),
+      `displayTomorrow harus menyebutkan Besok atau Pagi, dapat: '${displayTomorrow}'`
+    );
+
+    // Skenario C: Prompt dengan tenggat tapi tanpa target pengerjaan ("Selesaikan laporan selama 90 menit sebelum Jumat pukul 18.00.")
+    const promptDeadlineOnly = 'Selesaikan laporan selama 90 menit sebelum Jumat pukul 18.00.';
+    const parsedDeadlineOnly = parseIndonesianTemporalRules({
+      userPrompt: promptDeadlineOnly,
+      currentDateTime: MOCK_REFERENCE_DATE.toISOString(),
+      userTimezone: TEST_TIMEZONE,
+    });
+    const displayDeadlineOnly = formatPlanTargetDisplay(parsedDeadlineOnly, TEST_TIMEZONE);
+    assert(!displayDeadlineOnly.includes('undefined'), `displayDeadlineOnly tidak boleh mengandung 'undefined': '${displayDeadlineOnly}'`);
+    assert(
+      displayDeadlineOnly === 'Fleksibel (Kapan saja)' || displayDeadlineOnly.includes('Fleksibel'),
+      `displayDeadlineOnly harus bernilai Fleksibel karena hanya tenggat, dapat: '${displayDeadlineOnly}'`
+    );
+
+    console.log('  ✅ [PASS] Kasus 18: Tampilan Target / Waktu terbebas 100% dari string "undefined hari".');
+  }
+
+  // KASUS 19: Validasi Generator Opsi Pembagian (getAvailableSplitOptions)
+  console.log('>>> [19/20] Kasus 19: Generator opsi pembagian sesi dan penegakan batas minimum sesi');
+  {
+    // Total 90m dengan batas min 30m: opsi harus 2x45m dan 3x30m
+    const options90 = getAvailableSplitOptions(90, 30);
+    assert(options90.length === 2, `Harus ada 2 opsi untuk 90m (min 30m), dapat: ${options90.length}`);
+    assert(options90[0].sessionCount === 2 && options90[0].durationPerSession === 45, 'Opsi 1 harus 2 sesi @ 45m');
+    assert(options90[1].sessionCount === 3 && options90[1].durationPerSession === 30, 'Opsi 2 harus 3 sesi @ 30m');
+
+    // Total 45m dengan batas min 30m: 45 / 2 = 22 < 30 -> tidak ada opsi pembagian
+    const options45 = getAvailableSplitOptions(45, 30);
+    assert(options45.length === 0, `Harus ada 0 opsi pembagian untuk 45m dengan min 30m, dapat: ${options45.length}`);
+
+    // Total 60m dengan batas min 30m: opsi harus 2x30m
+    const options60 = getAvailableSplitOptions(60, 30);
+    assert(options60.length === 1, `Harus ada 1 opsi untuk 60m (min 30m), dapat: ${options60.length}`);
+    assert(options60[0].sessionCount === 2 && options60[0].durationPerSession === 30, 'Opsi harus 2 sesi @ 30m');
+
+    // Total 120m dengan batas min 45m: 2x60m boleh, 3x40m ditolak karena 40 < 45
+    const options120 = getAvailableSplitOptions(120, 45);
+    assert(options120.length === 1, `Harus ada 1 opsi untuk 120m dengan min 45m, dapat: ${options120.length}`);
+    assert(options120[0].sessionCount === 2 && options120[0].durationPerSession === 60, 'Opsi harus 2 sesi @ 60m');
+
+    console.log('  ✅ [PASS] Kasus 19: getAvailableSplitOptions menghasilkan opsi rasional dan mematuhi batas minimum.');
+  }
+
+  // KASUS 20: Anggaran Waktu Timeout Terukur dan Integritas Fallback
+  console.log('>>> [20/20] Kasus 20: Anggaran waktu backend terukur & proteksi fallback yang valid');
+  {
+    const prompt = 'Selesaikan laporan selama 90 menit sebelum Jumat pukul 18.00.';
+
+    // Fallback pada error network / timeout API
+    const simulatedFallback = simulateBackendPlanPipeline(prompt, {
+      mockGeminiPlan: null,
+      geminiError: new Error('Request timeout after 8000ms'),
+      apiKeyConfigured: true,
+      refDate: MOCK_REFERENCE_DATE,
+    });
+
+    assert(simulatedFallback.success === true, 'Fallback harus sukses untuk prompt yang valid');
+    assert(simulatedFallback.source === 'rule_fallback_on_error', `Source harus rule_fallback_on_error, dapat: ${simulatedFallback.source}`);
+    assert(simulatedFallback.plan.estimatedDurationMinutes === 90, 'Durasi harus 90m');
+    assert(simulatedFallback.plan.hasExplicitDeadline === true, 'Tenggat harus dikenali');
+
+    // Proteksi: prompt tanpa durasi/judul tidak boleh melaporkan kesuksesan palsu
+    const invalidPrompt = '   halo   ';
+    const simulatedInvalid = simulateBackendPlanPipeline(invalidPrompt, {
+      mockGeminiPlan: null,
+      geminiError: new Error('Service unavailable'),
+      apiKeyConfigured: true,
+      refDate: MOCK_REFERENCE_DATE,
+    });
+    assert(
+      simulatedInvalid.success === false,
+      'Prompt tanpa durasi tidak boleh pura-pura sukses dalam fallback'
+    );
+
+    console.log('  ✅ [PASS] Kasus 20: Anggaran timeout dan fallback tervalidasi dengan proteksi kejujuran status.');
   }
 
   console.log('\n========================================================================');

@@ -552,15 +552,26 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
   // 4. Detect single specific time: e.g. "pukul 22.00", "jam 9 malam", "pukul 21.00", "tidur pukul 22.00"
   let hasExplicitExactTime = false;
   if (fixedStartHour === null) {
-    const singleTimeMatch = prompt.match(/(?:jam|pukul)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i);
+    // Check if the single time is actually part of a deadline clause:
+    // e.g. "sebelum Jumat pukul 18.00", "deadline jam 17:00", "paling lambat pukul 20.00"
+    const deadlineTimeRegex = /(?:deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\s*(?:hari\s+\w+|\w+)?\s*(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i;
+    const deadlineMatch = prompt.match(deadlineTimeRegex);
+
+    // If there is a deadline time match, exclude that part from fixed start time matching
+    let promptForStartTime = prompt;
+    if (deadlineMatch) {
+      promptForStartTime = prompt.replace(deadlineMatch[0], ' ');
+    }
+
+    const singleTimeMatch = promptForStartTime.match(/(?:jam|pukul)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i);
     if (singleTimeMatch) {
       let h = parseInt(singleTimeMatch[1], 10);
       const m = singleTimeMatch[2] ? parseInt(singleTimeMatch[2], 10) : 0;
       const period = singleTimeMatch[3];
 
-      const isNight = period === 'malam' || prompt.includes('malam');
-      const isAfternoon = period === 'sore' || prompt.includes('sore');
-      const isNoon = period === 'siang' || prompt.includes('siang');
+      const isNight = period === 'malam' || promptForStartTime.includes('malam');
+      const isAfternoon = period === 'sore' || promptForStartTime.includes('sore');
+      const isNoon = period === 'siang' || promptForStartTime.includes('siang');
 
       if (isNight && h < 12) {
         h += 12; // 9 malam -> 21
@@ -574,19 +585,19 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
       fixedStartMin = m;
       hasExplicitExactTime = true;
     } else {
-      if (prompt.includes('sembilan malam') || prompt.includes('9 malam')) {
+      if (promptForStartTime.includes('sembilan malam') || promptForStartTime.includes('9 malam')) {
         fixedStartHour = 21;
         fixedStartMin = 0;
         hasExplicitExactTime = true;
-      } else if (prompt.includes('tujuh malam') || prompt.includes('7 malam')) {
+      } else if (promptForStartTime.includes('tujuh malam') || promptForStartTime.includes('7 malam')) {
         fixedStartHour = 19;
         fixedStartMin = 0;
         hasExplicitExactTime = true;
-      } else if (prompt.includes('delapan malam') || prompt.includes('8 malam')) {
+      } else if (promptForStartTime.includes('delapan malam') || promptForStartTime.includes('8 malam')) {
         fixedStartHour = 20;
         fixedStartMin = 0;
         hasExplicitExactTime = true;
-      } else if (prompt.includes('sepuluh malam') || prompt.includes('10 malam')) {
+      } else if (promptForStartTime.includes('sepuluh malam') || promptForStartTime.includes('10 malam')) {
         fixedStartHour = 22;
         fixedStartMin = 0;
         hasExplicitExactTime = true;

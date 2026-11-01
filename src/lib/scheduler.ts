@@ -690,6 +690,74 @@ export function scheduleTaskDeterministically(
     return free;
   };
 
+  // Helper to allocate exact split sessions requested by user (e.g. 2 sessions x 45 minutes)
+  const allocateExactSplitSessions = (
+    freeBlocks: TimeInterval[],
+    totalDurationMinutes: number,
+    targetCount: number,
+    durationPerSession: number,
+    minSessionMinutes: number
+  ): {
+    success: boolean;
+    sessions: ScheduleCalculationResult['proposedSessions'];
+    explanation: string;
+    failureCode?: ScheduleCalculationResult['failureCode'];
+  } => {
+    if (durationPerSession < minSessionMinutes) {
+      return {
+        success: false,
+        sessions: [],
+        failureCode: 'INSUFFICIENT_SPLIT_SLOTS',
+        explanation: `Durasi per sesi (${durationPerSession} menit) melanggar batas minimal durasi sesi (${minSessionMinutes} menit).`,
+      };
+    }
+
+    const allocated: ScheduleCalculationResult['proposedSessions'] = [];
+
+    for (const block of freeBlocks) {
+      if (allocated.length >= targetCount) break;
+
+      let blockStart = new Date(block.start);
+      const blockEnd = new Date(block.end);
+
+      while (allocated.length < targetCount) {
+        const blockRemainingMinutes = (blockEnd.getTime() - blockStart.getTime()) / 60000;
+        if (blockRemainingMinutes < durationPerSession) break;
+
+        const sessionStart = new Date(blockStart);
+        const sessionEnd = new Date(sessionStart.getTime() + durationPerSession * 60000);
+
+        allocated.push({
+          startAt: sessionStart.toISOString(),
+          endAt: sessionEnd.toISOString(),
+          durationMinutes: durationPerSession,
+          sessionIndex: allocated.length + 1,
+          totalSessions: targetCount,
+        });
+
+        blockStart = sessionEnd;
+      }
+    }
+
+    if (allocated.length === targetCount) {
+      const first = allocated[0];
+      const totalScheduled = allocated.reduce((sum, s) => sum + s.durationMinutes, 0);
+      return {
+        success: true,
+        sessions: allocated,
+        explanation: `Berhasil membagi kegiatan menjadi ${targetCount} sesi masing-masing ${durationPerSession} menit (total ${totalScheduled} menit). Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+      };
+    } else {
+      const totalFound = allocated.length * durationPerSession;
+      return {
+        success: false,
+        sessions: [],
+        failureCode: 'INSUFFICIENT_SPLIT_SLOTS',
+        explanation: `Hanya ditemukan ${allocated.length} dari ${targetCount} sesi (${durationPerSession} menit/sesi) yang dibutuhkan (total ${totalFound} dari ${totalDurationMinutes} menit). Sisa durasi ${totalDurationMinutes - totalFound} menit tidak menemukan slot luang bebas konflik.`,
+      };
+    }
+  };
+
   // -------------------------------------------------------------
   // 2A. RECURRING / MULTI-DAY FLEXIBLE TASKS (targetDays)
   // -------------------------------------------------------------
@@ -983,6 +1051,48 @@ export function scheduleTaskDeterministically(
 
     const preferredFreeBlocks = extractFreeBlocks(preferredSegments);
 
+    const isForcedSplitPref = task.splitConfig?.forcedMode === 'split';
+    const isForcedSinglePref = task.splitConfig?.forcedMode === 'single';
+
+    if (isForcedSplitPref) {
+      const targetCount = task.splitConfig?.targetSessionCount || 2;
+      const durPerSession = task.splitConfig?.sessionDurationMinutes || Math.round(durationNeeded / targetCount);
+      const minSession = task.minimumSessionMinutes || 30;
+
+      const splitRes = allocateExactSplitSessions(
+        preferredFreeBlocks,
+        durationNeeded,
+        targetCount,
+        durPerSession,
+        minSession
+      );
+
+      if (splitRes.success) {
+        return {
+          success: true,
+          taskId: task.id,
+          taskTitle: task.title,
+          proposedSessions: splitRes.sessions,
+          explanation: splitRes.explanation,
+          diagnostics: {
+            evaluatedDays: evaluatedDaysPreferred,
+          },
+        };
+      } else {
+        return {
+          success: false,
+          taskId: task.id,
+          taskTitle: task.title,
+          failureCode: splitRes.failureCode || 'INSUFFICIENT_SPLIT_SLOTS',
+          proposedSessions: [],
+          explanation: splitRes.explanation,
+          diagnostics: {
+            evaluatedDays: evaluatedDaysPreferred,
+          },
+        };
+      }
+    }
+
     // Contiguous fit in preferred window
     for (const block of preferredFreeBlocks) {
       const blockDuration = (block.end.getTime() - block.start.getTime()) / 60000;
@@ -1013,6 +1123,20 @@ export function scheduleTaskDeterministically(
           },
         };
       }
+    }
+
+    if (isForcedSinglePref) {
+      return {
+        success: false,
+        taskId: task.id,
+        taskTitle: task.title,
+        failureCode: 'NO_CONTIGUOUS_SLOT',
+        proposedSessions: [],
+        explanation: `Tidak ditemukan satu sesi utuh kontigu (tanpa putus) selama ${durationNeeded} menit di jendela waktu yang diminta. Anda dapat memilih opsi 'Bagi beberapa sesi' untuk membagi tugas menjadi sesi yang lebih singkat.`,
+        diagnostics: {
+          evaluatedDays: evaluatedDaysPreferred,
+        },
+      };
     }
 
     // Split sessions in preferred window if allowed
@@ -1267,6 +1391,50 @@ export function scheduleTaskDeterministically(
 
   const standardFreeBlocks = extractFreeBlocks(workSegments);
 
+  const isForcedSplitWork = task.splitConfig?.forcedMode === 'split';
+  const isForcedSingleWork = task.splitConfig?.forcedMode === 'single';
+
+  if (isForcedSplitWork) {
+    const targetCount = task.splitConfig?.targetSessionCount || 2;
+    const durPerSession = task.splitConfig?.sessionDurationMinutes || Math.round(durationNeeded / targetCount);
+    const minSession = task.minimumSessionMinutes || 30;
+
+    const splitRes = allocateExactSplitSessions(
+      standardFreeBlocks,
+      durationNeeded,
+      targetCount,
+      durPerSession,
+      minSession
+    );
+
+    if (splitRes.success) {
+      return {
+        success: true,
+        taskId: task.id,
+        taskTitle: task.title,
+        proposedSessions: splitRes.sessions,
+        explanation: splitRes.explanation,
+        diagnostics: {
+          isNightShift,
+          evaluatedDays: evaluatedDaysWork,
+        },
+      };
+    } else {
+      return {
+        success: false,
+        taskId: task.id,
+        taskTitle: task.title,
+        failureCode: splitRes.failureCode || 'INSUFFICIENT_SPLIT_SLOTS',
+        proposedSessions: [],
+        explanation: splitRes.explanation,
+        diagnostics: {
+          isNightShift,
+          evaluatedDays: evaluatedDaysWork,
+        },
+      };
+    }
+  }
+
   // Contiguous slot in standard / night shift hours
   for (const block of standardFreeBlocks) {
     const blockDuration = (block.end.getTime() - block.start.getTime()) / 60000;
@@ -1297,6 +1465,21 @@ export function scheduleTaskDeterministically(
         },
       };
     }
+  }
+
+  if (isForcedSingleWork) {
+    return {
+      success: false,
+      taskId: task.id,
+      taskTitle: task.title,
+      failureCode: 'NO_CONTIGUOUS_SLOT',
+      proposedSessions: [],
+      explanation: `Tidak ditemukan satu sesi utuh kontigu (tanpa putus) selama ${durationNeeded} menit pada jam kerja yang tersedia. Anda dapat memilih opsi 'Bagi beberapa sesi' untuk membagi tugas menjadi sesi yang lebih singkat.`,
+      diagnostics: {
+        isNightShift,
+        evaluatedDays: evaluatedDaysWork,
+      },
+    };
   }
 
   // Split sessions in standard / night shift hours

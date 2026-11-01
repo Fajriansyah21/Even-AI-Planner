@@ -61,6 +61,12 @@ export interface PreferredTimeWindow {
   label?: string;         // e.g. 'Malam (19:00 - 22:00)'
 }
 
+export interface TaskSplitConfig {
+  forcedMode?: 'single' | 'split';
+  targetSessionCount?: number;
+  sessionDurationMinutes?: number;
+}
+
 export interface Task {
   id: string;
   userId: string;
@@ -75,6 +81,7 @@ export interface Task {
   status: TaskStatus;
   allowSplit: boolean;
   minimumSessionMinutes?: number;
+  splitConfig?: TaskSplitConfig;
   preferredTimeOfDay?: 'MORNING' | 'AFTERNOON' | 'EVENING' | 'ANY';
   timeConstraintType?: TimeConstraintType;
   requestedStartAt?: string; // ISO string for fixed event
@@ -157,6 +164,8 @@ export interface ScheduleCalculationResult {
     | 'NO_SLOT_BEFORE_DEADLINE'
     | 'DEADLINE_PASSED'
     | 'TARGET_DATE_PASSED'
+    | 'INSUFFICIENT_SPLIT_SLOTS'
+    | 'NO_CONTIGUOUS_SLOT'
     | 'INVALID_TIME_RANGE';
   proposedSessions: {
     startAt: string;
@@ -237,6 +246,7 @@ export interface AIPlanDraft {
   priority: Priority;
   allowSplit: boolean;
   minimumSessionMinutes: number;
+  splitConfig?: TaskSplitConfig;
   reasoning: string;
   isOperational?: boolean;
   operationalAction?: 'find_free_slot' | 'resolve_conflicts' | 'view_schedule' | 'other';

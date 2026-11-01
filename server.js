@@ -412,6 +412,9 @@ function parseIndonesianTemporalRules(ctx) {
   }
   const targetDateObj = addDaysInTimezone(baseDate, dayOffset, tz);
   const targetParts = getPartsInTimezone(targetDateObj, tz);
+  const targetDateStr = `${targetParts.year}-${String(targetParts.month).padStart(2, "0")}-${String(targetParts.day).padStart(2, "0")}`;
+  const targetDayOffset = hasExplicitDayTarget ? dayOffset : void 0;
+  const targetDate = hasExplicitDayTarget ? targetDateStr : void 0;
   const isCommitmentKeyword = /\b(kelas|kuliah|webinar|rapat|meeting|janji|jadwal|workshop|seminar|konsultasi|kursus)\b/i.test(prompt);
   let fixedStartHour = null;
   let fixedStartMin = 0;
@@ -457,14 +460,20 @@ function parseIndonesianTemporalRules(ctx) {
   }
   let hasExplicitExactTime = false;
   if (fixedStartHour === null) {
-    const singleTimeMatch = prompt.match(/(?:jam|pukul)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i);
+    const deadlineTimeRegex = /(?:deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\s*(?:hari\s+\w+|\w+)?\s*(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i;
+    const deadlineMatch = prompt.match(deadlineTimeRegex);
+    let promptForStartTime = prompt;
+    if (deadlineMatch) {
+      promptForStartTime = prompt.replace(deadlineMatch[0], " ");
+    }
+    const singleTimeMatch = promptForStartTime.match(/(?:jam|pukul)\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i);
     if (singleTimeMatch) {
       let h = parseInt(singleTimeMatch[1], 10);
       const m = singleTimeMatch[2] ? parseInt(singleTimeMatch[2], 10) : 0;
       const period = singleTimeMatch[3];
-      const isNight = period === "malam" || prompt.includes("malam");
-      const isAfternoon = period === "sore" || prompt.includes("sore");
-      const isNoon = period === "siang" || prompt.includes("siang");
+      const isNight = period === "malam" || promptForStartTime.includes("malam");
+      const isAfternoon = period === "sore" || promptForStartTime.includes("sore");
+      const isNoon = period === "siang" || promptForStartTime.includes("siang");
       if (isNight && h < 12) {
         h += 12;
       } else if (isAfternoon && h <= 6) {
@@ -476,19 +485,19 @@ function parseIndonesianTemporalRules(ctx) {
       fixedStartMin = m;
       hasExplicitExactTime = true;
     } else {
-      if (prompt.includes("sembilan malam") || prompt.includes("9 malam")) {
+      if (promptForStartTime.includes("sembilan malam") || promptForStartTime.includes("9 malam")) {
         fixedStartHour = 21;
         fixedStartMin = 0;
         hasExplicitExactTime = true;
-      } else if (prompt.includes("tujuh malam") || prompt.includes("7 malam")) {
+      } else if (promptForStartTime.includes("tujuh malam") || promptForStartTime.includes("7 malam")) {
         fixedStartHour = 19;
         fixedStartMin = 0;
         hasExplicitExactTime = true;
-      } else if (prompt.includes("delapan malam") || prompt.includes("8 malam")) {
+      } else if (promptForStartTime.includes("delapan malam") || promptForStartTime.includes("8 malam")) {
         fixedStartHour = 20;
         fixedStartMin = 0;
         hasExplicitExactTime = true;
-      } else if (prompt.includes("sepuluh malam") || prompt.includes("10 malam")) {
+      } else if (promptForStartTime.includes("sepuluh malam") || promptForStartTime.includes("10 malam")) {
         fixedStartHour = 22;
         fixedStartMin = 0;
         hasExplicitExactTime = true;
@@ -557,6 +566,9 @@ function parseIndonesianTemporalRules(ctx) {
   const isExactFixedEvent = fixedStartHour !== null && (hasExplicitRange || isCommitmentKeyword || !isFlexibleLearningOrTask && (prompt.includes("pukul") || prompt.includes("jam")) || prompt.includes("tidur pukul") || prompt.includes("tidur jam"));
   let targetOccurrences = void 0;
   let targetDays = detectedWeekdays.length > 0 ? detectedWeekdays.map((dw) => dw.dayIndex) : void 0;
+  if (!targetDays && hasExplicitDayTarget && !promptIsRecurring) {
+    targetDays = [targetParts.dayOfWeek];
+  }
   if (isExactFixedEvent && fixedStartHour !== null) {
     timeConstraintType = "fixed_event";
     if (detectedWeekdays.length > 0) {
@@ -662,11 +674,28 @@ function parseIndonesianTemporalRules(ctx) {
   }
   let deadlineIso = void 0;
   let deadlineDaysFromNow = void 0;
+  let hasExplicitDeadline = false;
   const hasExplicitDeadlineKeyword = /\b(deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\b/i.test(prompt) || prompt.includes("minggu ini");
   if (detectedDeadlineDay) {
+    hasExplicitDeadline = true;
+    let dHour = 23;
+    let dMinute = 59;
+    const deadlineTimeMatch = prompt.match(
+      /(?:deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\s*(?:hari\s+\w+|\w+)?\s*(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i
+    );
+    if (deadlineTimeMatch) {
+      let dh = parseInt(deadlineTimeMatch[1], 10);
+      const dm = deadlineTimeMatch[2] ? parseInt(deadlineTimeMatch[2], 10) : 0;
+      const dPeriod = deadlineTimeMatch[3];
+      if ((dPeriod === "malam" || prompt.includes("malam")) && dh < 12) dh += 12;
+      else if ((dPeriod === "sore" || prompt.includes("sore")) && dh <= 6) dh += 12;
+      else if ((dPeriod === "siang" || prompt.includes("siang")) && dh >= 1 && dh <= 3) dh += 12;
+      dHour = dh;
+      dMinute = dm;
+    }
     const nextDeadlineDate = getNextValidDateForDayOfWeek(detectedDeadlineDay.dayIndex, baseDate, tz, {
-      targetHour: 23,
-      targetMinute: 59,
+      targetHour: dHour,
+      targetMinute: dMinute,
       forceNextWeek: prompt.includes("depan")
     });
     deadlineDaysFromNow = Math.max(1, nextDeadlineDate.dayOffset);
@@ -674,12 +703,13 @@ function parseIndonesianTemporalRules(ctx) {
       nextDeadlineDate.year,
       nextDeadlineDate.month,
       nextDeadlineDate.day,
-      23,
-      59,
+      dHour,
+      dMinute,
       0,
       tz
     );
   } else if (prompt.includes("minggu ini")) {
+    hasExplicitDeadline = true;
     const daysUntilEndOfWeek = (7 - baseParts.dayOfWeek) % 7;
     const endOfWeekObj = addDaysInTimezone(baseDate, daysUntilEndOfWeek, tz);
     const endOfWeekParts = getPartsInTimezone(endOfWeekObj, tz);
@@ -694,12 +724,14 @@ function parseIndonesianTemporalRules(ctx) {
       tz
     );
   } else if (timeConstraintType === "fixed_event" && requestedEndAt) {
-    deadlineIso = requestedEndAt;
-    deadlineDaysFromNow = Math.max(1, dayOffset);
+    hasExplicitDeadline = false;
+    deadlineIso = void 0;
+    deadlineDaysFromNow = hasExplicitDayTarget && dayOffset > 0 ? dayOffset : void 0;
   } else if (hasExplicitDeadlineKeyword) {
+    hasExplicitDeadline = true;
     let targetDeadlineOffset = dayOffset;
-    let deadlineHour = preferredTimeOfDay === "EVENING" ? 23 : 18;
-    let deadlineMinute = 0;
+    let deadlineHour = 23;
+    let deadlineMinute = 59;
     const deadlineTimeMatch = prompt.match(
       /(?:deadline|tenggat|paling\s+lambat|sebelum|due\s+date|batas\s+waktu)\s*(?:hari\s+ini|besok|lusa)?\s*(?:jam|pukul)?\s*(\d{1,2})(?:[:.](\d{2}))?\s*(pagi|siang|sore|malam)?/i
     );
@@ -733,21 +765,14 @@ function parseIndonesianTemporalRules(ctx) {
       0,
       tz
     );
-  } else if (hasExplicitDayTarget && dayOffset > 0) {
-    const deadlineHour = preferredTimeOfDay === "EVENING" ? 23 : 18;
-    deadlineIso = createIsoInTimezone(
-      targetParts.year,
-      targetParts.month,
-      targetParts.day,
-      deadlineHour,
-      0,
-      0,
-      tz
-    );
-    deadlineDaysFromNow = Math.max(1, dayOffset);
   } else {
+    hasExplicitDeadline = false;
     deadlineIso = void 0;
-    deadlineDaysFromNow = void 0;
+    if (hasExplicitDayTarget && dayOffset > 0) {
+      deadlineDaysFromNow = Math.max(1, dayOffset);
+    } else {
+      deadlineDaysFromNow = void 0;
+    }
   }
   let isDurationAmbiguous = false;
   let totalDurationMinutes = void 0;
@@ -803,7 +828,7 @@ function parseIndonesianTemporalRules(ctx) {
     }
   } else if (preferredWindow) {
     reasoning = `AI menetapkan jendela preferensi ${preferredWindow.label} dengan durasi ${duration} menit agar sesuai dengan waktu ${preferredTimeOfDay === "EVENING" ? "santai atau fokus malam" : preferredTimeOfDay.toLowerCase()} Anda.`;
-  } else if (deadlineDaysFromNow !== void 0) {
+  } else if (deadlineIso !== void 0 && deadlineDaysFromNow !== void 0) {
     reasoning = `AI menetapkan estimasi durasi ${duration} menit dengan tenggat waktu ${deadlineDaysFromNow === 0 ? "hari ini" : `${deadlineDaysFromNow} hari ke depan`}.`;
   } else {
     reasoning = `AI menetapkan estimasi durasi ${duration} menit untuk dijadwalkan pada waktu kerja luang berikutnya yang tersedia.`;
@@ -827,6 +852,10 @@ function parseIndonesianTemporalRules(ctx) {
     clarificationPrompt,
     preferredWindow,
     preferredTimeOfDay,
+    targetDate,
+    targetDayOffset,
+    hasExplicitDeadline,
+    hasDeadline: hasExplicitDeadline,
     deadlineAt: deadlineIso,
     deadlineDaysFromNow,
     timezone: tz,
@@ -1030,6 +1059,8 @@ async function startServer() {
         });
       }
       const trimmedPrompt = userPrompt.trim().slice(0, 600);
+      const requestId = req.headers["x-request-id"] || `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      const geminiAttemptDurations = [];
       const ctx = {
         userPrompt: trimmedPrompt,
         currentDateTime: currentDateTime || (/* @__PURE__ */ new Date()).toISOString(),
@@ -1037,10 +1068,15 @@ async function startServer() {
         userTimezone: userTimezone || "Asia/Jakarta",
         workHours
       };
+      const parseStart = Date.now();
       const baselinePlan = parseIndonesianTemporalRules(ctx);
+      const deterministicParseDurationMs = Date.now() - parseStart;
+      const isFallbackValid = Boolean(
+        baselinePlan && baselinePlan.title && typeof baselinePlan.estimatedDurationMinutes === "number" && baselinePlan.estimatedDurationMinutes > 0
+      );
       if (baselinePlan.isOperational) {
         const elapsedMs2 = Date.now() - startTime;
-        console.log(`[AI Plan Diagnostics] Duration: ${elapsedMs2}ms | Intent: Operational (${baselinePlan.operationalAction})`);
+        console.log(`[AI Plan Diagnostics] RequestId: ${requestId} | ParseDuration: ${deterministicParseDurationMs}ms | GeminiDurations: []ms | Retries: 0 | ErrorCategory: none | FallbackUsed: none | TotalDuration: ${elapsedMs2}ms | Intent: Operational (${baselinePlan.operationalAction})`);
         return res.json({
           success: true,
           isAiGenerated: false,
@@ -1051,7 +1087,18 @@ async function startServer() {
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
         const elapsedMs2 = Date.now() - startTime;
-        console.log(`[AI Plan Diagnostics] Duration: ${elapsedMs2}ms | Mode: rule_fallback | No API key configured`);
+        console.log(`[AI Plan Diagnostics] RequestId: ${requestId} | ParseDuration: ${deterministicParseDurationMs}ms | GeminiDurations: []ms | Retries: 0 | ErrorCategory: none | FallbackUsed: rule_engine | TotalDuration: ${elapsedMs2}ms`);
+        if (!isFallbackValid) {
+          return res.status(422).json({
+            success: false,
+            errorCode: "INVALID_FALLBACK_PLAN",
+            error: "Tidak dapat menyusun jadwal: instruksi tidak memiliki judul atau estimasi durasi yang valid.",
+            category: "invalid_request",
+            providerStatus: 422,
+            retryCount: 0,
+            latencyMs: elapsedMs2
+          });
+        }
         return res.json({
           success: true,
           isAiGenerated: false,
@@ -1109,7 +1156,8 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
    - JANGAN MENYALIN mentah-mentah seluruh prompt pengguna sebagai judul!`;
       const retryResult = await executeWithRetryAndTimeout(
         async (attempt, remainingMs) => {
-          const perAttemptTimeoutMs = Math.min(25e3, Math.max(5e3, remainingMs - 500));
+          const perAttemptTimeoutMs = Math.min(8e3, Math.max(3e3, remainingMs - 500));
+          const attemptStart = Date.now();
           const controller = new AbortController();
           const timeoutTimer = setTimeout(() => {
             controller.abort();
@@ -1172,8 +1220,10 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
                 abortSignal: controller.signal
               }
             });
+            geminiAttemptDurations.push(Date.now() - attemptStart);
             return result;
           } catch (err) {
+            geminiAttemptDurations.push(Date.now() - attemptStart);
             if (controller.signal.aborted || err?.name === "AbortError") {
               const timeoutErr = new Error(`Permintaan ke Gemini API melampaui batas waktu percobaan (${perAttemptTimeoutMs}ms).`);
               timeoutErr.name = "AbortError";
@@ -1187,9 +1237,9 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         },
         {
           maxRetries: 1,
-          totalTimeoutMs: 3e4,
-          initialBackoffMs: 300,
-          maxBackoffMs: 1e3
+          totalTimeoutMs: 14e3,
+          initialBackoffMs: 250,
+          maxBackoffMs: 500
         }
       );
       if (retryResult.error || !retryResult.result) {
@@ -1199,8 +1249,19 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         const retryCount = retryResult.retryCount;
         const category = analysis.category;
         console.log(
-          `[AI Plan Diagnostics] Duration: ${elapsedMs2}ms | ProviderStatus: ${providerStatus} | Retries: ${retryCount} | ErrorCategory: ${category} | ErrorCode: ${analysis.errorCode} | Fallback: rule_engine`
+          `[AI Plan Diagnostics] RequestId: ${requestId} | ParseDuration: ${deterministicParseDurationMs}ms | GeminiDurations: [${geminiAttemptDurations.join(", ")}]ms | Retries: ${retryCount} | ErrorCategory: ${category} | FallbackUsed: ${isFallbackValid ? "rule_engine" : "none"} | TotalDuration: ${elapsedMs2}ms`
         );
+        if (!isFallbackValid) {
+          return res.status(422).json({
+            success: false,
+            errorCode: "INVALID_FALLBACK_PLAN",
+            error: "Tidak dapat menyusun jadwal: instruksi tidak memiliki judul atau estimasi durasi yang valid.",
+            category: "invalid_request",
+            providerStatus,
+            retryCount,
+            latencyMs: elapsedMs2
+          });
+        }
         return res.json({
           success: true,
           isAiGenerated: false,
@@ -1269,6 +1330,15 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       if (baselinePlan.targetOccurrences && baselinePlan.targetOccurrences.length > 0) {
         sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
       }
+      if (baselinePlan.targetDate) {
+        sanitizedPlan.targetDate = baselinePlan.targetDate;
+      }
+      if (typeof baselinePlan.targetDayOffset === "number") {
+        sanitizedPlan.targetDayOffset = baselinePlan.targetDayOffset;
+      }
+      if (typeof baselinePlan.hasExplicitDayTarget === "boolean") {
+        sanitizedPlan.hasExplicitDayTarget = baselinePlan.hasExplicitDayTarget;
+      }
       if (baselinePlan.preferredTimeOfDay !== "ANY") {
         sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
       }
@@ -1284,9 +1354,11 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       if (baselinePlan.deadlineAt) {
         sanitizedPlan.deadlineAt = baselinePlan.deadlineAt;
         sanitizedPlan.deadlineDaysFromNow = baselinePlan.deadlineDaysFromNow;
+        sanitizedPlan.hasExplicitDeadline = true;
       } else {
         delete sanitizedPlan.deadlineAt;
         delete sanitizedPlan.deadlineDaysFromNow;
+        sanitizedPlan.hasExplicitDeadline = false;
       }
       if (baselinePlan.targetDays && baselinePlan.targetDays.length > 1) {
         sanitizedPlan.reasoning = baselinePlan.reasoning;
@@ -1304,7 +1376,7 @@ Catatan asli: "${trimmedPrompt}"`;
       }
       const elapsedMs = Date.now() - startTime;
       console.log(
-        `[AI Plan Diagnostics] Duration: ${elapsedMs}ms | ProviderStatus: 200 | Retries: ${retryResult.retryCount} | Success: true`
+        `[AI Plan Diagnostics] RequestId: ${requestId} | ParseDuration: ${deterministicParseDurationMs}ms | GeminiDurations: [${geminiAttemptDurations.join(", ")}]ms | Retries: ${retryResult.retryCount} | ErrorCategory: none | FallbackUsed: none | TotalDuration: ${elapsedMs}ms`
       );
       return res.json({
         success: true,

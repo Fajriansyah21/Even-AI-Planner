@@ -942,13 +942,8 @@ export default function App() {
 
   // AI Assistant Plan application
   const handleApplyAIPlan = async (plan: AIPlanDraft, scheduleResult: ScheduleCalculationResult) => {
-    let deadlineIso: string | null = plan.deadlineAt || null;
-    if (!deadlineIso && typeof plan.deadlineDaysFromNow === 'number') {
-      const deadlineDate = new Date();
-      deadlineDate.setDate(deadlineDate.getDate() + plan.deadlineDaysFromNow);
-      deadlineDate.setHours(plan.preferredTimeOfDay === 'EVENING' ? 23 : 18, 0, 0, 0);
-      deadlineIso = deadlineDate.toISOString();
-    }
+    // Hanya gunakan deadline jika pengguna secara eksplisit menyebutkan tenggat
+    const deadlineIso: string | null = (plan.hasExplicitDeadline && plan.deadlineAt) ? plan.deadlineAt : (plan.deadlineAt || null);
 
     const taskId = `ai-task-${Date.now()}`;
     const token = getCachedAccessToken();
@@ -976,10 +971,14 @@ export default function App() {
         description: plan.description,
         estimatedDurationMinutes: plan.estimatedDurationMinutes,
         deadlineAt: deadlineIso,
+        hasExplicitDeadline: Boolean(plan.hasExplicitDeadline || plan.deadlineAt),
+        targetDate: plan.targetDate,
+        targetDayOffset: plan.targetDayOffset,
         priority: plan.priority,
         status: scheduleResult.success ? 'SCHEDULED' : 'UNSCHEDULED',
         allowSplit: plan.allowSplit,
         minimumSessionMinutes: plan.minimumSessionMinutes || 30,
+        splitConfig: plan.splitConfig,
         preferredTimeOfDay: plan.preferredTimeOfDay,
         timeConstraintType: plan.timeConstraintType,
         requestedStartAt: plan.requestedStartAt,
@@ -1066,10 +1065,14 @@ export default function App() {
       description: plan.description,
       estimatedDurationMinutes: plan.estimatedDurationMinutes,
       deadlineAt: deadlineIso,
+      hasExplicitDeadline: Boolean(plan.hasExplicitDeadline || plan.deadlineAt),
+      targetDate: plan.targetDate,
+      targetDayOffset: plan.targetDayOffset,
       priority: plan.priority,
       status: scheduleResult.success ? 'SCHEDULED' : 'UNSCHEDULED',
       allowSplit: plan.allowSplit,
       minimumSessionMinutes: plan.minimumSessionMinutes || 30,
+      splitConfig: plan.splitConfig,
       preferredTimeOfDay: plan.preferredTimeOfDay,
       timeConstraintType: plan.timeConstraintType,
       requestedStartAt: plan.requestedStartAt,

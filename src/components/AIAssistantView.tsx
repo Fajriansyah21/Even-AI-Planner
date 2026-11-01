@@ -18,10 +18,160 @@ import {
   CircleDot,
   CheckCircle,
 } from 'lucide-react';
-import { Task, CalendarEvent, UserPreferences, AIPlanDraft, ScheduleCalculationResult } from '../types';
+import {
+  Task,
+  CalendarEvent,
+  UserPreferences,
+  AIPlanDraft,
+  ScheduleCalculationResult,
+  TaskSplitConfig,
+} from '../types';
 import { scheduleTaskDeterministically } from '../lib/scheduler';
 import { formatUserErrorMessage } from '../lib/geminiErrorHandling';
-import { formatInUserTimezone, getZonedDateTimeParts } from '../lib/timezone';
+import { formatInUserTimezone, getZonedDateTimeParts, createIsoInTimezone } from '../lib/timezone';
+import { parseIndonesianTemporalRules } from '../lib/temporalParser';
+
+export interface SplitOption {
+  sessionCount: number;
+  durationPerSession: number;
+  totalDuration: number;
+  label: string;
+}
+
+/**
+ * Menghasilkan opsi pembagian sesi yang valid dan proporsional
+ * berdasarkan durasi total dan batas minimum durasi sesi.
+ */
+export function getAvailableSplitOptions(
+  totalMinutes: number,
+  minimumSessionMinutes: number = 30
+): SplitOption[] {
+  const options: SplitOption[] = [];
+  if (totalMinutes <= minimumSessionMinutes) return options;
+
+  for (let count = 2; count <= 6; count++) {
+    const dur = Math.floor(totalMinutes / count);
+    if (dur < minimumSessionMinutes) continue;
+    if (totalMinutes % count === 0) {
+      options.push({
+        sessionCount: count,
+        durationPerSession: dur,
+        totalDuration: totalMinutes,
+        label: `${count} sesi × ${dur} menit`,
+      });
+    }
+  }
+
+  // Fallback untuk pembagian tak bulat jika belum ada opsi: misal 75 menit dengan min 30
+  if (options.length === 0) {
+    const count = 2;
+    const dur = Math.floor(totalMinutes / count);
+    if (dur >= minimumSessionMinutes) {
+      options.push({
+        sessionCount: count,
+        durationPerSession: dur,
+        totalDuration: totalMinutes,
+        label: `${count} sesi (~${dur} menit/sesi)`,
+      });
+    }
+  }
+
+  return options;
+}
+
+/**
+ * Format tampilan Target / Waktu tanpa pernah menampilkan 'undefined hari' atau menebak tenggat.
+ */
+export function formatPlanTargetDisplay(
+  plan: AIPlanDraft,
+  userTimezone: string = 'Asia/Jakarta'
+): string {
+  // 1. Multiple occurrences / fixed events dengan rentang jam eksplisit
+  if (plan.targetOccurrences && plan.targetOccurrences.length > 1) {
+    return plan.targetOccurrences.map((o) => o.dayName).join(' & ');
+  }
+  if (plan.requestedStartAt) {
+    const startD = new Date(plan.requestedStartAt);
+    const startStr = formatInUserTimezone(startD, userTimezone, {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+    if (plan.requestedEndAt) {
+      const endD = new Date(plan.requestedEndAt);
+      const endStr = formatInUserTimezone(endD, userTimezone, {
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      const isNextDay =
+        getZonedDateTimeParts(endD, userTimezone).day !==
+        getZonedDateTimeParts(startD, userTimezone).day;
+      return `${startStr} - ${endStr}${isNextDay ? ' (+1 hr)' : ''}`;
+    }
+    return startStr;
+  }
+
+  // 2. Tanggal target kalender atau offset relatif
+  if (plan.targetDate || typeof plan.targetDayOffset === 'number') {
+    let baseLabel = '';
+    if (typeof plan.targetDayOffset === 'number') {
+      if (plan.targetDayOffset === 0) baseLabel = 'Hari ini';
+      else if (plan.targetDayOffset === 1) baseLabel = 'Besok';
+      else if (plan.targetDayOffset === 2) baseLabel = 'Lusa';
+      else if (plan.targetDayOffset > 2) baseLabel = `${plan.targetDayOffset} hari ke depan`;
+    }
+
+    let dateFormatted = '';
+    if (plan.targetDate) {
+      const parts = plan.targetDate.split('-').map(Number);
+      if (parts.length === 3) {
+        const d = new Date(createIsoInTimezone(parts[0], parts[1], parts[2], 12, 0, 0, userTimezone));
+        dateFormatted = formatInUserTimezone(d, userTimezone, {
+          weekday: 'long',
+          day: 'numeric',
+          month: 'short',
+        });
+      }
+    }
+
+    const windowLabel =
+      plan.preferredWindow?.label ||
+      (plan.preferredTimeOfDay === 'MORNING'
+        ? 'Pagi'
+        : plan.preferredTimeOfDay === 'AFTERNOON'
+        ? 'Siang/Sore'
+        : plan.preferredTimeOfDay === 'EVENING'
+        ? 'Malam'
+        : '');
+
+    let combined = baseLabel;
+    if (baseLabel && dateFormatted) {
+      combined = `${baseLabel} (${dateFormatted})`;
+    } else if (dateFormatted) {
+      combined = dateFormatted;
+    }
+
+    if (windowLabel) {
+      combined = combined ? `${combined} • ${windowLabel}` : windowLabel;
+    }
+
+    return combined || 'Fleksibel';
+  }
+
+  // 3. Jika hanya ada jendela waktu (misal: "Malam ini" atau "Pagi hari" tanpa tanggal tertentu)
+  if (plan.preferredWindow?.label) {
+    return plan.preferredWindow.label;
+  }
+  if (plan.preferredTimeOfDay && plan.preferredTimeOfDay !== 'ANY') {
+    return plan.preferredTimeOfDay === 'MORNING'
+      ? 'Pagi Hari'
+      : plan.preferredTimeOfDay === 'AFTERNOON'
+      ? 'Siang/Sore'
+      : 'Malam Hari';
+  }
+
+  // 4. Default aman jika tidak ada target tertentu: Fleksibel
+  return 'Fleksibel';
+}
 
 interface AIAssistantViewProps {
   tasks: Task[];
@@ -30,8 +180,6 @@ interface AIAssistantViewProps {
   onApplyAIPlan: (plan: AIPlanDraft, scheduleResult: ScheduleCalculationResult) => Promise<boolean | void> | void;
   onNavigateToCalendar: () => void;
 }
-
-import { parseIndonesianTemporalRules } from '../lib/temporalParser';
 
 export enum LoadingPhase {
   IDLE = 'IDLE',
@@ -93,14 +241,17 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const [loadingPhase, setLoadingPhase] = useState<LoadingPhase>(LoadingPhase.IDLE);
   const [proposedPlan, setProposedPlan] = useState<AIPlanDraft | null>(null);
   const [scheduleTestResult, setScheduleTestResult] = useState<ScheduleCalculationResult | null>(null);
+  const [selectedSplitMode, setSelectedSplitMode] = useState<'single' | 'split'>('single');
+  const [selectedSplitOption, setSelectedSplitOption] = useState<SplitOption | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
   const [warningMessage, setWarningMessage] = useState('');
   const [planSource, setPlanSource] = useState<'gemini' | 'rule_fallback_on_error' | 'rule_fallback'>('gemini');
   const [appliedSuccess, setAppliedSuccess] = useState(false);
 
-  // Active cancellation and timer references to prevent race conditions and memory leaks
+  // Active cancellation, race condition guard, and timer references
   const abortControllerRef = useRef<AbortController | null>(null);
   const timeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeRequestIdRef = useRef<number>(0);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -151,6 +302,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     const trimmed = text.trim();
     if (!trimmed || isAnalyzing || isSaving) return;
 
+    // Track active request ID to completely eliminate race conditions
+    const currentReqId = ++activeRequestIdRef.current;
+
     // Preserve text in input field and record as last submitted prompt
     setPromptInput(text);
     setLastSubmittedPrompt(trimmed);
@@ -171,6 +325,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     setWarningMessage('');
     setProposedPlan(null);
     setScheduleTestResult(null);
+    setSelectedSplitMode('single');
+    setSelectedSplitOption(null);
     setAppliedSuccess(false);
 
     // Stage 2: Analyzing (Menganalisis konteks waktu lokal & preferensi)
@@ -223,6 +379,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         timeoutTimerRef.current = null;
       }
 
+      // Check if this request is still the active one
+      if (activeRequestIdRef.current !== currentReqId) return;
+
       let data: any = null;
       try {
         data = await response.json();
@@ -252,11 +411,20 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         return;
       }
 
+      // Calculate initial split options
+      const splitOpts = getAvailableSplitOptions(plan.estimatedDurationMinutes, plan.minimumSessionMinutes || 30);
+      if (splitOpts.length > 0) {
+        setSelectedSplitOption(splitOpts[0]);
+      } else {
+        setSelectedSplitOption(null);
+      }
+      setSelectedSplitMode('single');
+
       // Pisahkan secara tegas antara batas tenggat eksplisit dan tanggal target:
       // JANGAN PERNAH menyintesis tenggat buatan jam 18.00/23.00 jika pengguna tidak meminta tenggat!
       const calculatedDeadlineAt: string | null = plan.deadlineAt || null;
 
-      // Pre-flight check via deterministic scheduler
+      // Pre-flight check via deterministic scheduler (default: single session)
       const pseudoTask: Task = {
         id: `ai-draft-${Date.now()}`,
         userId: 'user-default',
@@ -271,6 +439,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         status: 'UNSCHEDULED',
         allowSplit: plan.allowSplit,
         minimumSessionMinutes: plan.minimumSessionMinutes || 30,
+        splitConfig: plan.allowSplit ? { forcedMode: 'single' } : undefined,
         preferredTimeOfDay: plan.preferredTimeOfDay,
         timeConstraintType: plan.timeConstraintType,
         requestedStartAt: plan.requestedStartAt,
@@ -284,10 +453,14 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
       const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
 
+      if (activeRequestIdRef.current !== currentReqId) return;
+
       // Selesai: Tampilkan hasil secara lengkap setelah uji slot selesai
       setProposedPlan(plan);
       setScheduleTestResult(schedRes);
     } catch (err: any) {
+      if (activeRequestIdRef.current !== currentReqId) return;
+
       if (err.name === 'AbortError') {
         if (didTimeout) {
           setErrorMessage('Permintaan dibatalkan karena melebihi batas waktu (timeout 30 detik). Silakan coba lagi.');
@@ -310,6 +483,14 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             },
           });
 
+          const splitOpts = getAvailableSplitOptions(fallbackParsed.estimatedDurationMinutes, fallbackParsed.minimumSessionMinutes || 30);
+          if (splitOpts.length > 0) {
+            setSelectedSplitOption(splitOpts[0]);
+          } else {
+            setSelectedSplitOption(null);
+          }
+          setSelectedSplitMode('single');
+
           const calculatedDeadlineAt: string | null = fallbackParsed.deadlineAt || null;
 
           const fallbackTask: Task = {
@@ -326,6 +507,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             status: 'UNSCHEDULED',
             allowSplit: fallbackParsed.allowSplit,
             minimumSessionMinutes: fallbackParsed.minimumSessionMinutes || 30,
+            splitConfig: fallbackParsed.allowSplit ? { forcedMode: 'single' } : undefined,
             preferredTimeOfDay: fallbackParsed.preferredTimeOfDay,
             timeConstraintType: fallbackParsed.timeConstraintType,
             requestedStartAt: fallbackParsed.requestedStartAt,
@@ -338,6 +520,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
           };
 
           const schedRes = scheduleTaskDeterministically(fallbackTask, events, tasks, preferences);
+
+          if (activeRequestIdRef.current !== currentReqId) return;
+
           setPlanSource('rule_fallback_on_error');
           setProposedPlan(fallbackParsed);
           setScheduleTestResult(schedRes);
@@ -345,6 +530,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             'Pemrosesan AI tidak tersedia saat ini. Jadwal berhasil dialihkan dan disusun menggunakan mesin aturan lokal deterministik (Local Rule-based Engine) EVEN.'
           );
         } catch {
+          if (activeRequestIdRef.current !== currentReqId) return;
           const safeMessage = formatUserErrorMessage(undefined, undefined, err?.message);
           setErrorMessage(safeMessage);
         }
@@ -355,8 +541,114 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         timeoutTimerRef.current = null;
       }
       abortControllerRef.current = null;
-      setLoadingPhase(LoadingPhase.IDLE);
+      if (activeRequestIdRef.current === currentReqId) {
+        setLoadingPhase(LoadingPhase.IDLE);
+      }
     }
+  };
+
+  const handleSelectSplitMode = (mode: 'single' | 'split') => {
+    if (!proposedPlan) return;
+    setSelectedSplitMode(mode);
+
+    const splitOpts = getAvailableSplitOptions(
+      proposedPlan.estimatedDurationMinutes,
+      proposedPlan.minimumSessionMinutes || 30
+    );
+    const chosenOption = selectedSplitOption || splitOpts[0] || null;
+
+    const splitConfig: TaskSplitConfig =
+      mode === 'split' && chosenOption
+        ? {
+            forcedMode: 'split',
+            targetSessionCount: chosenOption.sessionCount,
+            sessionDurationMinutes: chosenOption.durationPerSession,
+          }
+        : {
+            forcedMode: 'single',
+          };
+
+    const updatedPlan: AIPlanDraft = {
+      ...proposedPlan,
+      splitConfig,
+    };
+    setProposedPlan(updatedPlan);
+
+    const pseudoTask: Task = {
+      id: `ai-draft-${Date.now()}`,
+      userId: 'user-default',
+      title: updatedPlan.title,
+      description: updatedPlan.description,
+      estimatedDurationMinutes: updatedPlan.estimatedDurationMinutes,
+      deadlineAt: updatedPlan.deadlineAt || null,
+      hasExplicitDeadline: Boolean(updatedPlan.hasExplicitDeadline || updatedPlan.deadlineAt),
+      targetDate: updatedPlan.targetDate,
+      targetDayOffset: updatedPlan.targetDayOffset,
+      priority: updatedPlan.priority,
+      status: 'UNSCHEDULED',
+      allowSplit: updatedPlan.allowSplit,
+      minimumSessionMinutes: updatedPlan.minimumSessionMinutes || 30,
+      splitConfig,
+      preferredTimeOfDay: updatedPlan.preferredTimeOfDay,
+      timeConstraintType: updatedPlan.timeConstraintType,
+      requestedStartAt: updatedPlan.requestedStartAt,
+      requestedEndAt: updatedPlan.requestedEndAt,
+      targetDays: updatedPlan.targetDays,
+      targetOccurrences: updatedPlan.targetOccurrences,
+      preferredWindow: updatedPlan.preferredWindow,
+      timezone: updatedPlan.timezone || userTimezone,
+      createdAt: new Date().toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
+    setScheduleTestResult(schedRes);
+  };
+
+  const handleSelectSplitOption = (opt: SplitOption) => {
+    if (!proposedPlan) return;
+    setSelectedSplitOption(opt);
+    setSelectedSplitMode('split');
+
+    const splitConfig: TaskSplitConfig = {
+      forcedMode: 'split',
+      targetSessionCount: opt.sessionCount,
+      sessionDurationMinutes: opt.durationPerSession,
+    };
+
+    const updatedPlan: AIPlanDraft = {
+      ...proposedPlan,
+      splitConfig,
+    };
+    setProposedPlan(updatedPlan);
+
+    const pseudoTask: Task = {
+      id: `ai-draft-${Date.now()}`,
+      userId: 'user-default',
+      title: updatedPlan.title,
+      description: updatedPlan.description,
+      estimatedDurationMinutes: updatedPlan.estimatedDurationMinutes,
+      deadlineAt: updatedPlan.deadlineAt || null,
+      hasExplicitDeadline: Boolean(updatedPlan.hasExplicitDeadline || updatedPlan.deadlineAt),
+      targetDate: updatedPlan.targetDate,
+      targetDayOffset: updatedPlan.targetDayOffset,
+      priority: updatedPlan.priority,
+      status: 'UNSCHEDULED',
+      allowSplit: updatedPlan.allowSplit,
+      minimumSessionMinutes: updatedPlan.minimumSessionMinutes || 30,
+      splitConfig,
+      preferredTimeOfDay: updatedPlan.preferredTimeOfDay,
+      timeConstraintType: updatedPlan.timeConstraintType,
+      requestedStartAt: updatedPlan.requestedStartAt,
+      requestedEndAt: updatedPlan.requestedEndAt,
+      targetDays: updatedPlan.targetDays,
+      targetOccurrences: updatedPlan.targetOccurrences,
+      preferredWindow: updatedPlan.preferredWindow,
+      timezone: updatedPlan.timezone || userTimezone,
+      createdAt: new Date().toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
+    setScheduleTestResult(schedRes);
   };
 
   const handleResolveDurationAmbiguity = (mode: 'split' | 'per_day') => {
@@ -690,6 +982,11 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                   >
                     {planSource === 'gemini' ? 'Hasil Analisis AI' : 'Mesin Aturan Deterministik (Fallback)'}
                   </span>
+                  {proposedPlan.hasExplicitDeadline && proposedPlan.deadlineAt && (
+                    <span className="flex items-center gap-1 text-[11px] font-semibold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-md">
+                      <Calendar size={11} /> Tenggat: {formatInUserTimezone(new Date(proposedPlan.deadlineAt), userTimezone, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })} WIB
+                    </span>
+                  )}
                   {proposedPlan.timeConstraintType === 'fixed_event' ? (
                     <span className="flex items-center gap-1 text-[11px] font-semibold text-rose-700 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-md">
                       <Lock size={11} /> Komitmen Waktu Tetap (Fixed Event)
@@ -754,33 +1051,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                   <Calendar size={12} /> Target / Waktu
                 </span>
                 <span className="text-xs font-bold text-[#172B42]">
-                  {proposedPlan.targetOccurrences && proposedPlan.targetOccurrences.length > 1
-                    ? proposedPlan.targetOccurrences.map((o) => o.dayName).join(' & ')
-                    : proposedPlan.requestedStartAt
-                    ? (() => {
-                        const startD = new Date(proposedPlan.requestedStartAt);
-                        const startStr = formatInUserTimezone(startD, userTimezone, {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        });
-                        if (proposedPlan.requestedEndAt) {
-                          const endD = new Date(proposedPlan.requestedEndAt);
-                          const endStr = formatInUserTimezone(endD, userTimezone, {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          });
-                          const isNextDay =
-                            getZonedDateTimeParts(endD, userTimezone).day !==
-                            getZonedDateTimeParts(startD, userTimezone).day;
-                          return `${startStr} - ${endStr}${isNextDay ? ' (+1 hr)' : ''}`;
-                        }
-                        return startStr;
-                      })()
-                    : proposedPlan.deadlineDaysFromNow === 0
-                    ? 'Hari ini'
-                    : proposedPlan.deadlineDaysFromNow === 1
-                    ? 'Besok'
-                    : `${proposedPlan.deadlineDaysFromNow} hari`}
+                  {formatPlanTargetDisplay(proposedPlan, userTimezone)}
                 </span>
               </div>
               <div className="p-3 bg-[#F8FAFC] rounded-xl border border-[#D9E3EF]/60 space-y-1">
@@ -789,7 +1060,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                 </span>
                 <span className="text-xs font-bold text-[#172B42]">
                   {proposedPlan.allowSplit
-                    ? `Boleh (${proposedPlan.minimumSessionMinutes}m min)`
+                    ? (selectedSplitMode === 'split' && selectedSplitOption
+                        ? `${selectedSplitOption.sessionCount} sesi × ${selectedSplitOption.durationPerSession}m`
+                        : `Boleh (${proposedPlan.minimumSessionMinutes || 30}m min)`)
                     : 'Satu sesi utuh'}
                 </span>
               </div>
@@ -808,6 +1081,96 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                 </span>
               </div>
             </div>
+
+            {/* Split Session Interactive Selection (Hanya jika allowSplit bernilai true) */}
+            {proposedPlan.allowSplit && availableSplitOptions.length > 0 && (
+              <div className="p-4 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                  <span className="text-xs font-bold text-[#172B42] flex items-center gap-1.5">
+                    <Layers size={14} className="text-[#2457A7]" />
+                    Pilihan Pembagian Sesi Kegiatan
+                  </span>
+                  <span className="text-[11px] text-[#53657A]">
+                    Total Durasi: {proposedPlan.estimatedDurationMinutes} menit (Batas minimum {proposedPlan.minimumSessionMinutes || 30}m/sesi)
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleSelectSplitMode('single')}
+                    className={`px-3.5 py-2.5 text-xs rounded-xl border transition-all text-left flex flex-col justify-between ${
+                      selectedSplitMode === 'single'
+                        ? 'bg-[#EAF3FC] border-[#2457A7] text-[#2457A7] ring-1 ring-[#2457A7] shadow-2xs font-semibold'
+                        : 'bg-white text-[#172B42] border-[#D9E3EF] hover:border-[#8DBCEB]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold">Satu Sesi Utuh</span>
+                      <span className="text-[11px] px-1.5 py-0.5 rounded bg-slate-100 text-[#53657A]">1 sesi</span>
+                    </div>
+                    <p className="text-[11px] text-[#53657A] mt-1">
+                      Dikerjakan sekaligus selama {proposedPlan.estimatedDurationMinutes} menit tanpa jeda.
+                    </p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleSelectSplitMode('split')}
+                    className={`px-3.5 py-2.5 text-xs rounded-xl border transition-all text-left flex flex-col justify-between ${
+                      selectedSplitMode === 'split'
+                        ? 'bg-[#EAF3FC] border-[#2457A7] text-[#2457A7] ring-1 ring-[#2457A7] shadow-2xs font-semibold'
+                        : 'bg-white text-[#172B42] border-[#D9E3EF] hover:border-[#8DBCEB]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold">Bagi Menjadi Beberapa Sesi</span>
+                      <span className="text-[11px] px-1.5 py-0.5 rounded bg-[#EAF3FC] text-[#2457A7]">Terjadwal parsial</span>
+                    </div>
+                    <p className="text-[11px] text-[#53657A] mt-1">
+                      Pecah pengerjaan ke dalam slot waktu terpisah yang lebih fleksibel.
+                    </p>
+                  </button>
+                </div>
+
+                {selectedSplitMode === 'split' && (
+                  <div className="pt-2.5 border-t border-[#D9E3EF] space-y-2">
+                    <span className="text-[11px] font-semibold text-[#53657A] block">
+                      Pilih konfigurasi jumlah dan durasi sesi:
+                    </span>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      {availableSplitOptions.map((opt, idx) => {
+                        const isSelected =
+                          selectedSplitOption?.sessionCount === opt.sessionCount &&
+                          selectedSplitOption?.durationPerSession === opt.durationPerSession;
+                        return (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => handleSelectSplitOption(opt)}
+                            className={`p-2.5 rounded-lg border text-left transition-all ${
+                              isSelected
+                                ? 'bg-white border-[#2457A7] text-[#2457A7] shadow-2xs ring-1 ring-[#2457A7]'
+                                : 'bg-white border-[#D9E3EF] text-[#172B42] hover:border-[#8DBCEB]'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between text-xs font-bold">
+                              <span>{opt.label}</span>
+                              <span className="text-[11px] font-semibold text-[#53657A]">
+                                Total {opt.totalDuration} menit
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-[#53657A] mt-0.5">
+                              {opt.sessionCount} kali pengerjaan, masing-masing {opt.durationPerSession} menit
+                            </p>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Multi-day Duration Ambiguity Clarification Banner */}
             {proposedPlan.isDurationAmbiguous && (

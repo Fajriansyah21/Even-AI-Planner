@@ -49,6 +49,8 @@ async function startServer() {
       }
 
       const trimmedPrompt = userPrompt.trim().slice(0, 600);
+      const requestId = (req.headers['x-request-id'] as string) || `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      const geminiAttemptDurations: number[] = [];
 
       const ctx: ParseContext = {
         userPrompt: trimmedPrompt,
@@ -59,12 +61,20 @@ async function startServer() {
       };
 
       // Calculate baseline deterministic rule-based plan
+      const parseStart = Date.now();
       const baselinePlan = parseIndonesianTemporalRules(ctx);
+      const deterministicParseDurationMs = Date.now() - parseStart;
+      const isFallbackValid = Boolean(
+        baselinePlan &&
+        baselinePlan.title &&
+        typeof baselinePlan.estimatedDurationMinutes === 'number' &&
+        baselinePlan.estimatedDurationMinutes > 0
+      );
 
       // Jika instruksi adalah intent operasional (seperti mencari slot kosong atau memindahkan jadwal bentrok)
       if (baselinePlan.isOperational) {
         const elapsedMs = Date.now() - startTime;
-        console.log(`[AI Plan Diagnostics] Duration: ${elapsedMs}ms | Intent: Operational (${baselinePlan.operationalAction})`);
+        console.log(`[AI Plan Diagnostics] RequestId: ${requestId} | ParseDuration: ${deterministicParseDurationMs}ms | GeminiDurations: []ms | Retries: 0 | ErrorCategory: none | FallbackUsed: none | TotalDuration: ${elapsedMs}ms | Intent: Operational (${baselinePlan.operationalAction})`);
         return res.json({
           success: true,
           isAiGenerated: false,
@@ -76,7 +86,18 @@ async function startServer() {
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
         const elapsedMs = Date.now() - startTime;
-        console.log(`[AI Plan Diagnostics] Duration: ${elapsedMs}ms | Mode: rule_fallback | No API key configured`);
+        console.log(`[AI Plan Diagnostics] RequestId: ${requestId} | ParseDuration: ${deterministicParseDurationMs}ms | GeminiDurations: []ms | Retries: 0 | ErrorCategory: none | FallbackUsed: rule_engine | TotalDuration: ${elapsedMs}ms`);
+        if (!isFallbackValid) {
+          return res.status(422).json({
+            success: false,
+            errorCode: 'INVALID_FALLBACK_PLAN',
+            error: 'Tidak dapat menyusun jadwal: instruksi tidak memiliki judul atau estimasi durasi yang valid.',
+            category: 'invalid_request',
+            providerStatus: 422,
+            retryCount: 0,
+            latencyMs: elapsedMs,
+          });
+        }
         return res.json({
           success: true,
           isAiGenerated: false,
@@ -137,7 +158,8 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
 
       const retryResult = await executeWithRetryAndTimeout(
         async (attempt, remainingMs) => {
-          const perAttemptTimeoutMs = Math.min(25000, Math.max(5000, remainingMs - 500));
+          const perAttemptTimeoutMs = Math.min(8000, Math.max(3000, remainingMs - 500));
+          const attemptStart = Date.now();
           const controller = new AbortController();
           const timeoutTimer = setTimeout(() => {
             controller.abort();
@@ -203,8 +225,10 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
                 abortSignal: controller.signal,
               },
             });
+            geminiAttemptDurations.push(Date.now() - attemptStart);
             return result;
           } catch (err: any) {
+            geminiAttemptDurations.push(Date.now() - attemptStart);
             if (controller.signal.aborted || err?.name === 'AbortError') {
               const timeoutErr = new Error(`Permintaan ke Gemini API melampaui batas waktu percobaan (${perAttemptTimeoutMs}ms).`);
               (timeoutErr as any).name = 'AbortError';
@@ -218,9 +242,9 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         },
         {
           maxRetries: 1,
-          totalTimeoutMs: 30000,
-          initialBackoffMs: 300,
-          maxBackoffMs: 1000,
+          totalTimeoutMs: 14000,
+          initialBackoffMs: 250,
+          maxBackoffMs: 500,
         }
       );
 
@@ -232,8 +256,20 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         const category = analysis.category;
 
         console.log(
-          `[AI Plan Diagnostics] Duration: ${elapsedMs}ms | ProviderStatus: ${providerStatus} | Retries: ${retryCount} | ErrorCategory: ${category} | ErrorCode: ${analysis.errorCode} | Fallback: rule_engine`
+          `[AI Plan Diagnostics] RequestId: ${requestId} | ParseDuration: ${deterministicParseDurationMs}ms | GeminiDurations: [${geminiAttemptDurations.join(', ')}]ms | Retries: ${retryCount} | ErrorCategory: ${category} | FallbackUsed: ${isFallbackValid ? 'rule_engine' : 'none'} | TotalDuration: ${elapsedMs}ms`
         );
+
+        if (!isFallbackValid) {
+          return res.status(422).json({
+            success: false,
+            errorCode: 'INVALID_FALLBACK_PLAN',
+            error: 'Tidak dapat menyusun jadwal: instruksi tidak memiliki judul atau estimasi durasi yang valid.',
+            category: 'invalid_request',
+            providerStatus,
+            retryCount,
+            latencyMs: elapsedMs,
+          });
+        }
 
         return res.json({
           success: true,
@@ -381,7 +417,7 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
 
       const elapsedMs = Date.now() - startTime;
       console.log(
-        `[AI Plan Diagnostics] Duration: ${elapsedMs}ms | ProviderStatus: 200 | Retries: ${retryResult.retryCount} | Success: true`
+        `[AI Plan Diagnostics] RequestId: ${requestId} | ParseDuration: ${deterministicParseDurationMs}ms | GeminiDurations: [${geminiAttemptDurations.join(', ')}]ms | Retries: ${retryResult.retryCount} | ErrorCategory: none | FallbackUsed: none | TotalDuration: ${elapsedMs}ms`
       );
 
       return res.json({

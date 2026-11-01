@@ -64,7 +64,25 @@ export function simulateBackendPlanPipeline(
     };
   }
 
+  const isFallbackValid = Boolean(
+    baselinePlan &&
+    baselinePlan.title &&
+    typeof baselinePlan.estimatedDurationMinutes === 'number' &&
+    baselinePlan.estimatedDurationMinutes > 0 &&
+    prompt.trim().length > 5 &&
+    !['halo', 'test', 'tes'].includes(prompt.trim().toLowerCase())
+  );
+
   if (!apiKeyConfigured) {
+    if (!isFallbackValid) {
+      return {
+        success: false,
+        isAiGenerated: false,
+        source: 'rule_fallback',
+        warning: 'Instruksi tidak valid untuk fallback.',
+        plan: baselinePlan as any,
+      };
+    }
     return {
       success: true,
       isAiGenerated: false,
@@ -75,6 +93,15 @@ export function simulateBackendPlanPipeline(
   }
 
   if (options?.geminiError || !options?.mockGeminiPlan) {
+    if (!isFallbackValid) {
+      return {
+        success: false,
+        isAiGenerated: false,
+        source: 'rule_fallback_on_error',
+        warning: 'Instruksi tidak valid untuk fallback.',
+        plan: baselinePlan as any,
+      };
+    }
     return {
       success: true,
       isAiGenerated: false,
