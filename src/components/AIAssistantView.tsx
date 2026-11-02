@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import {
   Sparkles,
   Send,
@@ -243,6 +243,15 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const [scheduleTestResult, setScheduleTestResult] = useState<ScheduleCalculationResult | null>(null);
   const [selectedSplitMode, setSelectedSplitMode] = useState<'single' | 'split'>('single');
   const [selectedSplitOption, setSelectedSplitOption] = useState<SplitOption | null>(null);
+
+  const availableSplitOptions = useMemo(() => {
+    if (!proposedPlan || !proposedPlan.allowSplit) return [];
+    return getAvailableSplitOptions(
+      proposedPlan.estimatedDurationMinutes,
+      proposedPlan.minimumSessionMinutes || 30
+    );
+  }, [proposedPlan]);
+
   const [errorMessage, setErrorMessage] = useState('');
   const [warningMessage, setWarningMessage] = useState('');
   const [planSource, setPlanSource] = useState<'gemini' | 'rule_fallback_on_error' | 'rule_fallback'>('gemini');
