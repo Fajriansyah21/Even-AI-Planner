@@ -65,6 +65,7 @@ export interface TaskSplitConfig {
   forcedMode?: 'single' | 'split';
   targetSessionCount?: number;
   sessionDurationMinutes?: number;
+  minGapMinutes?: number;
 }
 
 export interface Task {

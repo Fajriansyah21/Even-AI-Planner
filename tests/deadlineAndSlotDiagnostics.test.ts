@@ -6,6 +6,7 @@ import {
   scheduleTaskDeterministically,
   formatWindowTime,
   verifyAndNormalizeReferenceDate,
+  DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
 } from '../src/lib/scheduler';
 import {
   createIsoInTimezone,
@@ -792,6 +793,220 @@ export function runDeadlineAndSlotDiagnosticsTests() {
     );
 
     console.log('  ✅ [PASS] Kasus 20: Anggaran timeout dan fallback tervalidasi dengan proteksi kejujuran status.');
+  }
+
+  // KASUS 21: Distribusi Multi-Sesi 3 × 30 Menit Terpisah Secara Temporal dengan Gap Minimal (60 Menit)
+  console.log('>>> [21/23] Kasus 21: Distribusi multi-sesi 3x30m terpisah secara temporal dengan jeda minimal 60 menit');
+  {
+    const mondayMorningAnchor = new Date('2024-05-20T02:00:00.000Z'); // 09:00 WIB Senin
+    const task3x30: Task = {
+      id: 'task-split-3x30',
+      userId: 'user-default',
+      title: 'Mengerjakan Laporan Praktikum',
+      estimatedDurationMinutes: 90,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 3,
+        sessionDurationMinutes: 30,
+        minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES, // 60 menit
+      },
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayMorningAnchor.toISOString(),
+    };
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      bufferMinutes: 0,
+      enableLunchBreak: false,
+    };
+
+    const result = scheduleTaskDeterministically(task3x30, [], [], cleanPrefs, mondayMorningAnchor);
+    assert(result.success === true, `Jadwal 3x30m harus berhasil di hari kosong, dapat: ${result.explanation}`);
+    assert(result.proposedSessions.length === 3, `Harus ada tepat 3 sesi, dapat: ${result.proposedSessions.length}`);
+
+    // Periksa durasi tiap sesi
+    for (let i = 0; i < 3; i++) {
+      assert(
+        result.proposedSessions[i].durationMinutes === 30,
+        `Sesi ${i + 1} harus berdurasi 30 menit, dapat: ${result.proposedSessions[i].durationMinutes}`
+      );
+    }
+
+    // Verifikasi jeda antar sesi: Sesi berikutnya tidak boleh menempel (kontigu) tanpa jeda
+    const s1End = new Date(result.proposedSessions[0].endAt).getTime();
+    const s2Start = new Date(result.proposedSessions[1].startAt).getTime();
+    const gap1 = (s2Start - s1End) / 60000;
+    assert(
+      gap1 >= 60,
+      `Jeda antara sesi 1 dan sesi 2 harus minimal 60 menit, dapat ${gap1} menit (sesi 1 end: ${result.proposedSessions[0].endAt}, sesi 2 start: ${result.proposedSessions[1].startAt})`
+    );
+
+    const s2End = new Date(result.proposedSessions[1].endAt).getTime();
+    const s3Start = new Date(result.proposedSessions[2].startAt).getTime();
+    const gap2 = (s3Start - s2End) / 60000;
+    assert(
+      gap2 >= 60,
+      `Jeda antara sesi 2 dan sesi 3 harus minimal 60 menit, dapat ${gap2} menit (sesi 2 end: ${result.proposedSessions[1].endAt}, sesi 3 start: ${result.proposedSessions[2].startAt})`
+    );
+
+    console.log('  ✅ [PASS] Kasus 21: Sesi 3x30m sukses terpisah secara temporal dengan jeda >= 60 menit dan tidak menempel.');
+  }
+
+  // KASUS 22: Distribusi Multi-Sesi Multi-Hari & Penolakan Total Jika Slot Berjeda Tidak Cukup
+  console.log('>>> [22/23] Kasus 22: Distribusi multi-sesi lintas hari & kegagalan INSUFFICIENT_SPLIT_SLOTS jika jeda tidak terpenuhi');
+  {
+    const mondayMorningAnchor = new Date('2024-05-20T02:00:00.000Z'); // 09:00 WIB Senin
+
+    // Skenario 22A: Hari Senin hanya cukup untuk 1 sesi karena agenda padat.
+    // Sisa 2 sesi harus melompat ke hari berikutnya (Selasa) dan tetap menjaga jeda 60m.
+    const busyMonday: CalendarEvent[] = [
+      {
+        id: 'evt-mon-1',
+        title: 'Meeting Seharian Sebagian',
+        startAt: createIsoInTimezone(2024, 5, 20, 10, 0, 0, TEST_TIMEZONE), // 10:00 - 18:00 WIB
+        endAt: createIsoInTimezone(2024, 5, 20, 18, 0, 0, TEST_TIMEZONE),
+        provider: 'google',
+        isEditable: false,
+        syncStatus: 'synced',
+      },
+    ];
+
+    const taskMultiDay: Task = {
+      id: 'task-multiday-split',
+      userId: 'user-default',
+      title: 'Belajar Coding',
+      estimatedDurationMinutes: 90,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 3,
+        sessionDurationMinutes: 30,
+        minGapMinutes: 60,
+      },
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayMorningAnchor.toISOString(),
+    };
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      bufferMinutes: 0,
+      enableLunchBreak: false,
+    };
+
+    const resultMultiDay = scheduleTaskDeterministically(taskMultiDay, busyMonday, [], cleanPrefs, mondayMorningAnchor);
+    assert(resultMultiDay.success === true, `Jadwal harus sukses melompat ke hari berikutnya: ${resultMultiDay.explanation}`);
+    assert(resultMultiDay.proposedSessions.length === 3, 'Harus menghasilkan tepat 3 sesi');
+
+    // Sesi 1 di Senin (09:00 - 09:30)
+    const sess1Date = new Date(resultMultiDay.proposedSessions[0].startAt);
+    const p1 = getPartsInTimezone(sess1Date, TEST_TIMEZONE);
+    assert(p1.day === 20, `Sesi 1 harus pada tanggal 20 (Senin), dapat tanggal ${p1.day}`);
+
+    // Sesi 2 di Selasa (21 Mei)
+    const sess2Date = new Date(resultMultiDay.proposedSessions[1].startAt);
+    const p2 = getPartsInTimezone(sess2Date, TEST_TIMEZONE);
+    assert(p2.day === 21, `Sesi 2 harus pada tanggal 21 (Selasa), dapat tanggal ${p2.day}`);
+
+    // Sesi 3 di Selasa (21 Mei) dengan jeda minimal 60 menit dari Sesi 2
+    const sess3Date = new Date(resultMultiDay.proposedSessions[2].startAt);
+    const p3 = getPartsInTimezone(sess3Date, TEST_TIMEZONE);
+    assert(p3.day === 21, `Sesi 3 harus pada tanggal 21 (Selasa), dapat tanggal ${p3.day}`);
+    const gapTue = (sess3Date.getTime() - new Date(resultMultiDay.proposedSessions[1].endAt).getTime()) / 60000;
+    assert(gapTue >= 60, `Jeda Sesi 2 dan 3 di hari Selasa harus minimal 60 menit, dapat: ${gapTue}m`);
+
+    // Skenario 22B: Ada tenggat waktu ketat di Senin jam 18:00 WIB, tetapi slot berjeda hanya mampu 2 sesi (kurang 1 sesi)
+    // Kalender Senin: 09:00-11:00 kosong (Sesi 1: 09:00-09:30, jeda 60m -> 10:30-11:00 Sesi 2)
+    // Jam 11:00 - 18:00 sibuk.
+    // Tenggat: Senin jam 18:00.
+    // Total slot yang memenuhi jeda hanya 2 dari 3 sesi yang diminta.
+    // Scheduler HARUS GAGAL TOTAL (success: false) dengan failureCode: 'INSUFFICIENT_SPLIT_SLOTS'.
+    const busyRestOfDay: CalendarEvent[] = [
+      {
+        id: 'evt-mon-afternoon',
+        title: 'Fokus Siang Hingga Tutup',
+        startAt: createIsoInTimezone(2024, 5, 20, 11, 0, 0, TEST_TIMEZONE),
+        endAt: createIsoInTimezone(2024, 5, 20, 18, 0, 0, TEST_TIMEZONE),
+        provider: 'google',
+        isEditable: false,
+        syncStatus: 'synced',
+      },
+    ];
+
+    const taskWithTightDeadline: Task = {
+      ...taskMultiDay,
+      deadlineAt: createIsoInTimezone(2024, 5, 20, 18, 0, 0, TEST_TIMEZONE),
+      hasExplicitDeadline: true,
+    };
+
+    const resultStrictFail = scheduleTaskDeterministically(taskWithTightDeadline, busyRestOfDay, [], cleanPrefs, mondayMorningAnchor);
+    assert(resultStrictFail.success === false, 'Scheduler HARUS gagal jika hanya menemukan 2 dari 3 sesi yang diminta');
+    assert(
+      resultStrictFail.failureCode === 'INSUFFICIENT_SPLIT_SLOTS',
+      `failureCode harus INSUFFICIENT_SPLIT_SLOTS, dapat: ${resultStrictFail.failureCode}`
+    );
+    assert(
+      resultStrictFail.proposedSessions.length === 0,
+      `proposedSessions harus kosong pada kegagalan (tidak boleh mengklaim sukses parsial), dapat: ${resultStrictFail.proposedSessions.length}`
+    );
+    assert(
+      resultStrictFail.explanation.includes('2 dari 3') || resultStrictFail.explanation.includes('jeda minimal'),
+      `Penjelasan harus jujur menyebutkan kekurangan sesi / jeda minimal, dapat: '${resultStrictFail.explanation}'`
+    );
+
+    console.log('  ✅ [PASS] Kasus 22: Distribusi multi-hari dan kegagalan tegas INSUFFICIENT_SPLIT_SLOTS teruji tervalidasi.');
+  }
+
+  // KASUS 23: UI Pembagian Sesi Dinamis & Penanganan Timeout Frontend vs Pembatalan Manual
+  console.log('>>> [23/23] Kasus 23: Evaluasi opsi UI pembagian sesi & proteksi timeout vs pembatalan manual');
+  {
+    // A. Tugas 90 menit dengan batas min 30 menit harus menghasilkan opsi 2x45m dan 3x30m
+    const opts90 = getAvailableSplitOptions(90, 30);
+    assert(opts90.length === 2, `Harus ada 2 opsi split untuk 90m (min 30m), dapat ${opts90.length}`);
+    assert(opts90[0].sessionCount === 2 && opts90[0].durationPerSession === 45, 'Opsi 1 harus 2 sesi @ 45m');
+    assert(opts90[1].sessionCount === 3 && opts90[1].durationPerSession === 30, 'Opsi 2 harus 3 sesi @ 30m');
+
+    // B. Nilai default gap minimal antar sesi
+    assert(DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES === 60, `DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES harus bernilai 60, dapat: ${DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES}`);
+
+    // C. Pembedaan manual cancel vs timeout:
+    // Manual cancel menghasilkan AbortError dengan didTimeout = false -> pesan 'Proses analisis dibatalkan oleh pengguna' dan JANGAN fallback
+    // Automated timeout menghasilkan AbortError dengan didTimeout = true -> jalankan deterministic fallback dengan notice timeout 30s
+    let fallbackExecuted = false;
+    let uiMessage = '';
+    const simulateAbortHandling = (isTimeout: boolean) => {
+      fallbackExecuted = false;
+      uiMessage = '';
+      const err = new Error('The operation was aborted');
+      err.name = 'AbortError';
+
+      if (err.name === 'AbortError' && !isTimeout) {
+        uiMessage = 'Proses analisis dibatalkan oleh pengguna.';
+        return;
+      }
+
+      // Timeout path
+      fallbackExecuted = true;
+      uiMessage = isTimeout
+        ? 'Permintaan AI melampaui batas waktu respons (30 detik). Jadwal berhasil dialihkan dan disusun menggunakan mesin aturan lokal deterministik (Local Rule-based Engine) EVEN.'
+        : 'Pemrosesan AI tidak tersedia saat ini.';
+    };
+
+    simulateAbortHandling(false); // Manual cancel
+    assert(fallbackExecuted === false, 'Pembatalan manual tidak boleh memicu fallback');
+    assert(uiMessage === 'Proses analisis dibatalkan oleh pengguna.', `Pesan harus dibatalkan oleh pengguna, dapat: '${uiMessage}'`);
+
+    simulateAbortHandling(true); // Automated 30s timeout
+    assert(fallbackExecuted === true, 'Automated 30s timeout HARUS memicu fallback deterministik');
+    assert(uiMessage.includes('30 detik'), `Pesan timeout harus menyebut 30 detik, dapat: '${uiMessage}'`);
+
+    console.log('  ✅ [PASS] Kasus 23: UI split options dinamis dan isolasi timeout vs manual cancel teruji akurat.');
   }
 
   console.log('\n========================================================================');

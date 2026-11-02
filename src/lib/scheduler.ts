@@ -20,6 +20,8 @@ interface TimeInterval {
   end: Date;
 }
 
+export const DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES = 60;
+
 function formatIndonesianDate(d: Date, tz: string = 'Asia/Jakarta'): string {
   return formatInTimezone(d, tz, {
     weekday: 'long',
@@ -696,7 +698,8 @@ export function scheduleTaskDeterministically(
     totalDurationMinutes: number,
     targetCount: number,
     durationPerSession: number,
-    minSessionMinutes: number
+    minSessionMinutes: number,
+    minGapMinutes: number = DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES
   ): {
     success: boolean;
     sessions: ScheduleCalculationResult['proposedSessions'];
@@ -713,18 +716,27 @@ export function scheduleTaskDeterministically(
     }
 
     const allocated: ScheduleCalculationResult['proposedSessions'] = [];
+    let lastAllocatedEnd: Date | null = null;
 
     for (const block of freeBlocks) {
       if (allocated.length >= targetCount) break;
 
-      let blockStart = new Date(block.start);
+      let cursor = new Date(block.start);
       const blockEnd = new Date(block.end);
 
-      while (allocated.length < targetCount) {
-        const blockRemainingMinutes = (blockEnd.getTime() - blockStart.getTime()) / 60000;
-        if (blockRemainingMinutes < durationPerSession) break;
+      // Enforce gap from previous session if allocated in earlier block
+      if (lastAllocatedEnd !== null && minGapMinutes > 0) {
+        const earliestAllowed = new Date(lastAllocatedEnd.getTime() + minGapMinutes * 60000);
+        if (earliestAllowed > cursor) {
+          cursor = earliestAllowed;
+        }
+      }
 
-        const sessionStart = new Date(blockStart);
+      while (allocated.length < targetCount) {
+        const remainingMs = blockEnd.getTime() - cursor.getTime();
+        if (remainingMs < durationPerSession * 60000) break;
+
+        const sessionStart = new Date(cursor);
         const sessionEnd = new Date(sessionStart.getTime() + durationPerSession * 60000);
 
         allocated.push({
@@ -735,17 +747,19 @@ export function scheduleTaskDeterministically(
           totalSessions: targetCount,
         });
 
-        blockStart = sessionEnd;
+        lastAllocatedEnd = sessionEnd;
+        cursor = new Date(sessionEnd.getTime() + (minGapMinutes > 0 ? minGapMinutes * 60000 : 0));
       }
     }
 
     if (allocated.length === targetCount) {
       const first = allocated[0];
       const totalScheduled = allocated.reduce((sum, s) => sum + s.durationMinutes, 0);
+      const gapNote = minGapMinutes > 0 ? ` dengan jeda minimal ${minGapMinutes} menit antar sesi` : '';
       return {
         success: true,
         sessions: allocated,
-        explanation: `Berhasil membagi kegiatan menjadi ${targetCount} sesi masing-masing ${durationPerSession} menit (total ${totalScheduled} menit). Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+        explanation: `Berhasil membagi kegiatan menjadi ${targetCount} sesi masing-masing ${durationPerSession} menit (total ${totalScheduled} menit)${gapNote}. Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
       };
     } else {
       const totalFound = allocated.length * durationPerSession;
@@ -753,7 +767,7 @@ export function scheduleTaskDeterministically(
         success: false,
         sessions: [],
         failureCode: 'INSUFFICIENT_SPLIT_SLOTS',
-        explanation: `Hanya ditemukan ${allocated.length} dari ${targetCount} sesi (${durationPerSession} menit/sesi) yang dibutuhkan (total ${totalFound} dari ${totalDurationMinutes} menit). Sisa durasi ${totalDurationMinutes - totalFound} menit tidak menemukan slot luang bebas konflik.`,
+        explanation: `Hanya ditemukan ${allocated.length} dari ${targetCount} sesi (${durationPerSession} menit/sesi) yang dibutuhkan (total ${totalFound} dari ${totalDurationMinutes} menit). Sisa ${targetCount - allocated.length} sesi tidak menemukan slot luang bebas konflik yang memenuhi jeda minimal antar sesi (${minGapMinutes} menit) sebelum batas pencarian atau tenggat.`,
       };
     }
   };
@@ -1058,13 +1072,17 @@ export function scheduleTaskDeterministically(
       const targetCount = task.splitConfig?.targetSessionCount || 2;
       const durPerSession = task.splitConfig?.sessionDurationMinutes || Math.round(durationNeeded / targetCount);
       const minSession = task.minimumSessionMinutes || 30;
+      const minGap = typeof task.splitConfig?.minGapMinutes === 'number'
+        ? task.splitConfig.minGapMinutes
+        : DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES;
 
       const splitRes = allocateExactSplitSessions(
         preferredFreeBlocks,
         durationNeeded,
         targetCount,
         durPerSession,
-        minSession
+        minSession,
+        minGap
       );
 
       if (splitRes.success) {
@@ -1398,13 +1416,17 @@ export function scheduleTaskDeterministically(
     const targetCount = task.splitConfig?.targetSessionCount || 2;
     const durPerSession = task.splitConfig?.sessionDurationMinutes || Math.round(durationNeeded / targetCount);
     const minSession = task.minimumSessionMinutes || 30;
+    const minGap = typeof task.splitConfig?.minGapMinutes === 'number'
+      ? task.splitConfig.minGapMinutes
+      : DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES;
 
     const splitRes = allocateExactSplitSessions(
       standardFreeBlocks,
       durationNeeded,
       targetCount,
       durPerSession,
-      minSession
+      minSession,
+      minGap
     );
 
     if (splitRes.success) {
@@ -1485,30 +1507,48 @@ export function scheduleTaskDeterministically(
   // Split sessions in standard / night shift hours
   if (task.allowSplit) {
     const minSession = task.minimumSessionMinutes || 30;
+    const minGap = typeof task.splitConfig?.minGapMinutes === 'number'
+      ? task.splitConfig.minGapMinutes
+      : DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES;
     let remainingMinutes = durationNeeded;
     const splitSessions: ScheduleCalculationResult['proposedSessions'] = [];
+    let lastAllocatedEnd: Date | null = null;
 
     for (const block of standardFreeBlocks) {
       if (remainingMinutes <= 0) break;
 
-      const blockDuration = (block.end.getTime() - block.start.getTime()) / 60000;
-      if (blockDuration < minSession) continue;
+      let cursor = new Date(block.start);
+      const blockEnd = new Date(block.end);
 
-      const allocDuration = Math.min(blockDuration, remainingMinutes);
-      if (allocDuration < minSession) continue;
+      if (lastAllocatedEnd !== null && minGap > 0) {
+        const earliestAllowed = new Date(lastAllocatedEnd.getTime() + minGap * 60000);
+        if (earliestAllowed > cursor) {
+          cursor = earliestAllowed;
+        }
+      }
 
-      const sessionStart = new Date(block.start);
-      const sessionEnd = new Date(sessionStart.getTime() + allocDuration * 60000);
+      while (remainingMinutes > 0) {
+        const remainingBlockMinutes = (blockEnd.getTime() - cursor.getTime()) / 60000;
+        if (remainingBlockMinutes < minSession) break;
 
-      splitSessions.push({
-        startAt: sessionStart.toISOString(),
-        endAt: sessionEnd.toISOString(),
-        durationMinutes: allocDuration,
-        sessionIndex: splitSessions.length + 1,
-        totalSessions: 0,
-      });
+        const allocDuration = Math.min(remainingBlockMinutes, remainingMinutes);
+        if (allocDuration < minSession) break;
 
-      remainingMinutes -= allocDuration;
+        const sessionStart = new Date(cursor);
+        const sessionEnd = new Date(sessionStart.getTime() + allocDuration * 60000);
+
+        splitSessions.push({
+          startAt: sessionStart.toISOString(),
+          endAt: sessionEnd.toISOString(),
+          durationMinutes: allocDuration,
+          sessionIndex: splitSessions.length + 1,
+          totalSessions: 0,
+        });
+
+        remainingMinutes -= allocDuration;
+        lastAllocatedEnd = sessionEnd;
+        cursor = new Date(sessionEnd.getTime() + (minGap > 0 ? minGap * 60000 : 0));
+      }
     }
 
     if (remainingMinutes <= 0 && splitSessions.length > 0) {

@@ -26,7 +26,10 @@ import {
   ScheduleCalculationResult,
   TaskSplitConfig,
 } from '../types';
-import { scheduleTaskDeterministically } from '../lib/scheduler';
+import {
+  scheduleTaskDeterministically,
+  DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
+} from '../lib/scheduler';
 import { formatUserErrorMessage } from '../lib/geminiErrorHandling';
 import { formatInUserTimezone, getZonedDateTimeParts, createIsoInTimezone } from '../lib/timezone';
 import { parseIndonesianTemporalRules } from '../lib/temporalParser';
@@ -245,7 +248,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const [selectedSplitOption, setSelectedSplitOption] = useState<SplitOption | null>(null);
 
   const availableSplitOptions = useMemo(() => {
-    if (!proposedPlan || !proposedPlan.allowSplit) return [];
+    if (!proposedPlan) return [];
+    if (proposedPlan.timeConstraintType === 'fixed_event') return [];
     return getAvailableSplitOptions(
       proposedPlan.estimatedDurationMinutes,
       proposedPlan.minimumSessionMinutes || 30
@@ -295,6 +299,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   ];
 
   const handleCancelAnalysis = () => {
+    activeRequestIdRef.current++;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -470,79 +475,86 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     } catch (err: any) {
       if (activeRequestIdRef.current !== currentReqId) return;
 
-      if (err.name === 'AbortError') {
-        if (didTimeout) {
-          setErrorMessage('Permintaan dibatalkan karena melebihi batas waktu (timeout 30 detik). Silakan coba lagi.');
+      if (err.name === 'AbortError' && !didTimeout) {
+        // Pembatalan manual oleh pengguna: JANGAN jalankan fallback
+        setErrorMessage('Proses analisis dibatalkan oleh pengguna.');
+        return;
+      }
+
+      // Timeout otomatis 30 detik (didTimeout === true) ATAU error jaringan/Gemini/server:
+      // Jalankan fallback ke deterministic rule-based scheduler lokal jika permintaan masih aktif
+      try {
+        setLoadingPhase(LoadingPhase.CHECKING_CONFLICTS);
+        const fallbackParsed = parseIndonesianTemporalRules({
+          userPrompt: trimmed,
+          currentDateTime: now.toISOString(),
+          userLocalTimeStr,
+          userTimezone: effectiveTimezone,
+          workHours: {
+            workStartHour: preferences.workStartHour,
+            workEndHour: preferences.workEndHour,
+          },
+        });
+
+        if (!fallbackParsed.title || !fallbackParsed.estimatedDurationMinutes) {
+          throw new Error('Instruksi tidak dapat dipahami untuk penjadwalan otomatis.');
+        }
+
+        const splitOpts = getAvailableSplitOptions(
+          fallbackParsed.estimatedDurationMinutes,
+          fallbackParsed.minimumSessionMinutes || 30
+        );
+        if (splitOpts.length > 0) {
+          setSelectedSplitOption(splitOpts[0]);
         } else {
-          setErrorMessage('Proses analisis dibatalkan oleh pengguna.');
+          setSelectedSplitOption(null);
         }
-      } else {
-        // DETEKSI TRANSISI FALLBACK KE scheduleTaskDeterministically:
-        // Jika AI tidak tersedia atau jaringan/layanan gagal, beralih secara cerdas ke mesin aturan lokal
-        try {
-          setLoadingPhase(LoadingPhase.CHECKING_CONFLICTS);
-          const fallbackParsed = parseIndonesianTemporalRules({
-            userPrompt: trimmed,
-            currentDateTime: now.toISOString(),
-            userLocalTimeStr,
-            userTimezone: effectiveTimezone,
-            workHours: {
-              workStartHour: preferences.workStartHour,
-              workEndHour: preferences.workEndHour,
-            },
-          });
+        setSelectedSplitMode('single');
 
-          const splitOpts = getAvailableSplitOptions(fallbackParsed.estimatedDurationMinutes, fallbackParsed.minimumSessionMinutes || 30);
-          if (splitOpts.length > 0) {
-            setSelectedSplitOption(splitOpts[0]);
-          } else {
-            setSelectedSplitOption(null);
-          }
-          setSelectedSplitMode('single');
+        const calculatedDeadlineAt: string | null = fallbackParsed.deadlineAt || null;
 
-          const calculatedDeadlineAt: string | null = fallbackParsed.deadlineAt || null;
+        const fallbackTask: Task = {
+          id: `ai-draft-${Date.now()}`,
+          userId: 'user-default',
+          title: fallbackParsed.title,
+          description: fallbackParsed.description,
+          estimatedDurationMinutes: fallbackParsed.estimatedDurationMinutes,
+          deadlineAt: calculatedDeadlineAt,
+          hasExplicitDeadline: Boolean(fallbackParsed.hasExplicitDeadline || fallbackParsed.deadlineAt),
+          targetDate: fallbackParsed.targetDate,
+          targetDayOffset: fallbackParsed.targetDayOffset,
+          priority: fallbackParsed.priority,
+          status: 'UNSCHEDULED',
+          allowSplit: fallbackParsed.allowSplit,
+          minimumSessionMinutes: fallbackParsed.minimumSessionMinutes || 30,
+          splitConfig: fallbackParsed.allowSplit ? { forcedMode: 'single' } : undefined,
+          preferredTimeOfDay: fallbackParsed.preferredTimeOfDay,
+          timeConstraintType: fallbackParsed.timeConstraintType,
+          requestedStartAt: fallbackParsed.requestedStartAt,
+          requestedEndAt: fallbackParsed.requestedEndAt,
+          targetDays: fallbackParsed.targetDays,
+          targetOccurrences: fallbackParsed.targetOccurrences,
+          preferredWindow: fallbackParsed.preferredWindow,
+          timezone: fallbackParsed.timezone || effectiveTimezone,
+          createdAt: new Date().toISOString(),
+        };
 
-          const fallbackTask: Task = {
-            id: `ai-draft-${Date.now()}`,
-            userId: 'user-default',
-            title: fallbackParsed.title,
-            description: fallbackParsed.description,
-            estimatedDurationMinutes: fallbackParsed.estimatedDurationMinutes,
-            deadlineAt: calculatedDeadlineAt,
-            hasExplicitDeadline: Boolean(fallbackParsed.hasExplicitDeadline || fallbackParsed.deadlineAt),
-            targetDate: fallbackParsed.targetDate,
-            targetDayOffset: fallbackParsed.targetDayOffset,
-            priority: fallbackParsed.priority,
-            status: 'UNSCHEDULED',
-            allowSplit: fallbackParsed.allowSplit,
-            minimumSessionMinutes: fallbackParsed.minimumSessionMinutes || 30,
-            splitConfig: fallbackParsed.allowSplit ? { forcedMode: 'single' } : undefined,
-            preferredTimeOfDay: fallbackParsed.preferredTimeOfDay,
-            timeConstraintType: fallbackParsed.timeConstraintType,
-            requestedStartAt: fallbackParsed.requestedStartAt,
-            requestedEndAt: fallbackParsed.requestedEndAt,
-            targetDays: fallbackParsed.targetDays,
-            targetOccurrences: fallbackParsed.targetOccurrences,
-            preferredWindow: fallbackParsed.preferredWindow,
-            timezone: fallbackParsed.timezone || effectiveTimezone,
-            createdAt: new Date().toISOString(),
-          };
+        const schedRes = scheduleTaskDeterministically(fallbackTask, events, tasks, preferences);
 
-          const schedRes = scheduleTaskDeterministically(fallbackTask, events, tasks, preferences);
+        if (activeRequestIdRef.current !== currentReqId) return;
 
-          if (activeRequestIdRef.current !== currentReqId) return;
+        setPlanSource('rule_fallback_on_error');
+        setProposedPlan(fallbackParsed);
+        setScheduleTestResult(schedRes);
 
-          setPlanSource('rule_fallback_on_error');
-          setProposedPlan(fallbackParsed);
-          setScheduleTestResult(schedRes);
-          setWarningMessage(
-            'Pemrosesan AI tidak tersedia saat ini. Jadwal berhasil dialihkan dan disusun menggunakan mesin aturan lokal deterministik (Local Rule-based Engine) EVEN.'
-          );
-        } catch {
-          if (activeRequestIdRef.current !== currentReqId) return;
-          const safeMessage = formatUserErrorMessage(undefined, undefined, err?.message);
-          setErrorMessage(safeMessage);
-        }
+        const noticeMsg = didTimeout
+          ? 'Permintaan AI melampaui batas waktu respons (30 detik). Jadwal berhasil dialihkan dan disusun menggunakan mesin aturan lokal deterministik (Local Rule-based Engine) EVEN.'
+          : 'Pemrosesan AI tidak tersedia saat ini. Jadwal berhasil dialihkan dan disusun menggunakan mesin aturan lokal deterministik (Local Rule-based Engine) EVEN.';
+        setWarningMessage(noticeMsg);
+      } catch (fallbackErr: any) {
+        if (activeRequestIdRef.current !== currentReqId) return;
+        const safeMessage = formatUserErrorMessage(undefined, undefined, err?.message || fallbackErr?.message);
+        setErrorMessage(safeMessage);
       }
     } finally {
       if (timeoutTimerRef.current) {
@@ -565,6 +577,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       proposedPlan.minimumSessionMinutes || 30
     );
     const chosenOption = selectedSplitOption || splitOpts[0] || null;
+    if (mode === 'split' && !selectedSplitOption && splitOpts[0]) {
+      setSelectedSplitOption(splitOpts[0]);
+    }
 
     const splitConfig: TaskSplitConfig =
       mode === 'split' && chosenOption
@@ -572,6 +587,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             forcedMode: 'split',
             targetSessionCount: chosenOption.sessionCount,
             sessionDurationMinutes: chosenOption.durationPerSession,
+            minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
           }
         : {
             forcedMode: 'single',
@@ -579,6 +595,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
     const updatedPlan: AIPlanDraft = {
       ...proposedPlan,
+      allowSplit: mode === 'split',
       splitConfig,
     };
     setProposedPlan(updatedPlan);
@@ -595,7 +612,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       targetDayOffset: updatedPlan.targetDayOffset,
       priority: updatedPlan.priority,
       status: 'UNSCHEDULED',
-      allowSplit: updatedPlan.allowSplit,
+      allowSplit: mode === 'split',
       minimumSessionMinutes: updatedPlan.minimumSessionMinutes || 30,
       splitConfig,
       preferredTimeOfDay: updatedPlan.preferredTimeOfDay,
@@ -622,10 +639,12 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       forcedMode: 'split',
       targetSessionCount: opt.sessionCount,
       sessionDurationMinutes: opt.durationPerSession,
+      minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
     };
 
     const updatedPlan: AIPlanDraft = {
       ...proposedPlan,
+      allowSplit: true,
       splitConfig,
     };
     setProposedPlan(updatedPlan);
@@ -642,7 +661,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       targetDayOffset: updatedPlan.targetDayOffset,
       priority: updatedPlan.priority,
       status: 'UNSCHEDULED',
-      allowSplit: updatedPlan.allowSplit,
+      allowSplit: true,
       minimumSessionMinutes: updatedPlan.minimumSessionMinutes || 30,
       splitConfig,
       preferredTimeOfDay: updatedPlan.preferredTimeOfDay,
@@ -1091,8 +1110,8 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
               </div>
             </div>
 
-            {/* Split Session Interactive Selection (Hanya jika allowSplit bernilai true) */}
-            {proposedPlan.allowSplit && availableSplitOptions.length > 0 && (
+            {/* Split Session Interactive Selection (Tersedia untuk semua tugas fleksibel yang durasinya memenuhi syarat) */}
+            {proposedPlan.timeConstraintType !== 'fixed_event' && availableSplitOptions.length > 0 && (
               <div className="p-4 bg-[#F8FAFC] border border-[#D9E3EF] rounded-xl space-y-3">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
                   <span className="text-xs font-bold text-[#172B42] flex items-center gap-1.5">
@@ -1274,18 +1293,79 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                 </>
               ) : (
                 <>
-                  <div className="flex items-center gap-2 text-xs font-bold text-[#B86B12]">
-                    <ShieldAlert size={16} />
-                    <span>Tidak Dapat Menempatkan Jadwal</span>
-                  </div>
-                  <p className="text-xs text-[#53657A] leading-relaxed">
-                    {scheduleTestResult.explanation}
-                  </p>
-                  {scheduleTestResult.warning && (
-                    <p className="text-xs text-[#B86B12] bg-amber-50 p-2.5 rounded-lg border border-amber-200">
-                      {scheduleTestResult.warning}
-                    </p>
-                  )}
+                  {(() => {
+                    const getFailureBadgeInfo = (code?: ScheduleCalculationResult['failureCode']) => {
+                      switch (code) {
+                        case 'INSUFFICIENT_SPLIT_SLOTS':
+                          return {
+                            badge: 'INSUFFICIENT_SPLIT_SLOTS',
+                            title: 'Slot Multi-Sesi Tidak Mencukupi (Jeda Terpotong)',
+                            color: 'text-amber-800 bg-amber-100 border-amber-300',
+                          };
+                        case 'NO_CONTIGUOUS_SLOT':
+                          return {
+                            badge: 'NO_CONTIGUOUS_SLOT',
+                            title: 'Tidak Ada Slot Kontigu Tanpa Putus',
+                            color: 'text-amber-800 bg-amber-100 border-amber-300',
+                          };
+                        case 'TIME_CONFLICT':
+                          return {
+                            badge: 'TIME_CONFLICT',
+                            title: 'Bentrok dengan Agenda Kalender Lain',
+                            color: 'text-rose-800 bg-rose-100 border-rose-300',
+                          };
+                        case 'NO_SLOT_BEFORE_DEADLINE':
+                          return {
+                            badge: 'NO_SLOT_BEFORE_DEADLINE',
+                            title: 'Tidak Ada Slot Sebelum Tenggat Waktu',
+                            color: 'text-rose-800 bg-rose-100 border-rose-300',
+                          };
+                        case 'DEADLINE_PASSED':
+                          return {
+                            badge: 'DEADLINE_PASSED',
+                            title: 'Tenggat Waktu Sudah Terlewat',
+                            color: 'text-rose-800 bg-rose-100 border-rose-300',
+                          };
+                        case 'DEADLINE_INSUFFICIENT_TIME':
+                          return {
+                            badge: 'DEADLINE_INSUFFICIENT_TIME',
+                            title: 'Waktu Menuju Tenggat Kurang dari Durasi',
+                            color: 'text-amber-800 bg-amber-100 border-amber-300',
+                          };
+                        default:
+                          return {
+                            badge: 'SLOT_UNAVAILABLE',
+                            title: 'Tidak Dapat Menempatkan Jadwal',
+                            color: 'text-amber-800 bg-amber-100 border-amber-300',
+                          };
+                      }
+                    };
+
+                    const failInfo = getFailureBadgeInfo(scheduleTestResult.failureCode);
+                    return (
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span
+                            className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${failInfo.color}`}
+                          >
+                            {failInfo.badge}
+                          </span>
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-[#B86B12]">
+                            <ShieldAlert size={16} />
+                            <span>{failInfo.title}</span>
+                          </div>
+                        </div>
+                        <p className="text-xs text-[#53657A] leading-relaxed">
+                          {scheduleTestResult.explanation}
+                        </p>
+                        {scheduleTestResult.warning && (
+                          <p className="text-xs text-[#B86B12] bg-amber-50 p-2.5 rounded-lg border border-amber-200">
+                            {scheduleTestResult.warning}
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </>
               )}
             </div>
@@ -1317,34 +1397,40 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                   Batal
                 </button>
 
-                {scheduleTestResult.success && (
-                  <button
-                    onClick={handleConfirmAndApply}
-                    disabled={isSaving || Boolean(proposedPlan.isDurationAmbiguous)}
-                    title={
-                      proposedPlan.isDurationAmbiguous
-                        ? 'Harap konfirmasi pilihan alokasi durasi di atas terlebih dahulu'
-                        : 'Terapkan ke Jadwal & Kalender'
-                    }
-                    className="flex items-center gap-1.5 px-5 py-2.5 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {isSaving ? (
-                      <>
-                        <Loader2 size={14} className="animate-spin" />
-                        <span>Menyimpan ke Google Calendar...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Check size={14} />
-                        <span>
-                          {proposedPlan.isDurationAmbiguous
-                            ? 'Pilih Alokasi Durasi Terlebih Dahulu'
-                            : 'Terapkan ke Jadwal & Kalender'}
-                        </span>
-                      </>
-                    )}
-                  </button>
-                )}
+                <button
+                  onClick={handleConfirmAndApply}
+                  disabled={
+                    !scheduleTestResult.success ||
+                    isSaving ||
+                    Boolean(proposedPlan.isDurationAmbiguous)
+                  }
+                  title={
+                    !scheduleTestResult.success
+                      ? 'Slot kalender tidak mencukupi atau bentrok dengan agenda lain'
+                      : proposedPlan.isDurationAmbiguous
+                      ? 'Harap konfirmasi pilihan alokasi durasi di atas terlebih dahulu'
+                      : 'Terapkan ke Jadwal & Kalender'
+                  }
+                  className="flex items-center gap-1.5 px-5 py-2.5 bg-[#2457A7] hover:bg-[#1E4889] text-white text-xs font-semibold rounded-xl transition-colors shadow-xs disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {isSaving ? (
+                    <>
+                      <Loader2 size={14} className="animate-spin" />
+                      <span>Menyimpan ke Google Calendar...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Check size={14} />
+                      <span>
+                        {!scheduleTestResult.success
+                          ? 'Slot Tidak Mencukupi'
+                          : proposedPlan.isDurationAmbiguous
+                          ? 'Pilih Alokasi Durasi Terlebih Dahulu'
+                          : 'Terapkan ke Jadwal & Kalender'}
+                      </span>
+                    </>
+                  )}
+                </button>
               </div>
             )}
           </div>
