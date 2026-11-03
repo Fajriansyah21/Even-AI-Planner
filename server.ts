@@ -406,6 +406,22 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.clarificationPrompt = baselinePlan.clarificationPrompt;
       }
 
+      // 5c. Split intent & configuration sanitization:
+      // Anchor of Truth: Baseline deterministic splitConfig overrides AI hallucinations.
+      if (baselinePlan.splitConfig) {
+        sanitizedPlan.splitConfig = baselinePlan.splitConfig;
+        if (baselinePlan.splitConfig.forcedMode === 'split') {
+          sanitizedPlan.allowSplit = true;
+          sanitizedPlan.reasoning = baselinePlan.reasoning;
+        }
+      } else if (baselinePlan.allowSplit !== undefined) {
+        sanitizedPlan.allowSplit = baselinePlan.allowSplit;
+      }
+      if (baselinePlan.timeConstraintType === 'fixed_event') {
+        sanitizedPlan.allowSplit = false;
+        sanitizedPlan.splitConfig = { forcedMode: 'single' };
+      }
+
       // 6. Title and Description Sanitization:
       // Pastikan judul ringkas dan tidak pernah menyalin mentah seluruh prompt
       sanitizedPlan.title = extractCleanActivityTitle(trimmedPrompt, rawPlan.title || baselinePlan.title);

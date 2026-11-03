@@ -87,6 +87,95 @@ export function getAvailableSplitOptions(
 }
 
 /**
+ * Menyelesaikan konfigurasi awal pembagian sesi (split configuration)
+ * berdasarkan interpretasi intensi pengguna pada plan dan opsi split yang tersedia.
+ */
+export function resolveInitialSplitConfiguration(
+  plan: AIPlanDraft,
+  availableOptions: SplitOption[]
+): {
+  splitMode: 'single' | 'split';
+  splitOption: SplitOption | null;
+  distributionStrategy: SessionDistributionStrategy;
+  activeSplitConfig: TaskSplitConfig;
+} {
+  if (plan.timeConstraintType === 'fixed_event') {
+    return {
+      splitMode: 'single',
+      splitOption: null,
+      distributionStrategy: 'flexible',
+      activeSplitConfig: { forcedMode: 'single' },
+    };
+  }
+
+  const isExplicitSplit = plan.splitConfig?.forcedMode === 'split';
+
+  if (!isExplicitSplit) {
+    return {
+      splitMode: 'single',
+      splitOption: availableOptions[0] || null,
+      distributionStrategy: plan.splitConfig?.distributionStrategy || 'flexible',
+      activeSplitConfig: { forcedMode: 'single' },
+    };
+  }
+
+  const initialStrategy: SessionDistributionStrategy =
+    plan.splitConfig?.distributionStrategy || 'flexible';
+
+  const targetCount = plan.splitConfig?.targetSessionCount || 2;
+  const targetDurations = plan.splitConfig?.sessionDurations;
+
+  // Cari apakah ada opsi yang cocok di availableOptions
+  let matchingOption = availableOptions.find((o) => o.sessionCount === targetCount) || null;
+
+  if (matchingOption) {
+    if (targetDurations && targetDurations.length === targetCount) {
+      matchingOption = {
+        ...matchingOption,
+        sessionDurations: targetDurations,
+        durationPerSession: targetDurations[0],
+        totalDuration: targetDurations.reduce((sum, d) => sum + d, 0),
+        label: `${targetCount} sesi (${targetDurations.map((d) => `${d}m`).join(' & ')})`,
+      };
+    }
+  } else {
+    // Bangun opsi custom jika belum ada di opsi default
+    const durations =
+      targetDurations && targetDurations.length === targetCount
+        ? targetDurations
+        : Array.from({ length: targetCount }, (_, i) => {
+            const base = Math.floor(plan.estimatedDurationMinutes / targetCount);
+            const rem = plan.estimatedDurationMinutes % targetCount;
+            return i < rem ? base + 1 : base;
+          });
+    const sum = durations.reduce((acc, d) => acc + d, 0);
+    matchingOption = {
+      sessionCount: targetCount,
+      durationPerSession: durations[0],
+      sessionDurations: durations,
+      totalDuration: sum,
+      label: `${targetCount} sesi (${durations.map((d) => `${d}m`).join(' & ')})`,
+    };
+  }
+
+  const activeSplitConfig: TaskSplitConfig = {
+    forcedMode: 'split',
+    targetSessionCount: targetCount,
+    sessionDurationMinutes: matchingOption.durationPerSession,
+    sessionDurations: matchingOption.sessionDurations,
+    minGapMinutes: plan.splitConfig?.minGapMinutes || DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
+    distributionStrategy: initialStrategy,
+  };
+
+  return {
+    splitMode: 'split',
+    splitOption: matchingOption,
+    distributionStrategy: initialStrategy,
+    activeSplitConfig,
+  };
+}
+
+/**
  * Format tampilan Target / Waktu tanpa pernah menampilkan 'undefined hari' atau menebak tenggat.
  */
 export function formatPlanTargetDisplay(
@@ -255,10 +344,36 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const availableSplitOptions = useMemo(() => {
     if (!proposedPlan) return [];
     if (proposedPlan.timeConstraintType === 'fixed_event') return [];
-    return getAvailableSplitOptions(
+    const baseOpts = getAvailableSplitOptions(
       proposedPlan.estimatedDurationMinutes,
       proposedPlan.minimumSessionMinutes || 30
     );
+
+    // Jika proposedPlan memiliki splitConfig custom (misal: sessionDurations [38, 37]),
+    // pastikan opsi dengan durasi tersebut tersedia di daftar
+    if (
+      proposedPlan.splitConfig?.targetSessionCount &&
+      proposedPlan.splitConfig?.sessionDurations
+    ) {
+      const targetCount = proposedPlan.splitConfig.targetSessionCount;
+      const targetDurs = proposedPlan.splitConfig.sessionDurations;
+      const matchIdx = baseOpts.findIndex((o) => o.sessionCount === targetCount);
+      const customOpt: SplitOption = {
+        sessionCount: targetCount,
+        durationPerSession: targetDurs[0],
+        sessionDurations: targetDurs,
+        totalDuration: targetDurs.reduce((sum, d) => sum + d, 0),
+        label: `${targetCount} sesi (${targetDurs.map((d) => `${d}m`).join(' & ')})`,
+      };
+      if (matchIdx >= 0) {
+        baseOpts[matchIdx] = customOpt;
+      } else {
+        baseOpts.push(customOpt);
+        baseOpts.sort((a, b) => a.sessionCount - b.sessionCount);
+      }
+    }
+
+    return baseOpts;
   }, [proposedPlan]);
 
   const [errorMessage, setErrorMessage] = useState('');
@@ -431,20 +546,19 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         return;
       }
 
-      // Calculate initial split options
+      // Calculate initial split options & configuration based on user intent
       const splitOpts = getAvailableSplitOptions(plan.estimatedDurationMinutes, plan.minimumSessionMinutes || 30);
-      if (splitOpts.length > 0) {
-        setSelectedSplitOption(splitOpts[0]);
-      } else {
-        setSelectedSplitOption(null);
-      }
-      setSelectedSplitMode('single');
+      const initialSplit = resolveInitialSplitConfiguration(plan, splitOpts);
+
+      setSelectedSplitMode(initialSplit.splitMode);
+      setSelectedDistributionStrategy(initialSplit.distributionStrategy);
+      setSelectedSplitOption(initialSplit.splitOption);
 
       // Pisahkan secara tegas antara batas tenggat eksplisit dan tanggal target:
       // JANGAN PERNAH menyintesis tenggat buatan jam 18.00/23.00 jika pengguna tidak meminta tenggat!
       const calculatedDeadlineAt: string | null = plan.deadlineAt || null;
 
-      // Pre-flight check via deterministic scheduler (default: single session)
+      // Pre-flight check via deterministic scheduler using resolved activeSplitConfig
       const pseudoTask: Task = {
         id: `ai-draft-${Date.now()}`,
         userId: 'user-default',
@@ -457,9 +571,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         targetDayOffset: plan.targetDayOffset,
         priority: plan.priority,
         status: 'UNSCHEDULED',
-        allowSplit: plan.allowSplit,
+        allowSplit: initialSplit.splitMode === 'split' ? true : plan.allowSplit,
         minimumSessionMinutes: plan.minimumSessionMinutes || 30,
-        splitConfig: plan.allowSplit ? { forcedMode: 'single' } : undefined,
+        splitConfig: initialSplit.activeSplitConfig,
         preferredTimeOfDay: plan.preferredTimeOfDay,
         timeConstraintType: plan.timeConstraintType,
         requestedStartAt: plan.requestedStartAt,
@@ -475,8 +589,14 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
       if (activeRequestIdRef.current !== currentReqId) return;
 
+      const planWithConfig: AIPlanDraft = {
+        ...plan,
+        allowSplit: pseudoTask.allowSplit,
+        splitConfig: initialSplit.activeSplitConfig,
+      };
+
       // Selesai: Tampilkan hasil secara lengkap setelah uji slot selesai
-      setProposedPlan(plan);
+      setProposedPlan(planWithConfig);
       setScheduleTestResult(schedRes);
     } catch (err: any) {
       if (activeRequestIdRef.current !== currentReqId) return;
@@ -510,12 +630,11 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
           fallbackParsed.estimatedDurationMinutes,
           fallbackParsed.minimumSessionMinutes || 30
         );
-        if (splitOpts.length > 0) {
-          setSelectedSplitOption(splitOpts[0]);
-        } else {
-          setSelectedSplitOption(null);
-        }
-        setSelectedSplitMode('single');
+        const initialSplit = resolveInitialSplitConfiguration(fallbackParsed, splitOpts);
+
+        setSelectedSplitMode(initialSplit.splitMode);
+        setSelectedDistributionStrategy(initialSplit.distributionStrategy);
+        setSelectedSplitOption(initialSplit.splitOption);
 
         const calculatedDeadlineAt: string | null = fallbackParsed.deadlineAt || null;
 
@@ -531,9 +650,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
           targetDayOffset: fallbackParsed.targetDayOffset,
           priority: fallbackParsed.priority,
           status: 'UNSCHEDULED',
-          allowSplit: fallbackParsed.allowSplit,
+          allowSplit: initialSplit.splitMode === 'split' ? true : fallbackParsed.allowSplit,
           minimumSessionMinutes: fallbackParsed.minimumSessionMinutes || 30,
-          splitConfig: fallbackParsed.allowSplit ? { forcedMode: 'single' } : undefined,
+          splitConfig: initialSplit.activeSplitConfig,
           preferredTimeOfDay: fallbackParsed.preferredTimeOfDay,
           timeConstraintType: fallbackParsed.timeConstraintType,
           requestedStartAt: fallbackParsed.requestedStartAt,
@@ -549,8 +668,14 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
         if (activeRequestIdRef.current !== currentReqId) return;
 
+        const fallbackPlanWithConfig: AIPlanDraft = {
+          ...fallbackParsed,
+          allowSplit: fallbackTask.allowSplit,
+          splitConfig: initialSplit.activeSplitConfig,
+        };
+
         setPlanSource('rule_fallback_on_error');
-        setProposedPlan(fallbackParsed);
+        setProposedPlan(fallbackPlanWithConfig);
         setScheduleTestResult(schedRes);
 
         const noticeMsg = didTimeout
@@ -1237,7 +1362,12 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                       {availableSplitOptions.map((opt, idx) => {
                         const isSelected =
                           selectedSplitOption?.sessionCount === opt.sessionCount &&
-                          selectedSplitOption?.durationPerSession === opt.durationPerSession;
+                          (selectedSplitOption?.durationPerSession === opt.durationPerSession ||
+                            Boolean(
+                              selectedSplitOption?.sessionDurations &&
+                              opt.sessionDurations &&
+                              selectedSplitOption.sessionDurations.join(',') === opt.sessionDurations.join(',')
+                            ));
                         return (
                           <button
                             key={idx}
@@ -1256,7 +1386,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                               </span>
                             </div>
                             <p className="text-[11px] text-[#53657A] mt-0.5">
-                              {opt.sessionCount} kali pengerjaan, masing-masing {opt.durationPerSession} menit
+                              {opt.sessionDurations && opt.sessionDurations.some((d) => d !== opt.sessionDurations[0])
+                                ? `${opt.sessionCount} sesi: ${opt.sessionDurations.map((d) => `${d}m`).join(' & ')}`
+                                : `${opt.sessionCount} kali pengerjaan, masing-masing ${opt.durationPerSession} menit`}
                             </p>
                           </button>
                         );

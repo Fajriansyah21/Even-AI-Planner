@@ -4,7 +4,7 @@ import {
   createIsoInTimezone,
   addDaysInTimezone,
 } from './timezone';
-import { TaskOccurrence } from '../types';
+import { TaskOccurrence, TaskSplitConfig, SessionDistributionStrategy } from '../types';
 
 export interface ParseContext {
   userPrompt: string;
@@ -221,6 +221,20 @@ export function extractCleanActivityTitle(prompt: string, aiTitle?: string): str
   // Hapus kondisi pelengkap
   text = text.replace(/\b(?:kalo|kalau|jika|bila)\s+belum\s+selesai\b/gi, '');
 
+  // Hapus frasa pembagian sesi & strategi
+  text = text.replace(
+    /\b(?:di)?(?:bagi|pecah|cicil)\s+(?:menjadi|jadi)?\s*(?:\d+|dua|tiga|empat|lima|enam|beberapa)?\s*(?:sesi|kali|bagian)?\b/gi,
+    ''
+  );
+  text = text.replace(
+    /\bmasing-masing\s+(?:\d+|dua|tiga|empat|lima|enam)\s*(?:dan\s+\d+)?\s*(?:menit|mnt|jam)?\b/gi,
+    ''
+  );
+  text = text.replace(/\b(?:pada\s+|di\s+)?hari\s+(?:yang\s+)?(?:berbeda|sama)\b/gi, '');
+  text = text.replace(/\b(?:satu|1)\s+sesi\s+per\s+hari\b/gi, '');
+  text = text.replace(/\blintas\s+hari\b/gi, '');
+  text = text.replace(/\b(?:total|durasi\s+total)\b/gi, '');
+
   // Hapus kata penghubung/filler sisa
   text = text.replace(/\b(?:akan\s+ada|ada|mau|selama|dan|atau|serta|yang|untuk|ini|itu|pada|di|ke)\b/gi, '');
 
@@ -402,6 +416,183 @@ export function parseIndonesianDayNames(prompt: string): {
   }
 
   return { days, isRecurring, deadlineDay };
+}
+
+export interface ParsedSplitIntent {
+  allowSplit: boolean;
+  splitConfig?: TaskSplitConfig;
+  adjustedDurationMinutes?: number;
+}
+
+/**
+ * Deteksi intensi pembagian sesi (split intent) secara deterministik dari bahasa Indonesia.
+ * Mendeteksi jumlah sesi, durasi per sesi, dan strategi distribusi (across_days, same_day, flexible).
+ */
+export function parseIndonesianSplitIntent(
+  prompt: string,
+  totalDurationMinutes: number,
+  timeConstraintType: 'fixed_event' | 'preferred_window' | 'deadline_only',
+  minimumSessionMinutes: number = 30
+): ParsedSplitIntent {
+  if (timeConstraintType === 'fixed_event') {
+    return {
+      allowSplit: false,
+      splitConfig: {
+        forcedMode: 'single',
+      },
+    };
+  }
+
+  const p = prompt.trim().toLowerCase();
+
+  // 1. Deteksi kata kunci intensi pembagian sesi
+  const promptHasSplitVerb = /\b(bagi|dibagi|pecah|dipecah|cicil|dicicil)\b/i.test(p);
+  const promptHasSessionClause =
+    /\b(?:kerjakan\s+dalam|jadwalkan\s+dalam|dalam)\s+(?:\d+|dua|tiga|empat|lima|enam|beberapa)\s+sesi\b/i.test(p) ||
+    /\b(?:\d+|dua|tiga|empat|lima|enam)\s+sesi\b/i.test(p) ||
+    /\b(?:\d+|dua|tiga|empat|lima|enam)\s+kali\s*(?:pengerjaan|sesi)?\b/i.test(p) ||
+    /\b(?:masing-masing|tiap|setiap)\s+sesi\b/i.test(p) ||
+    /\b(?:satu|1)\s+sesi\s+per\s+hari\b/i.test(p) ||
+    /\bsebar\s+ke\s+(?:\d+|dua|tiga|empat|lima|beberapa)\s+hari\b/i.test(p);
+
+  const isSplitExplicit = promptHasSplitVerb || promptHasSessionClause;
+
+  if (!isSplitExplicit) {
+    return {
+      allowSplit: totalDurationMinutes >= minimumSessionMinutes * 2,
+      splitConfig: {
+        forcedMode: 'single',
+      },
+    };
+  }
+
+  // 2. Ekstraksi jumlah sesi (targetSessionCount)
+  let targetSessionCount: number | undefined = undefined;
+
+  // Cek frasa durasi per sesi jamak eksplisit: "masing-masing 38 dan 37 menit" -> 2 sesi
+  const multiDurationMatch = p.match(
+    /masing-masing\s+(\d+)\s*(?:menit|mnt)?\s*(?:dan|,)\s*(\d+)\s*(?:menit|mnt)?/i
+  );
+  let parsedCustomDurations: number[] | undefined = undefined;
+  if (multiDurationMatch) {
+    parsedCustomDurations = [
+      parseInt(multiDurationMatch[1], 10),
+      parseInt(multiDurationMatch[2], 10),
+    ];
+    targetSessionCount = 2;
+  }
+
+  const numWordMap: Record<string, number> = {
+    se: 1,
+    satu: 1,
+    dua: 2,
+    tiga: 3,
+    empat: 4,
+    lima: 5,
+    enam: 6,
+    tujuh: 7,
+    delapan: 8,
+  };
+
+  if (!targetSessionCount) {
+    const sessionCountMatch = p.match(
+      /(?:bagi|dibagi|pecah|dipecah|cicil|dicicil|jadwalkan|kerjakan|dalam)?\s*(?:menjadi|jadi|dalam)?\s*(\d+|dua|tiga|empat|lima|enam)\s*(?:sesi|kali|bagian)/i
+    );
+    if (sessionCountMatch) {
+      const rawCount = sessionCountMatch[1].toLowerCase();
+      targetSessionCount = numWordMap[rawCount] || parseInt(rawCount, 10);
+    } else if (/\bbeberapa\s+sesi\b/i.test(p)) {
+      targetSessionCount = 2;
+    }
+  }
+
+  if (!targetSessionCount || targetSessionCount < 1) {
+    targetSessionCount = 2;
+  }
+
+  // 3. Ekstraksi durasi per sesi (sessionDurations / sessionDurationMinutes)
+  let sessionDurations: number[] = [];
+  let effectiveTotalMinutes = totalDurationMinutes;
+
+  if (parsedCustomDurations && parsedCustomDurations.length === targetSessionCount) {
+    sessionDurations = parsedCustomDurations;
+    effectiveTotalMinutes = sessionDurations.reduce((sum, d) => sum + d, 0);
+  } else {
+    // Cek apakah ada durasi eksplisit per sesi tunggal (misal: "masing-masing 45 menit", "tiap sesi 30 menit")
+    const perSessionMinMatch = p.match(
+      /(?:masing-masing|tiap\s+sesi|setiap\s+sesi|per\s+sesi)\s*(?:selama\s+)?(\d+)\s*(?:menit|mnt)/i
+    );
+    const perSessionHourMatch = p.match(
+      /(?:masing-masing|tiap\s+sesi|setiap\s+sesi|per\s+sesi)\s*(?:selama\s+)?(\d+|se|satu|dua)\s*jam/i
+    );
+
+    if (perSessionMinMatch) {
+      const singleDur = parseInt(perSessionMinMatch[1], 10);
+      sessionDurations = Array(targetSessionCount).fill(singleDur);
+      const computedTotal = singleDur * targetSessionCount;
+      if (!p.match(/(?:total|selama\s+total)\s*\d+/i) && computedTotal > effectiveTotalMinutes) {
+        effectiveTotalMinutes = computedTotal;
+      }
+    } else if (perSessionHourMatch) {
+      const hStr = perSessionHourMatch[1].toLowerCase();
+      const h = numWordMap[hStr] || parseInt(hStr, 10) || 1;
+      const singleDur = h * 60;
+      sessionDurations = Array(targetSessionCount).fill(singleDur);
+      const computedTotal = singleDur * targetSessionCount;
+      if (!p.match(/(?:total|selama\s+total)\s*\d+/i) && computedTotal > effectiveTotalMinutes) {
+        effectiveTotalMinutes = computedTotal;
+      }
+    } else {
+      // Hitung pembagian seimbang dari effectiveTotalMinutes
+      const base = Math.floor(effectiveTotalMinutes / targetSessionCount);
+      const rem = effectiveTotalMinutes % targetSessionCount;
+      sessionDurations = Array.from({ length: targetSessionCount }, (_, i) =>
+        i < rem ? base + 1 : base
+      );
+    }
+  }
+
+  // 4. Ekstraksi strategi distribusi (distributionStrategy)
+  let distributionStrategy: SessionDistributionStrategy = 'flexible';
+
+  const isAcrossDays =
+    /\b(?:pada\s+|di\s+)?hari\s+(?:yang\s+)?berbeda\b/i.test(p) ||
+    /\b(?:beda|berbeda)\s+hari\b/i.test(p) ||
+    /\b(?:beda|berbeda)\s+tanggal\b/i.test(p) ||
+    /\blintas\s+hari\b/i.test(p) ||
+    /\b(?:masing-masing\s+)?(?:satu|1)\s+sesi\s+per\s+hari\b/i.test(p) ||
+    /\b(?:tiap|setiap)\s+hari\s+(?:satu|1)\s+sesi\b/i.test(p) ||
+    /\bsebar\s+ke\s+(?:\w+|\d+)\s+hari\b/i.test(p) ||
+    /\bmaksimal\s+(?:satu|1)\s+sesi\s+(?:setiap|per|tiap)\s+hari\b/i.test(p);
+
+  const isSameDay =
+    /\b(?:pada\s+|di\s+)?hari\s+(?:yang\s+)?sama\b/i.test(p) ||
+    /\bsatu\s+hari\s+(?:yang\s+)?sama\b/i.test(p) ||
+    /\bselesaikan\s+dalam\s+(?:satu|1)\s+hari\b/i.test(p) ||
+    /\bdalam\s+(?:satu|1)\s+hari\s+dengan\s+jeda\b/i.test(p) ||
+    /\b(?:pisahkan\s+menjadi\s+beberapa\s+sesi|semua\s+sesi)\s+hari\s+ini\b/i.test(p) ||
+    /\bpada\s+hari\s+ini\s+juga\b/i.test(p);
+
+  if (isAcrossDays) {
+    distributionStrategy = 'across_days';
+  } else if (isSameDay) {
+    distributionStrategy = 'same_day';
+  } else {
+    distributionStrategy = 'flexible';
+  }
+
+  return {
+    allowSplit: true,
+    adjustedDurationMinutes: effectiveTotalMinutes,
+    splitConfig: {
+      forcedMode: 'split',
+      targetSessionCount,
+      sessionDurationMinutes: sessionDurations[0] || Math.round(effectiveTotalMinutes / targetSessionCount),
+      sessionDurations,
+      minGapMinutes: 60,
+      distributionStrategy,
+    },
+  };
 }
 
 /**
@@ -618,7 +809,8 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     tujuh: 7,
     delapan: 8,
   };
-  const durMatch = prompt.match(/(\d+)\s*(menit|mnt|jam)/i);
+  const totalDurMatch = prompt.match(/(?:total|selama\s+total|durasi\s+total)\s*(\d+)\s*(menit|mnt|jam)/i);
+  const durMatch = totalDurMatch || prompt.match(/(\d+)\s*(menit|mnt|jam)/i);
   const wordDurMatch = prompt.match(/(?:selama\s+)?(se|satu|dua|tiga|empat|lima|enam|tujuh|delapan)\s*jam/i);
   const wordMinMatch = prompt.match(/(?:selama\s+)?(tiga puluh|empat puluh lima)\s*(?:menit|mnt)/i);
 
@@ -983,12 +1175,20 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     priority = 'LOW';
   }
 
-  // 11. Split policy:
+  // 11. Split policy & explicit user intent:
   // Fixed events can NEVER be split!
-  const allowSplit =
-    timeConstraintType !== 'fixed_event' &&
-    (promptHasTotalSplitKeyword || prompt.includes('bagi') || prompt.includes('sesi') || prompt.includes('cicil'));
   const minSession = 30;
+  const splitIntent = parseIndonesianSplitIntent(
+    ctx.userPrompt,
+    duration,
+    timeConstraintType,
+    minSession
+  );
+  const allowSplit = splitIntent.allowSplit;
+  const splitConfig = splitIntent.splitConfig;
+  if (splitIntent.adjustedDurationMinutes && splitIntent.adjustedDurationMinutes > duration) {
+    duration = splitIntent.adjustedDurationMinutes;
+  }
 
   // 12. Title generation:
   const title = extractCleanActivityTitle(ctx.userPrompt);
@@ -1001,6 +1201,18 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     } else {
       reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, '0') : '00'}:${String(fixedStartMin).padStart(2, '0')} - ${fixedEndHour ? String(fixedEndHour).padStart(2, '0') : '00'}:${String(fixedEndMin).padStart(2, '0')}) sehingga dijaga tanpa digeser.`;
     }
+  } else if (splitConfig?.forcedMode === 'split') {
+    const stratLabel =
+      splitConfig.distributionStrategy === 'across_days'
+        ? 'lintas hari berbeda (maksimal 1 sesi per hari)'
+        : splitConfig.distributionStrategy === 'same_day'
+        ? 'hari yang sama dengan jeda minimal 60 menit'
+        : 'fleksibel sesuai ketersediaan slot';
+    const durSummary =
+      splitConfig.sessionDurations && splitConfig.sessionDurations.every((d) => d === splitConfig.sessionDurations![0])
+        ? `masing-masing ${splitConfig.sessionDurations[0]} menit`
+        : `(${splitConfig.sessionDurations?.map((d, i) => `Sesi ${i + 1}: ${d}m`).join(', ')})`;
+    reasoning = `AI mendeteksi instruksi pembagian tugas menjadi ${splitConfig.targetSessionCount} sesi ${durSummary} (total ${duration} menit) dengan strategi distribusi ${stratLabel}.`;
   } else if (isDurationAmbiguous && clarificationPrompt) {
     reasoning = `AI mendeteksi alokasi waktu pada ${detectedWeekdays.map((d) => d.dayName).join(' dan ')} dengan durasi ${duration} menit (${Math.round(duration / 60)} jam). ${clarificationPrompt}`;
   } else if (detectedWeekdays.length > 1) {
@@ -1046,6 +1258,7 @@ export function parseIndonesianTemporalRules(ctx: ParseContext) {
     priority,
     allowSplit,
     minimumSessionMinutes: minSession,
+    splitConfig,
     reasoning,
   };
 }

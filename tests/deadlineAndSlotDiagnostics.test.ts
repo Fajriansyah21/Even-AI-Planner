@@ -17,6 +17,7 @@ import { simulateBackendPlanPipeline, MOCK_REFERENCE_DATE, TEST_TIMEZONE } from 
 import {
   getAvailableSplitOptions,
   formatPlanTargetDisplay,
+  resolveInitialSplitConfiguration,
 } from '../src/components/AIAssistantView';
 
 function assert(condition: boolean, msg: string) {
@@ -1322,6 +1323,310 @@ export function runDeadlineAndSlotDiagnosticsTests() {
     }
 
     console.log('  ✅ [PASS] Kasus 28: Pemilihan ulang strategi distribusi teruji deterministik dan bebas tabrakan.');
+  }
+
+  // ============================================================================
+  // SUITE PENGUJIAN REGRESI AUTO-DETECTION & AUTO-SELECTION PEMBAGIAN SESI
+  // ============================================================================
+
+  // KASUS 29 (Kasus 1): "Jadwalkan laporan selama 90 menit, bagi menjadi 2 sesi masing-masing 45 menit pada hari berbeda."
+  console.log('>>> [29/36] Kasus 29: Auto-detection split 2x45m across_days pada hari berbeda');
+  {
+    const prompt = 'Jadwalkan laporan selama 90 menit, bagi menjadi 2 sesi masing-masing 45 menit pada hari berbeda.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z'); // 09:00 WIB Senin
+
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+    assert(pipelineRes.success === true, 'Pipeline backend harus sukses');
+    assert(pipelineRes.plan.splitConfig?.forcedMode === 'split', 'forcedMode harus split');
+    assert(pipelineRes.plan.splitConfig?.targetSessionCount === 2, 'targetSessionCount harus 2');
+    assert(
+      JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations) === JSON.stringify([45, 45]),
+      `sessionDurations harus [45, 45], dapat: ${JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations)}`
+    );
+    assert(pipelineRes.plan.splitConfig?.distributionStrategy === 'across_days', 'distributionStrategy harus across_days');
+
+    const splitOpts = getAvailableSplitOptions(pipelineRes.plan.estimatedDurationMinutes, 30);
+    const initialUi = resolveInitialSplitConfiguration(pipelineRes.plan, splitOpts);
+    assert(initialUi.splitMode === 'split', 'UI splitMode harus otomatis split');
+    assert(initialUi.distributionStrategy === 'across_days', 'UI distributionStrategy harus across_days');
+    assert(initialUi.splitOption?.sessionCount === 2, 'UI splitOption harus 2 sesi');
+
+    const task: Task = {
+      id: 'task-c29',
+      userId: 'user-default',
+      title: pipelineRes.plan.title,
+      estimatedDurationMinutes: pipelineRes.plan.estimatedDurationMinutes,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      splitConfig: initialUi.activeSplitConfig,
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(task, [], [], defaultPrefs, mondayAnchor);
+    assert(schedRes.success === true, `Scheduler harus sukses: ${schedRes.explanation}`);
+    assert(schedRes.proposedSessions.length === 2, 'Harus ada 2 sesi terjadwal');
+    const day1 = getPartsInTimezone(new Date(schedRes.proposedSessions[0].startAt), TEST_TIMEZONE).day;
+    const day2 = getPartsInTimezone(new Date(schedRes.proposedSessions[1].startAt), TEST_TIMEZONE).day;
+    assert(day1 !== day2, `Kedua sesi harus dijadwalkan pada hari berbeda, dapat: ${day1} dan ${day2}`);
+    assert(day1 === 20 && day2 === 21, `Sesi 1 pada Senin (20 Mei) dan Sesi 2 pada Selasa (21 Mei)`);
+    assert(schedRes.proposedSessions[0].durationMinutes === 45 && schedRes.proposedSessions[1].durationMinutes === 45, 'Durasi masing-masing harus 45m');
+    console.log('  ✅ [PASS] Kasus 29: Mode split 2x45m across_days pada 2 hari berbeda terverifikasi akurat.');
+  }
+
+  // KASUS 30 (Kasus 2): "Jadwalkan belajar React selama 90 menit, bagi menjadi 3 sesi masing-masing 30 menit pada hari yang sama."
+  console.log('>>> [30/36] Kasus 30: Auto-detection split 3x30m same_day pada hari yang sama dengan jeda minimal 60 menit');
+  {
+    const prompt = 'Jadwalkan belajar React selama 90 menit, bagi menjadi 3 sesi masing-masing 30 menit pada hari yang sama.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z'); // 09:00 WIB Senin
+
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.splitConfig?.forcedMode === 'split', 'forcedMode harus split');
+    assert(pipelineRes.plan.splitConfig?.targetSessionCount === 3, 'targetSessionCount harus 3');
+    assert(
+      JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations) === JSON.stringify([30, 30, 30]),
+      `sessionDurations harus [30, 30, 30], dapat: ${JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations)}`
+    );
+    assert(pipelineRes.plan.splitConfig?.distributionStrategy === 'same_day', 'distributionStrategy harus same_day');
+
+    const splitOpts = getAvailableSplitOptions(pipelineRes.plan.estimatedDurationMinutes, 30);
+    const initialUi = resolveInitialSplitConfiguration(pipelineRes.plan, splitOpts);
+    assert(initialUi.splitMode === 'split', 'UI splitMode harus split');
+    assert(initialUi.distributionStrategy === 'same_day', 'UI distributionStrategy harus same_day');
+    assert(initialUi.splitOption?.sessionCount === 3, 'UI splitOption harus 3 sesi');
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      enableLunchBreak: false,
+      bufferMinutes: 0,
+    };
+
+    const task: Task = {
+      id: 'task-c30',
+      userId: 'user-default',
+      title: pipelineRes.plan.title,
+      estimatedDurationMinutes: pipelineRes.plan.estimatedDurationMinutes,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      splitConfig: initialUi.activeSplitConfig,
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(task, [], [], cleanPrefs, mondayAnchor);
+    assert(schedRes.success === true, `Scheduler harus sukses: ${schedRes.explanation}`);
+    assert(schedRes.proposedSessions.length === 3, 'Harus ada 3 sesi');
+    const day1 = getPartsInTimezone(new Date(schedRes.proposedSessions[0].startAt), TEST_TIMEZONE).day;
+    const day2 = getPartsInTimezone(new Date(schedRes.proposedSessions[1].startAt), TEST_TIMEZONE).day;
+    const day3 = getPartsInTimezone(new Date(schedRes.proposedSessions[2].startAt), TEST_TIMEZONE).day;
+    assert(day1 === day2 && day2 === day3, `Semua 3 sesi harus di hari yang sama, dapat: ${day1}, ${day2}, ${day3}`);
+
+    // Periksa jeda minimal 60 menit antar sesi
+    const gap1 = (new Date(schedRes.proposedSessions[1].startAt).getTime() - new Date(schedRes.proposedSessions[0].endAt).getTime()) / 60000;
+    const gap2 = (new Date(schedRes.proposedSessions[2].startAt).getTime() - new Date(schedRes.proposedSessions[1].endAt).getTime()) / 60000;
+    assert(gap1 >= 60, `Jeda antara sesi 1 & 2 harus >= 60 menit, dapat: ${gap1}m`);
+    assert(gap2 >= 60, `Jeda antara sesi 2 & 3 harus >= 60 menit, dapat: ${gap2}m`);
+    console.log('  ✅ [PASS] Kasus 30: 3 sesi same_day terjadwal pada hari sama dengan jeda >= 60 menit.');
+  }
+
+  // KASUS 31 (Kasus 3): "Jadwalkan persiapan presentasi selama 90 menit, bagi menjadi 3 sesi."
+  console.log('>>> [31/36] Kasus 31: Auto-detection split 3 sesi tanpa strategi eksplisit -> flexible');
+  {
+    const prompt = 'Jadwalkan persiapan presentasi selama 90 menit, bagi menjadi 3 sesi.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.splitConfig?.forcedMode === 'split', 'forcedMode harus split');
+    assert(pipelineRes.plan.splitConfig?.targetSessionCount === 3, 'targetSessionCount harus 3');
+    assert(pipelineRes.plan.splitConfig?.distributionStrategy === 'flexible', 'distributionStrategy harus flexible sebagai default');
+
+    const splitOpts = getAvailableSplitOptions(pipelineRes.plan.estimatedDurationMinutes, 30);
+    const initialUi = resolveInitialSplitConfiguration(pipelineRes.plan, splitOpts);
+    assert(initialUi.splitMode === 'split', 'UI splitMode harus split');
+    assert(initialUi.distributionStrategy === 'flexible', 'UI distributionStrategy harus flexible');
+    assert(initialUi.splitOption?.sessionCount === 3, 'UI splitOption harus 3 sesi');
+    console.log('  ✅ [PASS] Kasus 31: Strategi flexible otomatis terpilih saat strategi tidak ditentukan eksplisit.');
+  }
+
+  // KASUS 32 (Kasus 4): "Jadwalkan belajar algoritma selama 90 menit."
+  console.log('>>> [32/36] Kasus 4: Permintaan tanpa instruksi pembagian sesi default single mode');
+  {
+    const prompt = 'Jadwalkan belajar algoritma selama 90 menit.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.splitConfig?.forcedMode === 'single', 'forcedMode harus single jika user tidak minta split');
+
+    const splitOpts = getAvailableSplitOptions(pipelineRes.plan.estimatedDurationMinutes, 30);
+    const initialUi = resolveInitialSplitConfiguration(pipelineRes.plan, splitOpts);
+    assert(initialUi.splitMode === 'single', 'UI splitMode harus default single');
+    assert(splitOpts.length > 0, 'Opsi split tetap tersedia untuk dipilih manual oleh pengguna');
+    console.log('  ✅ [PASS] Kasus 32: Default single session terjaga dan opsi split tetap tersedia.');
+  }
+
+  // KASUS 33 (Kasus 5): "Bagi pengerjaan makalah 75 menit menjadi 2 sesi masing-masing 38 dan 37 menit."
+  console.log('>>> [33/36] Kasus 33: Integritas durasi sesi kustom [38, 37] total tepat 75 menit');
+  {
+    const prompt = 'Bagi pengerjaan makalah 75 menit menjadi 2 sesi masing-masing 38 dan 37 menit.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.estimatedDurationMinutes === 75, `Durasi total harus 75, dapat ${pipelineRes.plan.estimatedDurationMinutes}`);
+    assert(pipelineRes.plan.splitConfig?.forcedMode === 'split', 'forcedMode harus split');
+    assert(pipelineRes.plan.splitConfig?.targetSessionCount === 2, 'targetSessionCount harus 2');
+    assert(
+      JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations) === JSON.stringify([38, 37]),
+      `sessionDurations harus [38, 37], dapat: ${JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations)}`
+    );
+
+    const splitOpts = getAvailableSplitOptions(pipelineRes.plan.estimatedDurationMinutes, 30);
+    const initialUi = resolveInitialSplitConfiguration(pipelineRes.plan, splitOpts);
+    assert(initialUi.splitMode === 'split', 'UI splitMode harus split');
+    assert(
+      JSON.stringify(initialUi.activeSplitConfig.sessionDurations) === JSON.stringify([38, 37]),
+      'activeSplitConfig sessionDurations harus [38, 37]'
+    );
+
+    const task: Task = {
+      id: 'task-c33',
+      userId: 'user-default',
+      title: pipelineRes.plan.title,
+      estimatedDurationMinutes: pipelineRes.plan.estimatedDurationMinutes,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      splitConfig: initialUi.activeSplitConfig,
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(task, [], [], defaultPrefs, mondayAnchor);
+    assert(schedRes.success === true, `Scheduler harus sukses: ${schedRes.explanation}`);
+    assert(schedRes.proposedSessions.length === 2, 'Harus ada 2 sesi');
+    assert(schedRes.proposedSessions[0].durationMinutes === 38, `Sesi 1 harus 38 menit, dapat: ${schedRes.proposedSessions[0].durationMinutes}`);
+    assert(schedRes.proposedSessions[1].durationMinutes === 37, `Sesi 2 harus 37 menit, dapat: ${schedRes.proposedSessions[1].durationMinutes}`);
+    assert(schedRes.proposedSessions[0].durationMinutes + schedRes.proposedSessions[1].durationMinutes === 75, 'Total durasi tepat 75 menit');
+    console.log('  ✅ [PASS] Kasus 33: Durasi [38, 37] total tepat 75 menit terjaga 100% tanpa menit hilang.');
+  }
+
+  // KASUS 34 (Kasus 6): "Jadwalkan laporan 90 menit menjadi 2 sesi masing-masing 45 menit pada hari berbeda sebelum Jumat pukul 18.00 WIB."
+  console.log('>>> [34/36] Kasus 34: Tenggat Jumat 18:00 WIB dipatuhi & penolakan jika tidak cukup hari');
+  {
+    const prompt = 'Jadwalkan laporan 90 menit menjadi 2 sesi masing-masing 45 menit pada hari berbeda sebelum Jumat pukul 18.00 WIB.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z'); // Senin 20 Mei 09:00 WIB
+
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.splitConfig?.forcedMode === 'split', 'forcedMode harus split');
+    assert(pipelineRes.plan.splitConfig?.distributionStrategy === 'across_days', 'distributionStrategy harus across_days');
+    assert(pipelineRes.plan.hasExplicitDeadline === true, 'hasExplicitDeadline harus true');
+    assert(Boolean(pipelineRes.plan.deadlineAt), 'deadlineAt harus ada');
+    const dlParts = getPartsInTimezone(new Date(pipelineRes.plan.deadlineAt!), TEST_TIMEZONE);
+    assert(dlParts.dayOfWeek === 5 && dlParts.hour === 18 && dlParts.minute === 0, `Deadline harus Jumat 18:00 WIB, dapat: hari ke-${dlParts.dayOfWeek} ${dlParts.hour}:${dlParts.minute}`);
+
+    // Skenario A: Tersedia hari Senin & Selasa -> Sukses
+    const taskA: Task = {
+      id: 'task-c34-a',
+      userId: 'user-default',
+      title: pipelineRes.plan.title,
+      estimatedDurationMinutes: pipelineRes.plan.estimatedDurationMinutes,
+      deadlineAt: pipelineRes.plan.deadlineAt,
+      hasExplicitDeadline: true,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      splitConfig: pipelineRes.plan.splitConfig,
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+    const schedResA = scheduleTaskDeterministically(taskA, [], [], defaultPrefs, mondayAnchor);
+    assert(schedResA.success === true, 'Harus sukses jika hari tersedia');
+    assert(schedResA.proposedSessions.length === 2, 'Harus ada 2 sesi');
+
+    // Skenario B: Hanya 1 hari kerja sebelum tenggat (Kamis 23 Mei 17:00 WIB, dan Jumat penuh dengan agenda sibuk)
+    const thursdayLateAnchor = new Date('2024-05-23T10:00:00.000Z'); // Kamis 23 Mei 17:00 WIB
+    const busyFriday: CalendarEvent[] = [
+      {
+        id: 'evt-busy-friday',
+        title: 'Konferensi Seharian Penuh Jumat',
+        startAt: createIsoInTimezone(2024, 5, 24, 9, 0, 0, TEST_TIMEZONE),
+        endAt: createIsoInTimezone(2024, 5, 24, 18, 0, 0, TEST_TIMEZONE),
+        provider: 'google',
+        isEditable: false,
+        syncStatus: 'synced',
+      },
+    ];
+
+    const schedResB = scheduleTaskDeterministically(taskA, busyFriday, [], defaultPrefs, thursdayLateAnchor);
+    assert(schedResB.success === false, 'Harus gagal total jika hanya ada 1 hari sebelum tenggat Jumat 18:00');
+    assert(schedResB.failureCode === 'INSUFFICIENT_SPLIT_SLOTS', `failureCode harus INSUFFICIENT_SPLIT_SLOTS, dapat: ${schedResB.failureCode}`);
+    assert(schedResB.proposedSessions.length === 0, 'proposedSessions harus kosong pada penolakan total');
+    console.log('  ✅ [PASS] Kasus 34: Tenggat dipatuhi & penolakan total bekerja tegas jika hari kurang.');
+  }
+
+  // KASUS 35 (Kasus 7): Gemini gagal dan sistem memakai fallback lokal
+  console.log('>>> [35/36] Kasus 35: Gemini gagal & fallback lokal tetap mempertahankan mode split');
+  {
+    const prompt = 'Jadwalkan persiapan ujian 90 menit, bagi 2 sesi masing-masing 45 menit di hari berbeda.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+
+    const fallbackRes = simulateBackendPlanPipeline(prompt, {
+      mockGeminiPlan: null,
+      geminiError: new Error('Rate limit 429'),
+      refDate: mondayAnchor,
+    });
+
+    assert(fallbackRes.success === true, 'Fallback harus sukses');
+    assert(fallbackRes.source === 'rule_fallback_on_error', 'source harus rule_fallback_on_error');
+    assert(fallbackRes.plan.splitConfig?.forcedMode === 'split', 'Fallback harus tetap mendeteksi forcedMode: split');
+    assert(fallbackRes.plan.splitConfig?.distributionStrategy === 'across_days', 'Fallback harus mendeteksi across_days');
+    assert(fallbackRes.plan.splitConfig?.targetSessionCount === 2, 'Fallback harus mendeteksi 2 sesi');
+
+    const splitOpts = getAvailableSplitOptions(fallbackRes.plan.estimatedDurationMinutes, 30);
+    const initialUi = resolveInitialSplitConfiguration(fallbackRes.plan, splitOpts);
+    assert(initialUi.splitMode === 'split', 'UI harus tetap split mode pada fallback');
+    assert(initialUi.distributionStrategy === 'across_days', 'UI harus tetap across_days pada fallback');
+    console.log('  ✅ [PASS] Kasus 35: Fallback lokal berhasil mempertahankan mode split tanpa kembali diam-diam ke single.');
+  }
+
+  // KASUS 36 (Kasus 8): Pengguna mengganti mode split menjadi single secara manual
+  console.log('>>> [36/36] Kasus 36: Pengguna mengganti mode split menjadi single secara manual');
+  {
+    const prompt = 'Bagi laporan 90 menit menjadi 2 sesi masing-masing 45 menit.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+    const splitOpts = getAvailableSplitOptions(pipelineRes.plan.estimatedDurationMinutes, 30);
+    const initialUi = resolveInitialSplitConfiguration(pipelineRes.plan, splitOpts);
+    assert(initialUi.splitMode === 'split', 'Awalnya mode split');
+
+    // Pengguna menekan tombol "Satu Sesi Utuh" secara manual:
+    const manualSingleConfig: TaskSplitConfig = { forcedMode: 'single' };
+
+    const taskSingle: Task = {
+      id: 'task-manual-override',
+      userId: 'user-default',
+      title: pipelineRes.plan.title,
+      estimatedDurationMinutes: pipelineRes.plan.estimatedDurationMinutes,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: false,
+      splitConfig: manualSingleConfig,
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(taskSingle, [], [], defaultPrefs, mondayAnchor);
+    assert(schedRes.success === true, 'Scheduler harus sukses menjadwalkan satu sesi');
+    assert(schedRes.proposedSessions.length === 1, `Harus ada 1 sesi tunggal, dapat: ${schedRes.proposedSessions.length}`);
+    assert(schedRes.proposedSessions[0].durationMinutes === 90, `Durasi sesi tunggal harus 90 menit, dapat: ${schedRes.proposedSessions[0].durationMinutes}`);
+    console.log('  ✅ [PASS] Kasus 36: Pilihan manual single session dihormati dan dihitung ulang sebagai satu sesi utuh.');
   }
 
   console.log('\n========================================================================');

@@ -183,6 +183,21 @@ export function simulateBackendPlanPipeline(
     sanitizedPlan.clarificationPrompt = baselinePlan.clarificationPrompt;
   }
 
+  // 5c. Split intent & configuration sanitization:
+  if (baselinePlan.splitConfig) {
+    sanitizedPlan.splitConfig = baselinePlan.splitConfig;
+    if (baselinePlan.splitConfig.forcedMode === 'split') {
+      sanitizedPlan.allowSplit = true;
+      sanitizedPlan.reasoning = baselinePlan.reasoning;
+    }
+  } else if (baselinePlan.allowSplit !== undefined) {
+    sanitizedPlan.allowSplit = baselinePlan.allowSplit;
+  }
+  if (baselinePlan.timeConstraintType === 'fixed_event') {
+    sanitizedPlan.allowSplit = false;
+    sanitizedPlan.splitConfig = { forcedMode: 'single' };
+  }
+
   sanitizedPlan.title = extractCleanActivityTitle(prompt, options.mockGeminiPlan.title || baselinePlan.title);
 
   return {
