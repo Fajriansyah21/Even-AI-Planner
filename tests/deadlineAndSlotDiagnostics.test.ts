@@ -1009,6 +1009,321 @@ export function runDeadlineAndSlotDiagnosticsTests() {
     console.log('  ✅ [PASS] Kasus 23: UI split options dinamis dan isolasi timeout vs manual cancel teruji akurat.');
   }
 
+  // KASUS 24: Strategi across_days untuk 90 menit (2 sesi × 45m pada hari berbeda)
+  console.log('>>> [24/28] Kasus 24: Strategi across_days (2 sesi x 45m ditempatkan pada hari berbeda)');
+  {
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z'); // 09:00 WIB Senin (20 Mei)
+    const taskAcrossDays: Task = {
+      id: 'task-across-days-2x45',
+      userId: 'user-default',
+      title: 'Belajar Arsitektur Sistem',
+      estimatedDurationMinutes: 90,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurationMinutes: 45,
+        distributionStrategy: 'across_days',
+      },
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      bufferMinutes: 0,
+      enableLunchBreak: false,
+    };
+
+    // Meskipun hari Senin kosong penuh, strategi across_days HARUS membatasi 1 sesi per hari
+    const result = scheduleTaskDeterministically(taskAcrossDays, [], [], cleanPrefs, mondayAnchor);
+    assert(result.success === true, `Penjadwalan across_days harus sukses: ${result.explanation}`);
+    assert(result.proposedSessions.length === 2, `Harus menghasilkan 2 sesi, dapat: ${result.proposedSessions.length}`);
+
+    const s1Day = getPartsInTimezone(new Date(result.proposedSessions[0].startAt), TEST_TIMEZONE).day;
+    const s2Day = getPartsInTimezone(new Date(result.proposedSessions[1].startAt), TEST_TIMEZONE).day;
+    assert(s1Day !== s2Day, `Sesi 1 (hari ${s1Day}) dan Sesi 2 (hari ${s2Day}) HARUS berada pada hari kalender berbeda`);
+    assert(s1Day === 20 && s2Day === 21, `Sesi 1 harus di hari Senin (20 Mei) dan Sesi 2 di hari Selasa (21 Mei), dapat ${s1Day} dan ${s2Day}`);
+
+    console.log('  ✅ [PASS] Kasus 24: Strategi across_days sukses mendistribusikan 2 sesi pada 2 hari berbeda.');
+  }
+
+  // KASUS 25: Strategi across_days untuk 90 menit (3 sesi × 30m pada 3 hari berbeda) & Tenggat Jumat 18:00
+  console.log('>>> [25/28] Kasus 25: Strategi across_days 3 sesi x 30m lintas hari sebelum tenggat Jumat 18:00');
+  {
+    const wednesdayAnchor = new Date('2024-05-22T02:00:00.000Z'); // 09:00 WIB Rabu (22 Mei)
+    const deadlineFriday = createIsoInTimezone(2024, 5, 24, 18, 0, 0, TEST_TIMEZONE); // Jumat 18:00 WIB (24 Mei)
+
+    const task3x30Across: Task = {
+      id: 'task-across-3x30',
+      userId: 'user-default',
+      title: 'Menulis Draf Laporan',
+      estimatedDurationMinutes: 90,
+      priority: 'HIGH',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      deadlineAt: deadlineFriday,
+      hasExplicitDeadline: true,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 3,
+        sessionDurationMinutes: 30,
+        distributionStrategy: 'across_days',
+      },
+      timezone: TEST_TIMEZONE,
+      createdAt: wednesdayAnchor.toISOString(),
+    };
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      bufferMinutes: 0,
+      enableLunchBreak: false,
+    };
+
+    const result = scheduleTaskDeterministically(task3x30Across, [], [], cleanPrefs, wednesdayAnchor);
+    assert(result.success === true, `Harus berhasil menjadwalkan 3 sesi lintas hari sebelum tenggat: ${result.explanation}`);
+    assert(result.proposedSessions.length === 3, 'Harus tepat 3 sesi');
+
+    const day1 = getPartsInTimezone(new Date(result.proposedSessions[0].startAt), TEST_TIMEZONE).day;
+    const day2 = getPartsInTimezone(new Date(result.proposedSessions[1].startAt), TEST_TIMEZONE).day;
+    const day3 = getPartsInTimezone(new Date(result.proposedSessions[2].startAt), TEST_TIMEZONE).day;
+
+    assert(day1 === 22, `Sesi 1 harus Rabu (22 Mei), dapat: ${day1}`);
+    assert(day2 === 23, `Sesi 2 harus Kamis (23 Mei), dapat: ${day2}`);
+    assert(day3 === 24, `Sesi 3 harus Jumat (24 Mei), dapat: ${day3}`);
+
+    const sess3End = new Date(result.proposedSessions[2].endAt).getTime();
+    const deadlineMs = new Date(deadlineFriday).getTime();
+    assert(sess3End <= deadlineMs, 'Sesi 3 harus selesai sebelum batas tenggat Jumat 18:00 WIB');
+
+    console.log('  ✅ [PASS] Kasus 25: 3 sesi terdistribusi presisi pada Rabu, Kamis, dan Jumat sebelum tenggat 18:00.');
+  }
+
+  // KASUS 26: Integritas total durasi 75 menit (38m + 37m = tepat 75 menit, tidak ada menit hilang)
+  console.log('>>> [26/28] Kasus 26: Integritas durasi total 75 menit (38m + 37m = tepat 75m tanpa pembulatan hilang)');
+  {
+    // A. Generator opsi pembagian untuk 75 menit dengan batas min 30 menit
+    const opts75 = getAvailableSplitOptions(75, 30);
+    assert(opts75.length === 1, `Harus ada 1 opsi untuk 75m dengan min 30m, dapat: ${opts75.length}`);
+    assert(opts75[0].sessionCount === 2, 'Harus 2 sesi');
+    assert(opts75[0].totalDuration === 75, `Total durasi opsi harus persis 75 menit, dapat: ${opts75[0].totalDuration}`);
+    assert(
+      opts75[0].sessionDurations[0] === 38 && opts75[0].sessionDurations[1] === 37,
+      `Durasi per sesi harus 38m dan 37m, dapat: ${JSON.stringify(opts75[0].sessionDurations)}`
+    );
+
+    // B. Penjadwalan deterministik dengan durasi 75 menit
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    const task75: Task = {
+      id: 'task-75m',
+      userId: 'user-default',
+      title: 'Tinjauan Proposal',
+      estimatedDurationMinutes: 75,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurations: [38, 37],
+        distributionStrategy: 'flexible',
+      },
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      bufferMinutes: 0,
+      enableLunchBreak: false,
+    };
+
+    const result75 = scheduleTaskDeterministically(task75, [], [], cleanPrefs, mondayAnchor);
+    assert(result75.success === true, `Penjadwalan 75m harus sukses: ${result75.explanation}`);
+    assert(result75.proposedSessions.length === 2, 'Harus menghasilkan 2 sesi');
+    assert(result75.proposedSessions[0].durationMinutes === 38, `Sesi 1 harus 38 menit, dapat: ${result75.proposedSessions[0].durationMinutes}`);
+    assert(result75.proposedSessions[1].durationMinutes === 37, `Sesi 2 harus 37 menit, dapat: ${result75.proposedSessions[1].durationMinutes}`);
+    const sumDurations = result75.proposedSessions.reduce((acc, s) => acc + s.durationMinutes, 0);
+    assert(sumDurations === 75, `Jumlah durasi kedua sesi harus tepat 75 menit, dapat: ${sumDurations}`);
+
+    console.log('  ✅ [PASS] Kasus 26: Integritas total durasi 75 menit (38m + 37m = 75m) terjaga 100% tanpa menit hilang.');
+  }
+
+  // KASUS 27: Penolakan total ketika hanya tersedia 1 slot padahal 2 sesi dibutuhkan
+  console.log('>>> [27/28] Kasus 27: Penolakan total saat slot tidak mencukupi (tidak ada klaim sukses parsial)');
+  {
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z'); // 09:00 WIB Senin
+    const mondayDeadline = createIsoInTimezone(2024, 5, 20, 18, 0, 0, TEST_TIMEZONE);
+
+    // Agenda: 10:00 - 18:00 sibuk. Hanya ada 1 slot 45m (09:00 - 09:45) sebelum tenggat.
+    const busyMonday: CalendarEvent[] = [
+      {
+        id: 'evt-busy-full',
+        title: 'Workshop Seharian',
+        startAt: createIsoInTimezone(2024, 5, 20, 10, 0, 0, TEST_TIMEZONE),
+        endAt: createIsoInTimezone(2024, 5, 20, 18, 0, 0, TEST_TIMEZONE),
+        provider: 'google',
+        isEditable: false,
+        syncStatus: 'synced',
+      },
+    ];
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      bufferMinutes: 0,
+      enableLunchBreak: false,
+    };
+
+    // Skenario A: same_day (meminta 2 sesi @ 45m di hari yang sama sebelum tenggat Senin 18:00)
+    const taskSameDayFail: Task = {
+      id: 'task-same-day-fail',
+      userId: 'user-default',
+      title: 'Tugas Padat',
+      estimatedDurationMinutes: 90,
+      priority: 'HIGH',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      deadlineAt: mondayDeadline,
+      hasExplicitDeadline: true,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurationMinutes: 45,
+        distributionStrategy: 'same_day',
+      },
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const resultSameDayFail = scheduleTaskDeterministically(taskSameDayFail, busyMonday, [], cleanPrefs, mondayAnchor);
+    assert(resultSameDayFail.success === false, 'same_day harus gagal jika hanya ada 1 slot di hari tersebut');
+    assert(resultSameDayFail.failureCode === 'INSUFFICIENT_SPLIT_SLOTS', `failureCode harus INSUFFICIENT_SPLIT_SLOTS, dapat: ${resultSameDayFail.failureCode}`);
+    assert(resultSameDayFail.proposedSessions.length === 0, 'proposedSessions harus kosong, tidak boleh mengklaim sukses parsial');
+
+    // Skenario B: across_days (meminta 2 sesi di hari berbeda sebelum tenggat Senin 18:00)
+    // Karena hanya ada 1 hari sebelum tenggat, across_days tidak mungkin menempatkan 2 sesi di 2 hari berbeda!
+    const taskAcrossDaysFail: Task = {
+      ...taskSameDayFail,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurationMinutes: 45,
+        distributionStrategy: 'across_days',
+      },
+    };
+
+    const resultAcrossFail = scheduleTaskDeterministically(taskAcrossDaysFail, busyMonday, [], cleanPrefs, mondayAnchor);
+    assert(resultAcrossFail.success === false, 'across_days harus gagal jika tidak cukup hari berbeda sebelum tenggat');
+    assert(resultAcrossFail.failureCode === 'INSUFFICIENT_SPLIT_SLOTS', `failureCode harus INSUFFICIENT_SPLIT_SLOTS, dapat: ${resultAcrossFail.failureCode}`);
+    assert(resultAcrossFail.proposedSessions.length === 0, 'proposedSessions harus kosong pada kegagalan across_days');
+
+    console.log('  ✅ [PASS] Kasus 27: Penolakan total saat slot/hari kurang berfungsi tegas tanpa sukses palsu.');
+  }
+
+  // KASUS 28: Memilih ulang strategi distribusi setelah hasil awal ditampilkan
+  console.log('>>> [28/28] Kasus 28: Reaktifitas memilih ulang strategi distribusi (same_day vs across_days vs flexible)');
+  {
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z'); // 09:00 WIB Senin
+    // Senin: 10:00 - 18:00 sibuk. Selasa: Bebas penuh.
+    const busyMonday: CalendarEvent[] = [
+      {
+        id: 'evt-mon-afternoon-busy',
+        title: 'Meeting Padat Senin',
+        startAt: createIsoInTimezone(2024, 5, 20, 10, 0, 0, TEST_TIMEZONE),
+        endAt: createIsoInTimezone(2024, 5, 20, 18, 0, 0, TEST_TIMEZONE),
+        provider: 'google',
+        isEditable: false,
+        syncStatus: 'synced',
+      },
+    ];
+
+    const cleanPrefs: UserPreferences = {
+      ...defaultPrefs,
+      bufferMinutes: 0,
+      enableLunchBreak: false,
+    };
+
+    const baseTask: Task = {
+      id: 'task-reselect',
+      userId: 'user-default',
+      title: 'Persiapan Peluncuran Produk',
+      estimatedDurationMinutes: 90,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: 30,
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    // Langkah 1: Pengguna memilih same_day -> Karena Senin tidak muat 2 sesi (hanya ada 09:00-10:00),
+    // scheduler mencari hari berikutnya (Selasa) yang dapat memuat seluruh 2 sesi pada hari yang sama!
+    const taskSameDay: Task = {
+      ...baseTask,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurationMinutes: 45,
+        distributionStrategy: 'same_day',
+      },
+    };
+    const resSameDay = scheduleTaskDeterministically(taskSameDay, busyMonday, [], cleanPrefs, mondayAnchor);
+    assert(resSameDay.success === true, `same_day harus menemukan hari Selasa yang muat 2 sesi: ${resSameDay.explanation}`);
+    const sameDay1 = getPartsInTimezone(new Date(resSameDay.proposedSessions[0].startAt), TEST_TIMEZONE).day;
+    const sameDay2 = getPartsInTimezone(new Date(resSameDay.proposedSessions[1].startAt), TEST_TIMEZONE).day;
+    assert(sameDay1 === sameDay2, `Kedua sesi same_day harus di hari yang sama, dapat ${sameDay1} dan ${sameDay2}`);
+    assert(sameDay1 === 21, `Harus ditempatkan di hari Selasa (21 Mei) karena Senin penuh, dapat: ${sameDay1}`);
+
+    // Langkah 2: Pengguna beralih memilih across_days -> Scheduler langsung menempatkan Sesi 1 di Senin (09:00-09:45)
+    // dan Sesi 2 di Selasa (09:00-09:45)!
+    const taskAcrossDays: Task = {
+      ...baseTask,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurationMinutes: 45,
+        distributionStrategy: 'across_days',
+      },
+    };
+    const resAcross = scheduleTaskDeterministically(taskAcrossDays, busyMonday, [], cleanPrefs, mondayAnchor);
+    assert(resAcross.success === true, `across_days harus sukses: ${resAcross.explanation}`);
+    const acrossDay1 = getPartsInTimezone(new Date(resAcross.proposedSessions[0].startAt), TEST_TIMEZONE).day;
+    const acrossDay2 = getPartsInTimezone(new Date(resAcross.proposedSessions[1].startAt), TEST_TIMEZONE).day;
+    assert(acrossDay1 === 20 && acrossDay2 === 21, `across_days harus menyebar Sesi 1 di Senin (20 Mei) dan Sesi 2 di Selasa (21 Mei), dapat ${acrossDay1} dan ${acrossDay2}`);
+
+    // Langkah 3: Pengguna beralih ke flexible -> Menggunakan slot luang terdekat di Senin lalu Selasa
+    const taskFlexible: Task = {
+      ...baseTask,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurationMinutes: 45,
+        distributionStrategy: 'flexible',
+      },
+    };
+    const resFlex = scheduleTaskDeterministically(taskFlexible, busyMonday, [], cleanPrefs, mondayAnchor);
+    assert(resFlex.success === true, `flexible harus sukses: ${resFlex.explanation}`);
+    assert(resFlex.proposedSessions.length === 2, 'Harus 2 sesi');
+
+    // Verifikasi: Tidak ada sesi yang bertabrakan dengan agenda sibuk Senin (10:00 - 18:00)
+    for (const sess of [...resSameDay.proposedSessions, ...resAcross.proposedSessions, ...resFlex.proposedSessions]) {
+      const sStart = new Date(sess.startAt).getTime();
+      const sEnd = new Date(sess.endAt).getTime();
+      const bStart = new Date(busyMonday[0].startAt).getTime();
+      const bEnd = new Date(busyMonday[0].endAt).getTime();
+      const hasConflict = sStart < bEnd && sEnd > bStart;
+      assert(!hasConflict, `Sesi (${sess.startAt} - ${sess.endAt}) tidak boleh bertabrakan dengan agenda sibuk`);
+    }
+
+    console.log('  ✅ [PASS] Kasus 28: Pemilihan ulang strategi distribusi teruji deterministik dan bebas tabrakan.');
+  }
+
   console.log('\n========================================================================');
   console.log('🎉 SELURUH PENGUJIAN DIAGNOSTIK TENGGAT & SLOT PENJADWALAN BERHASIL 100%! 🎉');
   console.log('========================================================================\n');

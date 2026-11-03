@@ -61,11 +61,15 @@ export interface PreferredTimeWindow {
   label?: string;         // e.g. 'Malam (19:00 - 22:00)'
 }
 
+export type SessionDistributionStrategy = 'same_day' | 'across_days' | 'flexible';
+
 export interface TaskSplitConfig {
   forcedMode?: 'single' | 'split';
   targetSessionCount?: number;
   sessionDurationMinutes?: number;
+  sessionDurations?: number[];
   minGapMinutes?: number;
+  distributionStrategy?: SessionDistributionStrategy;
 }
 
 export interface Task {

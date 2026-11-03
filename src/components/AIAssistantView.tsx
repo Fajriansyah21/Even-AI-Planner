@@ -25,6 +25,7 @@ import {
   AIPlanDraft,
   ScheduleCalculationResult,
   TaskSplitConfig,
+  SessionDistributionStrategy,
 } from '../types';
 import {
   scheduleTaskDeterministically,
@@ -37,6 +38,7 @@ import { parseIndonesianTemporalRules } from '../lib/temporalParser';
 export interface SplitOption {
   sessionCount: number;
   durationPerSession: number;
+  sessionDurations: number[];
   totalDuration: number;
   label: string;
 }
@@ -44,39 +46,41 @@ export interface SplitOption {
 /**
  * Menghasilkan opsi pembagian sesi yang valid dan proporsional
  * berdasarkan durasi total dan batas minimum durasi sesi.
+ * Menjamin jumlah total menit seluruh sesi selalu sama persis dengan totalMinutes (tidak ada menit hilang).
  */
 export function getAvailableSplitOptions(
   totalMinutes: number,
   minimumSessionMinutes: number = 30
 ): SplitOption[] {
   const options: SplitOption[] = [];
-  if (totalMinutes <= minimumSessionMinutes) return options;
+  if (totalMinutes < minimumSessionMinutes * 2) return options;
 
   for (let count = 2; count <= 6; count++) {
-    const dur = Math.floor(totalMinutes / count);
-    if (dur < minimumSessionMinutes) continue;
-    if (totalMinutes % count === 0) {
-      options.push({
-        sessionCount: count,
-        durationPerSession: dur,
-        totalDuration: totalMinutes,
-        label: `${count} sesi × ${dur} menit`,
-      });
-    }
-  }
+    const base = Math.floor(totalMinutes / count);
+    if (base < minimumSessionMinutes) continue;
 
-  // Fallback untuk pembagian tak bulat jika belum ada opsi: misal 75 menit dengan min 30
-  if (options.length === 0) {
-    const count = 2;
-    const dur = Math.floor(totalMinutes / count);
-    if (dur >= minimumSessionMinutes) {
-      options.push({
-        sessionCount: count,
-        durationPerSession: dur,
-        totalDuration: totalMinutes,
-        label: `${count} sesi (~${dur} menit/sesi)`,
-      });
+    const remainder = totalMinutes % count;
+    // Sisa menit didistribusikan ke sesi-sesi awal agar total durasi selalu persis sama
+    const durations = Array.from({ length: count }, (_, i) =>
+      i < remainder ? base + 1 : base
+    );
+
+    const sum = durations.reduce((acc, d) => acc + d, 0);
+
+    let label = '';
+    if (remainder === 0) {
+      label = `${count} sesi × ${base} menit`;
+    } else {
+      label = `${count} sesi (${durations[0]}m & ${durations[durations.length - 1]}m)`;
     }
+
+    options.push({
+      sessionCount: count,
+      durationPerSession: base,
+      sessionDurations: durations,
+      totalDuration: sum,
+      label,
+    });
   }
 
   return options;
@@ -246,6 +250,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const [scheduleTestResult, setScheduleTestResult] = useState<ScheduleCalculationResult | null>(null);
   const [selectedSplitMode, setSelectedSplitMode] = useState<'single' | 'split'>('single');
   const [selectedSplitOption, setSelectedSplitOption] = useState<SplitOption | null>(null);
+  const [selectedDistributionStrategy, setSelectedDistributionStrategy] = useState<SessionDistributionStrategy>('flexible');
 
   const availableSplitOptions = useMemo(() => {
     if (!proposedPlan) return [];
@@ -341,6 +346,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     setScheduleTestResult(null);
     setSelectedSplitMode('single');
     setSelectedSplitOption(null);
+    setSelectedDistributionStrategy('flexible');
     setAppliedSuccess(false);
 
     // Stage 2: Analyzing (Menganalisis konteks waktu lokal & preferensi)
@@ -587,7 +593,9 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             forcedMode: 'split',
             targetSessionCount: chosenOption.sessionCount,
             sessionDurationMinutes: chosenOption.durationPerSession,
+            sessionDurations: chosenOption.sessionDurations,
             minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
+            distributionStrategy: selectedDistributionStrategy,
           }
         : {
             forcedMode: 'single',
@@ -639,7 +647,66 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       forcedMode: 'split',
       targetSessionCount: opt.sessionCount,
       sessionDurationMinutes: opt.durationPerSession,
+      sessionDurations: opt.sessionDurations,
       minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
+      distributionStrategy: selectedDistributionStrategy,
+    };
+
+    const updatedPlan: AIPlanDraft = {
+      ...proposedPlan,
+      allowSplit: true,
+      splitConfig,
+    };
+    setProposedPlan(updatedPlan);
+
+    const pseudoTask: Task = {
+      id: `ai-draft-${Date.now()}`,
+      userId: 'user-default',
+      title: updatedPlan.title,
+      description: updatedPlan.description,
+      estimatedDurationMinutes: updatedPlan.estimatedDurationMinutes,
+      deadlineAt: updatedPlan.deadlineAt || null,
+      hasExplicitDeadline: Boolean(updatedPlan.hasExplicitDeadline || updatedPlan.deadlineAt),
+      targetDate: updatedPlan.targetDate,
+      targetDayOffset: updatedPlan.targetDayOffset,
+      priority: updatedPlan.priority,
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      minimumSessionMinutes: updatedPlan.minimumSessionMinutes || 30,
+      splitConfig,
+      preferredTimeOfDay: updatedPlan.preferredTimeOfDay,
+      timeConstraintType: updatedPlan.timeConstraintType,
+      requestedStartAt: updatedPlan.requestedStartAt,
+      requestedEndAt: updatedPlan.requestedEndAt,
+      targetDays: updatedPlan.targetDays,
+      targetOccurrences: updatedPlan.targetOccurrences,
+      preferredWindow: updatedPlan.preferredWindow,
+      timezone: updatedPlan.timezone || userTimezone,
+      createdAt: new Date().toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
+    setScheduleTestResult(schedRes);
+  };
+
+  const handleSelectDistributionStrategy = (strategy: SessionDistributionStrategy) => {
+    if (!proposedPlan) return;
+    setSelectedDistributionStrategy(strategy);
+    setSelectedSplitMode('split');
+
+    const splitOpts = getAvailableSplitOptions(
+      proposedPlan.estimatedDurationMinutes,
+      proposedPlan.minimumSessionMinutes || 30
+    );
+    const chosenOption = selectedSplitOption || splitOpts[0] || null;
+
+    const splitConfig: TaskSplitConfig = {
+      forcedMode: 'split',
+      targetSessionCount: chosenOption?.sessionCount || 2,
+      sessionDurationMinutes: chosenOption?.durationPerSession || 30,
+      sessionDurations: chosenOption?.sessionDurations,
+      minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
+      distributionStrategy: strategy,
     };
 
     const updatedPlan: AIPlanDraft = {
@@ -1194,6 +1261,64 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
                           </button>
                         );
                       })}
+                    </div>
+
+                    {/* Strategi Distribusi Sesi */}
+                    <div className="pt-3 border-t border-[#D9E3EF] space-y-2">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                        <span className="text-[11px] font-semibold text-[#53657A]">
+                          Strategi Distribusi Sesi:
+                        </span>
+                        <span className="text-[10px] text-[#2457A7] font-medium bg-[#EAF3FC] px-2 py-0.5 rounded inline-block self-start sm:self-auto">
+                          Jeda minimal 60 menit antar sesi di hari yang sama
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleSelectDistributionStrategy('flexible')}
+                          className={`p-2.5 rounded-lg border text-left transition-all ${
+                            selectedDistributionStrategy === 'flexible'
+                              ? 'bg-white border-[#2457A7] text-[#2457A7] shadow-2xs ring-1 ring-[#2457A7]'
+                              : 'bg-white border-[#D9E3EF] text-[#172B42] hover:border-[#8DBCEB]'
+                          }`}
+                        >
+                          <span className="text-xs font-bold block">Fleksibel (Otomatis)</span>
+                          <p className="text-[10px] text-[#53657A] mt-0.5 leading-snug">
+                            Optimalkan hari sama jika muat, lanjut lintas hari jika padat.
+                          </p>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleSelectDistributionStrategy('same_day')}
+                          className={`p-2.5 rounded-lg border text-left transition-all ${
+                            selectedDistributionStrategy === 'same_day'
+                              ? 'bg-white border-[#2457A7] text-[#2457A7] shadow-2xs ring-1 ring-[#2457A7]'
+                              : 'bg-white border-[#D9E3EF] text-[#172B42] hover:border-[#8DBCEB]'
+                          }`}
+                        >
+                          <span className="text-xs font-bold block">Hari yang Sama</span>
+                          <p className="text-[10px] text-[#53657A] mt-0.5 leading-snug">
+                            Semua sesi dikerjakan di 1 hari dengan jeda minimal 60m.
+                          </p>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleSelectDistributionStrategy('across_days')}
+                          className={`p-2.5 rounded-lg border text-left transition-all ${
+                            selectedDistributionStrategy === 'across_days'
+                              ? 'bg-white border-[#2457A7] text-[#2457A7] shadow-2xs ring-1 ring-[#2457A7]'
+                              : 'bg-white border-[#D9E3EF] text-[#172B42] hover:border-[#8DBCEB]'
+                          }`}
+                        >
+                          <span className="text-xs font-bold block">Lintas Hari</span>
+                          <p className="text-[10px] text-[#53657A] mt-0.5 leading-snug">
+                            Prioritaskan 1 sesi per hari pada hari-hari berbeda.
+                          </p>
+                        </button>
+                      </div>
                     </div>
                   </div>
                 )}

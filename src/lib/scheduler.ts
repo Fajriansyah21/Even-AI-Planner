@@ -5,6 +5,7 @@ import {
   ScheduleCalculationResult,
   DateEvaluationDiagnostic,
   OptimalSlotSuggestion,
+  SessionDistributionStrategy,
 } from '../types';
 import {
   parseTimezoneString,
@@ -692,6 +693,11 @@ export function scheduleTaskDeterministically(
     return free;
   };
 
+  const getDayKey = (d: Date): string => {
+    const parts = getPartsInTimezone(d, userTz);
+    return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+  };
+
   // Helper to allocate exact split sessions requested by user (e.g. 2 sessions x 45 minutes)
   const allocateExactSplitSessions = (
     freeBlocks: TimeInterval[],
@@ -699,22 +705,179 @@ export function scheduleTaskDeterministically(
     targetCount: number,
     durationPerSession: number,
     minSessionMinutes: number,
-    minGapMinutes: number = DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES
+    minGapMinutes: number = DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
+    distributionStrategy: SessionDistributionStrategy = 'flexible',
+    customDurations?: number[]
   ): {
     success: boolean;
     sessions: ScheduleCalculationResult['proposedSessions'];
     explanation: string;
     failureCode?: ScheduleCalculationResult['failureCode'];
   } => {
-    if (durationPerSession < minSessionMinutes) {
+    // Generate strictly balanced session durations whose sum equals totalDurationMinutes exactly
+    const durations =
+      customDurations && customDurations.length === targetCount
+        ? [...customDurations]
+        : Array.from({ length: targetCount }, (_, i) => {
+            const base = Math.floor(totalDurationMinutes / targetCount);
+            const rem = totalDurationMinutes % targetCount;
+            return i < rem ? base + 1 : base;
+          });
+
+    if (durations.some((d) => d < minSessionMinutes)) {
       return {
         success: false,
         sessions: [],
         failureCode: 'INSUFFICIENT_SPLIT_SLOTS',
-        explanation: `Durasi per sesi (${durationPerSession} menit) melanggar batas minimal durasi sesi (${minSessionMinutes} menit).`,
+        explanation: `Durasi per sesi (${Math.min(...durations)} menit) melanggar batas minimal durasi sesi (${minSessionMinutes} menit).`,
       };
     }
 
+    // -------------------------------------------------------------------------
+    // STRATEGI 1: across_days (Maksimal 1 sesi per hari pada hari-hari berbeda)
+    // -------------------------------------------------------------------------
+    if (distributionStrategy === 'across_days') {
+      const allocated: ScheduleCalculationResult['proposedSessions'] = [];
+      const usedDays = new Set<string>();
+      let lastAllocatedEnd: Date | null = null;
+
+      for (const block of freeBlocks) {
+        if (allocated.length >= targetCount) break;
+
+        const dayKey = getDayKey(block.start);
+        if (usedDays.has(dayKey)) continue;
+
+        let cursor = new Date(block.start);
+        const blockEnd = new Date(block.end);
+
+        if (lastAllocatedEnd !== null && minGapMinutes > 0) {
+          const earliestAllowed = new Date(lastAllocatedEnd.getTime() + minGapMinutes * 60000);
+          if (earliestAllowed > cursor) {
+            cursor = earliestAllowed;
+          }
+        }
+
+        const curDur = durations[allocated.length];
+        const remainingMs = blockEnd.getTime() - cursor.getTime();
+        if (remainingMs >= curDur * 60000) {
+          const sessionStart = new Date(cursor);
+          const sessionEnd = new Date(sessionStart.getTime() + curDur * 60000);
+
+          allocated.push({
+            startAt: sessionStart.toISOString(),
+            endAt: sessionEnd.toISOString(),
+            durationMinutes: curDur,
+            sessionIndex: allocated.length + 1,
+            totalSessions: targetCount,
+          });
+
+          usedDays.add(dayKey);
+          lastAllocatedEnd = sessionEnd;
+        }
+      }
+
+      if (allocated.length === targetCount) {
+        const first = allocated[0];
+        const totalScheduled = allocated.reduce((sum, s) => sum + s.durationMinutes, 0);
+        const durSummary = durations.every((d) => d === durations[0])
+          ? `masing-masing ${durations[0]} menit`
+          : `(${durations.map((d, i) => `Sesi ${i + 1}: ${d}m`).join(', ')})`;
+        return {
+          success: true,
+          sessions: allocated,
+          explanation: `Berhasil membagi kegiatan menjadi ${targetCount} sesi lintas hari ${durSummary} (total ${totalScheduled} menit, 1 sesi per hari). Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+        };
+      } else {
+        const totalFound = allocated.reduce((sum, s) => sum + s.durationMinutes, 0);
+        return {
+          success: false,
+          sessions: [],
+          failureCode: 'INSUFFICIENT_SPLIT_SLOTS',
+          explanation: `Hanya ditemukan ${allocated.length} dari ${targetCount} hari berbeda yang memiliki slot luang sebelum batas pencarian atau tenggat waktu (total ${totalFound} dari ${totalDurationMinutes} menit). Anda dapat beralih ke strategi 'Hari yang sama' atau 'Fleksibel'.`,
+        };
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // STRATEGI 2: same_day (Seluruh sesi diwajibkan berada pada satu hari yang sama)
+    // -------------------------------------------------------------------------
+    if (distributionStrategy === 'same_day') {
+      const dayKeysOrder: string[] = [];
+      const blocksByDay = new Map<string, TimeInterval[]>();
+
+      for (const block of freeBlocks) {
+        const dKey = getDayKey(block.start);
+        if (!blocksByDay.has(dKey)) {
+          blocksByDay.set(dKey, []);
+          dayKeysOrder.push(dKey);
+        }
+        blocksByDay.get(dKey)!.push(block);
+      }
+
+      for (const dKey of dayKeysOrder) {
+        const blocksOfDay = blocksByDay.get(dKey)!;
+        const dayAllocated: ScheduleCalculationResult['proposedSessions'] = [];
+        let lastAllocatedEnd: Date | null = null;
+
+        for (const block of blocksOfDay) {
+          if (dayAllocated.length >= targetCount) break;
+
+          let cursor = new Date(block.start);
+          const blockEnd = new Date(block.end);
+
+          if (lastAllocatedEnd !== null && minGapMinutes > 0) {
+            const earliestAllowed = new Date(lastAllocatedEnd.getTime() + minGapMinutes * 60000);
+            if (earliestAllowed > cursor) {
+              cursor = earliestAllowed;
+            }
+          }
+
+          while (dayAllocated.length < targetCount) {
+            const curDur = durations[dayAllocated.length];
+            const remainingMs = blockEnd.getTime() - cursor.getTime();
+            if (remainingMs < curDur * 60000) break;
+
+            const sessionStart = new Date(cursor);
+            const sessionEnd = new Date(sessionStart.getTime() + curDur * 60000);
+
+            dayAllocated.push({
+              startAt: sessionStart.toISOString(),
+              endAt: sessionEnd.toISOString(),
+              durationMinutes: curDur,
+              sessionIndex: dayAllocated.length + 1,
+              totalSessions: targetCount,
+            });
+
+            lastAllocatedEnd = sessionEnd;
+            cursor = new Date(sessionEnd.getTime() + (minGapMinutes > 0 ? minGapMinutes * 60000 : 0));
+          }
+        }
+
+        if (dayAllocated.length === targetCount) {
+          const first = dayAllocated[0];
+          const totalScheduled = dayAllocated.reduce((sum, s) => sum + s.durationMinutes, 0);
+          const durSummary = durations.every((d) => d === durations[0])
+            ? `masing-masing ${durations[0]} menit`
+            : `(${durations.map((d, i) => `Sesi ${i + 1}: ${d}m`).join(', ')})`;
+          return {
+            success: true,
+            sessions: dayAllocated,
+            explanation: `Berhasil membagi kegiatan menjadi ${targetCount} sesi pada hari yang sama (${formatIndonesianDate(new Date(first.startAt), userTz)}) ${durSummary} dengan jeda minimal ${minGapMinutes} menit antar sesi (total ${totalScheduled} menit). Sesi pertama dimulai pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+          };
+        }
+      }
+
+      return {
+        success: false,
+        sessions: [],
+        failureCode: 'INSUFFICIENT_SPLIT_SLOTS',
+        explanation: `Tidak ditemukan satu hari dengan slot waktu luang yang mencukupi untuk menampung seluruh ${targetCount} sesi pada hari yang sama dengan jeda minimal ${minGapMinutes} menit sebelum batas tenggat. Anda dapat memilih strategi distribusi 'Lintas hari' atau 'Fleksibel'.`,
+      };
+    }
+
+    // -------------------------------------------------------------------------
+    // STRATEGI 3: flexible (Default: optimalkan hari yang sama, lanjut hari berikutnya jika penuh)
+    // -------------------------------------------------------------------------
     const allocated: ScheduleCalculationResult['proposedSessions'] = [];
     let lastAllocatedEnd: Date | null = null;
 
@@ -733,16 +896,17 @@ export function scheduleTaskDeterministically(
       }
 
       while (allocated.length < targetCount) {
+        const curDur = durations[allocated.length];
         const remainingMs = blockEnd.getTime() - cursor.getTime();
-        if (remainingMs < durationPerSession * 60000) break;
+        if (remainingMs < curDur * 60000) break;
 
         const sessionStart = new Date(cursor);
-        const sessionEnd = new Date(sessionStart.getTime() + durationPerSession * 60000);
+        const sessionEnd = new Date(sessionStart.getTime() + curDur * 60000);
 
         allocated.push({
           startAt: sessionStart.toISOString(),
           endAt: sessionEnd.toISOString(),
-          durationMinutes: durationPerSession,
+          durationMinutes: curDur,
           sessionIndex: allocated.length + 1,
           totalSessions: targetCount,
         });
@@ -756,18 +920,21 @@ export function scheduleTaskDeterministically(
       const first = allocated[0];
       const totalScheduled = allocated.reduce((sum, s) => sum + s.durationMinutes, 0);
       const gapNote = minGapMinutes > 0 ? ` dengan jeda minimal ${minGapMinutes} menit antar sesi` : '';
+      const durSummary = durations.every((d) => d === durations[0])
+        ? `masing-masing ${durations[0]} menit`
+        : `(${durations.map((d, i) => `Sesi ${i + 1}: ${d}m`).join(', ')})`;
       return {
         success: true,
         sessions: allocated,
-        explanation: `Berhasil membagi kegiatan menjadi ${targetCount} sesi masing-masing ${durationPerSession} menit (total ${totalScheduled} menit)${gapNote}. Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
+        explanation: `Berhasil membagi kegiatan menjadi ${targetCount} sesi ${durSummary} (total ${totalScheduled} menit)${gapNote}. Sesi pertama dimulai ${formatIndonesianDate(new Date(first.startAt), userTz)}, pukul ${formatTime(new Date(first.startAt), userTz)} WIB.`,
       };
     } else {
-      const totalFound = allocated.length * durationPerSession;
+      const totalFound = allocated.reduce((sum, s) => sum + s.durationMinutes, 0);
       return {
         success: false,
         sessions: [],
         failureCode: 'INSUFFICIENT_SPLIT_SLOTS',
-        explanation: `Hanya ditemukan ${allocated.length} dari ${targetCount} sesi (${durationPerSession} menit/sesi) yang dibutuhkan (total ${totalFound} dari ${totalDurationMinutes} menit). Sisa ${targetCount - allocated.length} sesi tidak menemukan slot luang bebas konflik yang memenuhi jeda minimal antar sesi (${minGapMinutes} menit) sebelum batas pencarian atau tenggat.`,
+        explanation: `Hanya ditemukan ${allocated.length} dari ${targetCount} sesi (${durations[0]} menit/sesi) yang dibutuhkan (total ${totalFound} dari ${totalDurationMinutes} menit). Sisa ${targetCount - allocated.length} sesi tidak menemukan slot luang bebas konflik yang memenuhi jeda minimal antar sesi (${minGapMinutes} menit) sebelum batas pencarian atau tenggat.`,
       };
     }
   };
@@ -1076,13 +1243,18 @@ export function scheduleTaskDeterministically(
         ? task.splitConfig.minGapMinutes
         : DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES;
 
+      const strategy = task.splitConfig?.distributionStrategy || 'flexible';
+      const customDurations = task.splitConfig?.sessionDurations;
+
       const splitRes = allocateExactSplitSessions(
         preferredFreeBlocks,
         durationNeeded,
         targetCount,
         durPerSession,
         minSession,
-        minGap
+        minGap,
+        strategy,
+        customDurations
       );
 
       if (splitRes.success) {
@@ -1420,13 +1592,18 @@ export function scheduleTaskDeterministically(
       ? task.splitConfig.minGapMinutes
       : DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES;
 
+    const strategy = task.splitConfig?.distributionStrategy || 'flexible';
+    const customDurations = task.splitConfig?.sessionDurations;
+
     const splitRes = allocateExactSplitSessions(
       standardFreeBlocks,
       durationNeeded,
       targetCount,
       durPerSession,
       minSession,
-      minGap
+      minGap,
+      strategy,
+      customDurations
     );
 
     if (splitRes.success) {
