@@ -422,6 +422,21 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.splitConfig = { forcedMode: 'single' };
       }
 
+      // 5d. Contradiction & validation propagation:
+      if (baselinePlan.hasConflict) {
+        sanitizedPlan.hasConflict = true;
+        sanitizedPlan.conflictType = baselinePlan.conflictType;
+        sanitizedPlan.conflictReason = baselinePlan.conflictReason;
+        sanitizedPlan.conflictingInstructions = baselinePlan.conflictingInstructions;
+        sanitizedPlan.requiresClarification = true;
+        sanitizedPlan.clarificationPrompt = baselinePlan.clarificationPrompt;
+        sanitizedPlan.clarificationOptions = baselinePlan.clarificationOptions;
+        sanitizedPlan.reasoning = baselinePlan.reasoning;
+      }
+      if (baselinePlan.splitValidation) {
+        sanitizedPlan.splitValidation = baselinePlan.splitValidation;
+      }
+
       // 6. Title and Description Sanitization:
       // Pastikan judul ringkas dan tidak pernah menyalin mentah seluruh prompt
       sanitizedPlan.title = extractCleanActivityTitle(trimmedPrompt, rawPlan.title || baselinePlan.title);

@@ -63,6 +63,26 @@ export interface PreferredTimeWindow {
 
 export type SessionDistributionStrategy = 'same_day' | 'across_days' | 'flexible';
 
+export type SplitConflictType =
+  | 'STRATEGY_MISMATCH'
+  | 'DURATION_MISMATCH'
+  | 'DEADLINE_IMPOSSIBLE'
+  | 'CONTRADICTORY_INSTRUCTIONS'
+  | 'INVALID_CONFIG';
+
+export interface SplitValidationResult {
+  isValid: boolean;
+  errorCode?:
+    | 'DURATION_MISMATCH'
+    | 'SESSION_COUNT_MISMATCH'
+    | 'BELOW_MINIMUM_DURATION'
+    | 'INVALID_DURATION_VALUE'
+    | 'CONFIG_CONFLICT';
+  errorMessage?: string;
+  totalTaskDuration?: number;
+  totalSessionsDuration?: number;
+}
+
 export interface TaskSplitConfig {
   forcedMode?: 'single' | 'split';
   targetSessionCount?: number;
@@ -70,6 +90,15 @@ export interface TaskSplitConfig {
   sessionDurations?: number[];
   minGapMinutes?: number;
   distributionStrategy?: SessionDistributionStrategy;
+  configSource?: 'auto' | 'manual';
+  hasConflict?: boolean;
+  conflictType?: SplitConflictType;
+  conflictReason?: string;
+  conflictingInstructions?: string[];
+  requiresClarification?: boolean;
+  clarificationPrompt?: string;
+  clarificationOptions?: { label: string; actionValue: string }[];
+  validation?: SplitValidationResult;
 }
 
 export interface Task {
@@ -171,7 +200,8 @@ export interface ScheduleCalculationResult {
     | 'TARGET_DATE_PASSED'
     | 'INSUFFICIENT_SPLIT_SLOTS'
     | 'NO_CONTIGUOUS_SLOT'
-    | 'INVALID_TIME_RANGE';
+    | 'INVALID_TIME_RANGE'
+    | 'INVALID_SPLIT_CONFIGURATION';
   proposedSessions: {
     startAt: string;
     endAt: string;
@@ -260,6 +290,13 @@ export interface AIPlanDraft {
   totalDurationMinutes?: number;
   durationPerDayMinutes?: number;
   clarificationPrompt?: string;
+  hasConflict?: boolean;
+  conflictType?: SplitConflictType;
+  conflictReason?: string;
+  conflictingInstructions?: string[];
+  requiresClarification?: boolean;
+  clarificationOptions?: { label: string; actionValue: string }[];
+  splitValidation?: SplitValidationResult;
 }
 
 export interface KeepChecklistItem {

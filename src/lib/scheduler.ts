@@ -15,6 +15,7 @@ import {
   addDaysInTimezone,
 } from './timezone';
 import { getNextValidDateForDayOfWeek, DAY_NAMES_ID } from './temporalParser';
+import { validateSplitConfiguration } from './splitValidation';
 
 interface TimeInterval {
   start: Date;
@@ -188,6 +189,38 @@ export function scheduleTaskDeterministically(
   );
   // Gunakan normalizedDate terverifikasi
   referenceDate = normalizedDate;
+
+  // -------------------------------------------------------------
+  // VALIDASI KETAT PEMBAGIAN SESI (Centralized Split Configuration Validation)
+  // -------------------------------------------------------------
+  if (task.splitConfig?.forcedMode === 'split') {
+    const splitValidation = validateSplitConfiguration({
+      estimatedDurationMinutes: durationNeeded,
+      hasExplicitTotalDuration: true,
+      splitConfig: task.splitConfig,
+      minimumSessionMinutes: task.minimumSessionMinutes || 30,
+    });
+    if (!splitValidation.isValid) {
+      return {
+        success: false,
+        taskId: task.id,
+        taskTitle: task.title,
+        failureCode: 'INVALID_SPLIT_CONFIGURATION',
+        proposedSessions: [],
+        explanation: splitValidation.errorMessage || 'Konfigurasi pembagian sesi tidak valid.',
+      };
+    }
+    if (task.splitConfig.hasConflict) {
+      return {
+        success: false,
+        taskId: task.id,
+        taskTitle: task.title,
+        failureCode: 'INVALID_SPLIT_CONFIGURATION',
+        proposedSessions: [],
+        explanation: task.splitConfig.conflictReason || 'Konfigurasi pembagian sesi memiliki instruksi yang saling bertentangan.',
+      };
+    }
+  }
 
   // -------------------------------------------------------------
   // 1. HARD CONSTRAINT: MULTI-DAY FIXED COMMITMENTS (targetOccurrences or targetDays)

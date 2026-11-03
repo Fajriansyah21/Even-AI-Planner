@@ -165,6 +165,15 @@ export function resolveInitialSplitConfiguration(
     sessionDurations: matchingOption.sessionDurations,
     minGapMinutes: plan.splitConfig?.minGapMinutes || DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
     distributionStrategy: initialStrategy,
+    configSource: plan.splitConfig?.configSource || 'auto_detected',
+    hasConflict: plan.hasConflict,
+    conflictType: plan.conflictType,
+    conflictReason: plan.conflictReason,
+    conflictingInstructions: plan.conflictingInstructions,
+    requiresClarification: plan.requiresClarification,
+    clarificationPrompt: plan.clarificationPrompt,
+    clarificationOptions: plan.clarificationOptions,
+    validation: plan.splitValidation,
   };
 
   return {
@@ -554,6 +563,18 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       setSelectedDistributionStrategy(initialSplit.distributionStrategy);
       setSelectedSplitOption(initialSplit.splitOption);
 
+      // Prioritas 2: Deteksi instruksi bertentangan atau validasi durasi gagal
+      // JANGAN jalankan scheduler atau klaim keberhasilan palsu!
+      if (plan.hasConflict || plan.splitValidation?.isValid === false) {
+        const planWithConfig: AIPlanDraft = {
+          ...plan,
+          splitConfig: initialSplit.activeSplitConfig,
+        };
+        setProposedPlan(planWithConfig);
+        setScheduleTestResult(null);
+        return;
+      }
+
       // Pisahkan secara tegas antara batas tenggat eksplisit dan tanggal target:
       // JANGAN PERNAH menyintesis tenggat buatan jam 18.00/23.00 jika pengguna tidak meminta tenggat!
       const calculatedDeadlineAt: string | null = plan.deadlineAt || null;
@@ -636,6 +657,17 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         setSelectedDistributionStrategy(initialSplit.distributionStrategy);
         setSelectedSplitOption(initialSplit.splitOption);
 
+        if (fallbackParsed.hasConflict || fallbackParsed.splitValidation?.isValid === false) {
+          const fallbackPlanWithConfig: AIPlanDraft = {
+            ...fallbackParsed,
+            splitConfig: initialSplit.activeSplitConfig,
+          };
+          setPlanSource('rule_fallback_on_error');
+          setProposedPlan(fallbackPlanWithConfig);
+          setScheduleTestResult(null);
+          return;
+        }
+
         const calculatedDeadlineAt: string | null = fallbackParsed.deadlineAt || null;
 
         const fallbackTask: Task = {
@@ -699,6 +731,111 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     }
   };
 
+  const handleResolveClarificationAction = (actionValue: string) => {
+    if (!proposedPlan) return;
+
+    let targetStrategy: SessionDistributionStrategy = selectedDistributionStrategy;
+    let targetMode: 'single' | 'split' = 'split';
+    let newDuration = proposedPlan.estimatedDurationMinutes;
+    let newDeadlineAt = proposedPlan.deadlineAt;
+    let newSessionDurations = proposedPlan.splitConfig?.sessionDurations;
+
+    if (actionValue === 'same_day') {
+      targetStrategy = 'same_day';
+      setSelectedDistributionStrategy('same_day');
+    } else if (actionValue === 'across_days') {
+      targetStrategy = 'across_days';
+      setSelectedDistributionStrategy('across_days');
+    } else if (actionValue === 'single_session') {
+      targetMode = 'single';
+      setSelectedSplitMode('single');
+    } else if (actionValue === 'keep_total') {
+      const count = proposedPlan.splitConfig?.targetSessionCount || 2;
+      const base = Math.floor(newDuration / count);
+      const rem = newDuration % count;
+      newSessionDurations = Array.from({ length: count }, (_, i) => (i < rem ? base + 1 : base));
+    } else if (actionValue === 'use_session_sum') {
+      if (proposedPlan.splitConfig?.sessionDurations) {
+        newDuration = proposedPlan.splitConfig.sessionDurations.reduce((a, b) => a + b, 0);
+      }
+    } else if (actionValue === 'extend_deadline') {
+      const d = addDaysInTimezone(new Date(), 2, userTimezone);
+      const parts = getZonedDateTimeParts(d, userTimezone);
+      newDeadlineAt = createIsoInTimezone(parts.year, parts.month, parts.day, 23, 59, 0, userTimezone);
+      targetStrategy = 'across_days';
+      setSelectedDistributionStrategy('across_days');
+    }
+
+    const splitOpts = getAvailableSplitOptions(newDuration, proposedPlan.minimumSessionMinutes || 30);
+    const chosenOption =
+      splitOpts.find((o) => o.sessionCount === (proposedPlan.splitConfig?.targetSessionCount || 2)) ||
+      splitOpts[0];
+
+    const updatedSplitConfig: TaskSplitConfig =
+      targetMode === 'split' && chosenOption
+        ? {
+            forcedMode: 'split',
+            targetSessionCount: chosenOption.sessionCount,
+            sessionDurationMinutes: newSessionDurations?.[0] || chosenOption.durationPerSession,
+            sessionDurations: newSessionDurations || chosenOption.sessionDurations,
+            minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
+            distributionStrategy: targetStrategy,
+            configSource: 'manual',
+            hasConflict: false,
+          }
+        : {
+            forcedMode: 'single',
+            configSource: 'manual',
+            hasConflict: false,
+          };
+
+    const updatedPlan: AIPlanDraft = {
+      ...proposedPlan,
+      estimatedDurationMinutes: newDuration,
+      deadlineAt: newDeadlineAt,
+      hasExplicitDeadline: Boolean(newDeadlineAt),
+      hasConflict: false,
+      conflictType: undefined,
+      conflictReason: undefined,
+      conflictingInstructions: undefined,
+      requiresClarification: false,
+      allowSplit: targetMode === 'split',
+      splitConfig: updatedSplitConfig,
+    };
+
+    setSelectedSplitMode(targetMode);
+    setProposedPlan(updatedPlan);
+
+    const pseudoTask: Task = {
+      id: `ai-draft-${Date.now()}`,
+      userId: 'user-default',
+      title: updatedPlan.title,
+      description: updatedPlan.description,
+      estimatedDurationMinutes: updatedPlan.estimatedDurationMinutes,
+      deadlineAt: updatedPlan.deadlineAt || null,
+      hasExplicitDeadline: Boolean(updatedPlan.hasExplicitDeadline || updatedPlan.deadlineAt),
+      targetDate: updatedPlan.targetDate,
+      targetDayOffset: updatedPlan.targetDayOffset,
+      priority: updatedPlan.priority,
+      status: 'UNSCHEDULED',
+      allowSplit: targetMode === 'split',
+      minimumSessionMinutes: updatedPlan.minimumSessionMinutes || 30,
+      splitConfig: updatedSplitConfig,
+      preferredTimeOfDay: updatedPlan.preferredTimeOfDay,
+      timeConstraintType: updatedPlan.timeConstraintType,
+      requestedStartAt: updatedPlan.requestedStartAt,
+      requestedEndAt: updatedPlan.requestedEndAt,
+      targetDays: updatedPlan.targetDays,
+      targetOccurrences: updatedPlan.targetOccurrences,
+      preferredWindow: updatedPlan.preferredWindow,
+      timezone: updatedPlan.timezone || userTimezone,
+      createdAt: new Date().toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(pseudoTask, events, tasks, preferences);
+    setScheduleTestResult(schedRes);
+  };
+
   const handleSelectSplitMode = (mode: 'single' | 'split') => {
     if (!proposedPlan) return;
     setSelectedSplitMode(mode);
@@ -721,13 +858,22 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             sessionDurations: chosenOption.sessionDurations,
             minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
             distributionStrategy: selectedDistributionStrategy,
+            configSource: 'manual',
+            hasConflict: false,
           }
         : {
             forcedMode: 'single',
+            configSource: 'manual',
+            hasConflict: false,
           };
 
     const updatedPlan: AIPlanDraft = {
       ...proposedPlan,
+      hasConflict: false,
+      conflictType: undefined,
+      conflictReason: undefined,
+      conflictingInstructions: undefined,
+      requiresClarification: false,
       allowSplit: mode === 'split',
       splitConfig,
     };
@@ -775,10 +921,17 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       sessionDurations: opt.sessionDurations,
       minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
       distributionStrategy: selectedDistributionStrategy,
+      configSource: 'manual',
+      hasConflict: false,
     };
 
     const updatedPlan: AIPlanDraft = {
       ...proposedPlan,
+      hasConflict: false,
+      conflictType: undefined,
+      conflictReason: undefined,
+      conflictingInstructions: undefined,
+      requiresClarification: false,
       allowSplit: true,
       splitConfig,
     };
@@ -832,10 +985,17 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
       sessionDurations: chosenOption?.sessionDurations,
       minGapMinutes: DEFAULT_MIN_SPLIT_SESSION_GAP_MINUTES,
       distributionStrategy: strategy,
+      configSource: 'manual',
+      hasConflict: false,
     };
 
     const updatedPlan: AIPlanDraft = {
       ...proposedPlan,
+      hasConflict: false,
+      conflictType: undefined,
+      conflictReason: undefined,
+      conflictingInstructions: undefined,
+      requiresClarification: false,
       allowSplit: true,
       splitConfig,
     };
@@ -1183,6 +1343,104 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
               >
                 Tutup
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Conflict / Clarification Required Card (Prioritas 2) */}
+        {proposedPlan && !proposedPlan.isOperational && (proposedPlan.hasConflict || proposedPlan.splitValidation?.isValid === false) && (
+          <div className="bg-white border-2 border-amber-300 rounded-2xl p-5 shadow-xs space-y-4 animate-in fade-in slide-in-from-bottom-2">
+            <div className="flex items-start justify-between border-b border-amber-200/80 pb-3.5">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-amber-100 text-amber-800 flex items-center justify-center shrink-0">
+                  <AlertCircle size={18} />
+                </div>
+                <div>
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-amber-800 bg-amber-100/70 px-2 py-0.5 rounded-md">
+                    Memerlukan Klarifikasi Instruksi
+                  </span>
+                  <h3 className="text-sm font-bold text-[#172B42] mt-0.5">
+                    {proposedPlan.title || 'Kegiatan Baru'}
+                  </h3>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setProposedPlan(null);
+                  setScheduleTestResult(null);
+                }}
+                className="text-[#53657A] hover:text-[#172B42] text-xs"
+              >
+                Tutup
+              </button>
+            </div>
+
+            <div className="p-3.5 bg-amber-50/70 rounded-xl border border-amber-200/60 space-y-2">
+              <span className="text-xs font-bold text-amber-950 block">
+                {proposedPlan.conflictType === 'STRATEGY_MISMATCH'
+                  ? 'Konflik Strategi Distribusi Sesi'
+                  : proposedPlan.conflictType === 'DEADLINE_IMPOSSIBLE'
+                  ? 'Batas Tenggat Waktu Tidak Memungkinkan Distribusi Lintas Hari'
+                  : proposedPlan.conflictType === 'DURATION_MISMATCH'
+                  ? 'Total Durasi Tidak Sesuai Rincian Sesi'
+                  : 'Konfigurasi Pembagian Sesi Tidak Valid'}
+              </span>
+              <p className="text-xs text-amber-900 leading-relaxed">
+                {proposedPlan.conflictReason || proposedPlan.splitValidation?.errorMessage || proposedPlan.clarificationPrompt}
+              </p>
+
+              {proposedPlan.conflictingInstructions && proposedPlan.conflictingInstructions.length > 0 && (
+                <div className="pt-1.5 space-y-1">
+                  <span className="text-[11px] font-bold text-amber-950 block">Instruksi yang saling bertentangan:</span>
+                  <ul className="list-disc list-inside text-[11px] text-amber-900 space-y-0.5 pl-1">
+                    {proposedPlan.conflictingInstructions.map((ins, idx) => (
+                      <li key={idx}>{ins}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            {/* Actionable Resolution Buttons */}
+            <div className="space-y-2 pt-1">
+              <span className="text-xs font-bold text-[#172B42] block">
+                Pilih opsi penyelesaian untuk melanjutkan penjadwalan:
+              </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {proposedPlan.clarificationOptions && proposedPlan.clarificationOptions.length > 0 ? (
+                  proposedPlan.clarificationOptions.map((opt, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      onClick={() => handleResolveClarificationAction(opt.actionValue)}
+                      className="px-3.5 py-2.5 bg-[#EAF3FC] hover:bg-[#D9E9F9] text-[#2457A7] border border-[#8DBCEB] rounded-xl text-xs font-semibold text-left transition-colors flex items-center justify-between shadow-2xs"
+                    >
+                      <span>{opt.label}</span>
+                      <ArrowRight size={13} className="shrink-0 ml-1.5" />
+                    </button>
+                  ))
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleResolveClarificationAction('single_session')}
+                      className="px-3.5 py-2.5 bg-[#EAF3FC] hover:bg-[#D9E9F9] text-[#2457A7] border border-[#8DBCEB] rounded-xl text-xs font-semibold text-left transition-colors flex items-center justify-between shadow-2xs"
+                    >
+                      <span>Jadwalkan Sebagai Satu Sesi Utuh</span>
+                      <ArrowRight size={13} className="shrink-0 ml-1.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleResolveClarificationAction('same_day')}
+                      className="px-3.5 py-2.5 bg-[#EAF3FC] hover:bg-[#D9E9F9] text-[#2457A7] border border-[#8DBCEB] rounded-xl text-xs font-semibold text-left transition-colors flex items-center justify-between shadow-2xs"
+                    >
+                      <span>Bagi Sesi Pada Hari yang Sama</span>
+                      <ArrowRight size={13} className="shrink-0 ml-1.5" />
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
           </div>
         )}

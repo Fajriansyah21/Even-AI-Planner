@@ -1629,6 +1629,212 @@ export function runDeadlineAndSlotDiagnosticsTests() {
     console.log('  ✅ [PASS] Kasus 36: Pilihan manual single session dihormati dan dihitung ulang sebagai satu sesi utuh.');
   }
 
+  // ========================================================================
+  // HARDENING TESTS: AUTO-DETECTION, VALIDASI DURASI, KONTRADIKSI & OVERRIDE
+  // (KASUS 37 - 45)
+  // ========================================================================
+
+  // KASUS 37: Validasi total durasi konsisten (total 90m, 2 sesi @45m -> valid)
+  console.log('>>> [37/45] Kasus 37: Validasi total durasi konsisten (total 90m, 2 sesi @45m)');
+  {
+    const prompt = 'Jadwalkan belajar algoritma selama total 90 menit, dibagi menjadi 2 sesi masing-masing 45 menit.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.estimatedDurationMinutes === 90, 'Total durasi harus 90 menit');
+    assert(pipelineRes.plan.splitConfig?.forcedMode === 'split', 'forcedMode harus split');
+    assert(pipelineRes.plan.splitConfig?.targetSessionCount === 2, 'targetSessionCount harus 2');
+    assert(
+      JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations) === JSON.stringify([45, 45]),
+      `sessionDurations harus [45, 45], dapat: ${JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations)}`
+    );
+    assert(pipelineRes.plan.hasConflict !== true, 'Tidak boleh ada konflik');
+    assert(pipelineRes.plan.splitValidation?.isValid === true, 'splitValidation harus valid');
+    console.log('  ✅ [PASS] Kasus 37: Total durasi 90m dengan 2 sesi 45+45m terverifikasi valid secara matematis.');
+  }
+
+  // KASUS 38: Validasi durasi pecahan ganjil konsisten (total 75m, 2 sesi @38m dan @37m -> valid)
+  console.log('>>> [38/45] Kasus 38: Validasi durasi pecahan ganjil konsisten (75m, 2 sesi 38+37m)');
+  {
+    const prompt = 'Bagi tugas analisis 75 menit menjadi 2 sesi masing-masing 38 dan 37 menit.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.estimatedDurationMinutes === 75, 'Total durasi harus 75 menit');
+    assert(pipelineRes.plan.splitConfig?.targetSessionCount === 2, 'targetSessionCount harus 2');
+    assert(
+      JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations) === JSON.stringify([38, 37]),
+      `sessionDurations harus [38, 37], dapat: ${JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations)}`
+    );
+    assert(pipelineRes.plan.hasConflict !== true, 'Tidak boleh ada konflik');
+    assert(pipelineRes.plan.splitValidation?.isValid === true, 'splitValidation harus valid');
+    console.log('  ✅ [PASS] Kasus 38: Pecahan ganjil 38m dan 37m tepat berjumlah 75m terverifikasi valid.');
+  }
+
+  // KASUS 39: Deteksi durasi mismatch & penolakan silent mutation (total 90m, 2 sesi @40m -> invalid)
+  console.log('>>> [39/45] Kasus 39: Deteksi durasi mismatch & penolakan silent mutation (90m, 2 sesi @40m)');
+  {
+    const prompt = 'Jadwalkan belajar algoritma selama total 90 menit, dibagi menjadi 2 sesi masing-masing 40 menit.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+
+    // Verifikasi perlindungan dari mutasi diam-diam:
+    // 1. Total durasi TIDAK BOLEH diam-diam berubah menjadi 80
+    assert(pipelineRes.plan.estimatedDurationMinutes === 90, `Total durasi harus tetap 90 menit (tidak boleh bermutasi ke 80), dapat: ${pipelineRes.plan.estimatedDurationMinutes}`);
+    // 2. Rincian sesi TIDAK BOLEH diam-diam diubah ke 45+45
+    assert(
+      JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations) === JSON.stringify([40, 40]),
+      `sessionDurations harus tetap merefleksikan permintaan [40, 40], dapat: ${JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations)}`
+    );
+    // 3. Status konflik dan validasi cacat harus terdeteksi dengan tepat
+    assert(pipelineRes.plan.hasConflict === true, 'hasConflict harus true');
+    assert(pipelineRes.plan.conflictType === 'DURATION_MISMATCH', `conflictType harus DURATION_MISMATCH, dapat: ${pipelineRes.plan.conflictType}`);
+    assert(pipelineRes.plan.splitValidation?.isValid === false, 'splitValidation.isValid harus false');
+    assert(pipelineRes.plan.splitValidation?.errorCode === 'DURATION_MISMATCH', 'errorCode harus DURATION_MISMATCH');
+    assert(pipelineRes.plan.requiresClarification === true, 'requiresClarification harus true');
+    console.log('  ✅ [PASS] Kasus 39: Mismatch 90m vs 40+40m terdeteksi secara ketat tanpa mutasi data diam-diam.');
+  }
+
+  // KASUS 40: Validasi durasi 3 sesi konsisten (total 90m, 3 sesi @30m -> valid)
+  console.log('>>> [40/45] Kasus 40: Validasi durasi 3 sesi konsisten (total 90m, 3 sesi @30m)');
+  {
+    const prompt = 'Jadwalkan review materi total 90 menit, pecah menjadi 3 sesi masing-masing 30 menit.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.estimatedDurationMinutes === 90, 'Total durasi harus 90 menit');
+    assert(pipelineRes.plan.splitConfig?.targetSessionCount === 3, 'targetSessionCount harus 3');
+    assert(
+      JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations) === JSON.stringify([30, 30, 30]),
+      `sessionDurations harus [30, 30, 30]`
+    );
+    assert(pipelineRes.plan.hasConflict !== true, 'Tidak boleh ada konflik');
+    assert(pipelineRes.plan.splitValidation?.isValid === true, 'splitValidation harus valid');
+    console.log('  ✅ [PASS] Kasus 40: Total 90m dengan 3 sesi 30+30+30m terverifikasi valid.');
+  }
+
+  // KASUS 41: Validasi total dari sesi tanpa total eksplisit ("2 sesi masing-masing 40 menit" -> total 80m valid)
+  console.log('>>> [41/45] Kasus 41: Validasi total dari sesi tanpa total eksplisit (2 sesi @40m -> total 80m)');
+  {
+    const prompt = 'Bagi tugas persiapan ujian menjadi 2 sesi masing-masing 40 menit.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+
+    assert(pipelineRes.success === true, 'Pipeline harus sukses');
+    assert(pipelineRes.plan.estimatedDurationMinutes === 80, `Total durasi harus dihitung 80 menit, dapat: ${pipelineRes.plan.estimatedDurationMinutes}`);
+    assert(pipelineRes.plan.splitConfig?.targetSessionCount === 2, 'targetSessionCount harus 2');
+    assert(
+      JSON.stringify(pipelineRes.plan.splitConfig?.sessionDurations) === JSON.stringify([40, 40]),
+      `sessionDurations harus [40, 40]`
+    );
+    assert(pipelineRes.plan.hasConflict !== true, 'Tidak boleh ada konflik karena total tidak disebutkan berlawanan');
+    assert(pipelineRes.plan.splitValidation?.isValid === true, 'splitValidation harus valid');
+    console.log('  ✅ [PASS] Kasus 41: Tanpa total eksplisit yang berlawanan, total 80m dihitung akurat dari sesi.');
+  }
+
+  // KASUS 42: Deteksi instruksi bertentangan strategi ("3 sesi pada hari yang berbeda, tetapi selesaikan semuanya hari ini")
+  console.log('>>> [42/45] Kasus 42: Deteksi instruksi bertentangan strategi (across_days vs hari ini)');
+  {
+    const prompt = 'Bagi tugas menjadi 3 sesi pada hari yang berbeda, tetapi selesaikan semuanya hari ini.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+
+    assert(pipelineRes.plan.hasConflict === true, 'hasConflict harus true');
+    assert(pipelineRes.plan.conflictType === 'STRATEGY_MISMATCH', `conflictType harus STRATEGY_MISMATCH, dapat: ${pipelineRes.plan.conflictType}`);
+    assert(pipelineRes.plan.requiresClarification === true, 'requiresClarification harus true');
+    assert(Array.isArray(pipelineRes.plan.clarificationOptions), 'clarificationOptions harus ada');
+    console.log('  ✅ [PASS] Kasus 42: Kontradiksi lintas hari vs selesai hari ini berhasil dicegat sebagai STRATEGY_MISMATCH.');
+  }
+
+  // KASUS 43: Deteksi instruksi bertentangan tenggat (3 sesi beda hari + tenggat jam 12:00 hari ini)
+  console.log('>>> [43/45] Kasus 43: Deteksi instruksi bertentangan tenggat (across_days + tenggat hari ini)');
+  {
+    const prompt = 'Bagi pengerjaan proyek menjadi 3 sesi pada hari berbeda, paling lambat jam 12.00 hari ini.';
+    const mondayAnchor = new Date('2024-05-20T01:00:00.000Z'); // 08:00 WIB
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+
+    assert(pipelineRes.plan.hasConflict === true, 'hasConflict harus true');
+    assert(pipelineRes.plan.conflictType === 'DEADLINE_IMPOSSIBLE', `conflictType harus DEADLINE_IMPOSSIBLE, dapat: ${pipelineRes.plan.conflictType}`);
+    assert(pipelineRes.plan.requiresClarification === true, 'requiresClarification harus true');
+    console.log('  ✅ [PASS] Kasus 43: Kontradiksi 3 sesi beda hari dengan batas tenggat hari ini dicegat sebagai DEADLINE_IMPOSSIBLE.');
+  }
+
+  // KASUS 44: Manual override integritas & configSource manual
+  console.log('>>> [44/45] Kasus 44: Manual override integritas & configSource manual');
+  {
+    const prompt = 'Bagi laporan 90 menit menjadi 2 sesi masing-masing 45 menit pada hari berbeda.';
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    const pipelineRes = simulateBackendPlanPipeline(prompt, { refDate: mondayAnchor });
+
+    const splitOpts = getAvailableSplitOptions(pipelineRes.plan.estimatedDurationMinutes, 30);
+    const initialUi = resolveInitialSplitConfiguration(pipelineRes.plan, splitOpts);
+    assert(initialUi.splitMode === 'split', 'Awalnya auto-detected split');
+    assert(initialUi.activeSplitConfig.configSource === 'auto_detected', 'Awalnya configSource auto_detected');
+
+    // Pengguna secara manual memilih Satu Sesi Utuh:
+    const manualSingleConfig: TaskSplitConfig = {
+      forcedMode: 'single',
+      configSource: 'manual',
+    };
+    assert(manualSingleConfig.configSource === 'manual', 'Override harus memiliki configSource: manual');
+
+    const taskSingle: Task = {
+      id: 'task-manual-override-44',
+      userId: 'user-default',
+      title: pipelineRes.plan.title,
+      estimatedDurationMinutes: pipelineRes.plan.estimatedDurationMinutes,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: false,
+      splitConfig: manualSingleConfig,
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(taskSingle, [], [], defaultPrefs, mondayAnchor);
+    assert(schedRes.success === true, 'Scheduler harus sukses');
+    assert(schedRes.proposedSessions.length === 1, 'Harus menghasilkan 1 sesi utuh');
+    console.log('  ✅ [PASS] Kasus 44: Manual override menetapkan configSource: manual dan dihormati penuh.');
+  }
+
+  // KASUS 45: Penolakan Scheduler pada Konfigurasi Split Cacat
+  console.log('>>> [45/45] Kasus 45: Penolakan scheduler pada konfigurasi split cacat (INVALID_SPLIT_CONFIGURATION)');
+  {
+    const mondayAnchor = new Date('2024-05-20T02:00:00.000Z');
+    // Task cacat: total 90m tapi rincian sesi [40, 40] (jumlah 80m, hilang 10m)
+    const invalidTask: Task = {
+      id: 'task-invalid-split',
+      userId: 'user-default',
+      title: 'Tugas Cacat Durasi',
+      estimatedDurationMinutes: 90,
+      priority: 'MEDIUM',
+      status: 'UNSCHEDULED',
+      allowSplit: true,
+      splitConfig: {
+        forcedMode: 'split',
+        targetSessionCount: 2,
+        sessionDurations: [40, 40],
+        sessionDurationMinutes: 40,
+        distributionStrategy: 'flexible',
+      },
+      timezone: TEST_TIMEZONE,
+      createdAt: mondayAnchor.toISOString(),
+    };
+
+    const schedRes = scheduleTaskDeterministically(invalidTask, [], [], defaultPrefs, mondayAnchor);
+    assert(schedRes.success === false, 'Scheduler harus menolak konfigurasi cacat');
+    assert(
+      schedRes.failureCode === 'INVALID_SPLIT_CONFIGURATION',
+      `failureCode harus INVALID_SPLIT_CONFIGURATION, dapat: ${schedRes.failureCode}`
+    );
+    assert(schedRes.proposedSessions.length === 0, 'proposedSessions harus kosong');
+    assert(schedRes.explanation.includes('Total durasi tugas adalah 90 menit'), 'Penjelasan harus transparan menyebut durasi mismatch');
+    console.log('  ✅ [PASS] Kasus 45: Scheduler deterministik secara tegas menolak eksekusi dengan INVALID_SPLIT_CONFIGURATION.');
+  }
+
   console.log('\n========================================================================');
   console.log('🎉 SELURUH PENGUJIAN DIAGNOSTIK TENGGAT & SLOT PENJADWALAN BERHASIL 100%! 🎉');
   console.log('========================================================================\n');
