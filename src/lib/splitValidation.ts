@@ -215,7 +215,7 @@ export function detectSplitContradictions(params: SplitContradictionCheckParams)
     };
   }
 
-  // 2. Konflik Tenggat vs Lintas Hari: Meminta lintas hari tapi tenggat waktu hari ini
+  // 2. Konflik Tenggat vs Lintas Hari: Meminta lintas hari tapi sisa hari sebelum tenggat tidak mencukupi
   // Contoh: "Bagi menjadi 3 sesi pada hari berbeda, tetapi semua sesi harus selesai sebelum pukul 12.00 hari ini."
   if (isAcrossDays && deadlineIso) {
     try {
@@ -223,22 +223,40 @@ export function detectSplitContradictions(params: SplitContradictionCheckParams)
       const rDate = new Date(referenceDate);
 
       // Hitung perbedaan hari kalender antara reference date dan deadline dalam timezone
-      const refDayKey = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(rDate);
-      const dlDayKey = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(dDate);
+      const refDayParts = new Intl.DateTimeFormat('en-CA', { timeZone: timezone })
+        .format(rDate)
+        .split('-')
+        .map(Number);
+      const dlDayParts = new Intl.DateTimeFormat('en-CA', { timeZone: timezone })
+        .format(dDate)
+        .split('-')
+        .map(Number);
 
-      if (refDayKey === dlDayKey && targetSessionCount > 1) {
+      const refUtcDays = Date.UTC(refDayParts[0], refDayParts[1] - 1, refDayParts[2]) / 86400000;
+      const dlUtcDays = Date.UTC(dlDayParts[0], dlDayParts[1] - 1, dlDayParts[2]) / 86400000;
+      const diffCalendarDays = dlUtcDays - refUtcDays;
+      const availableCalendarDays = diffCalendarDays >= 0 ? diffCalendarDays + 1 : 0;
+
+      if (availableCalendarDays < targetSessionCount && targetSessionCount > 1) {
         const timeStrMatch = p.match(/(?:jam|pukul)\s*(\d{1,2})(?:[:.](\d{2}))?/i);
-        const timeLabel = timeStrMatch ? `pukul ${timeStrMatch[1]}.${timeStrMatch[2] || '00'} WIB` : 'hari ini';
+        const timeLabel = timeStrMatch ? `pukul ${timeStrMatch[1]}.${timeStrMatch[2] || '00'} WIB` : 'hari batas tenggat';
+        const dayDesc =
+          availableCalendarDays === 1
+            ? 'hari yang sama / hari ini'
+            : availableCalendarDays === 0
+            ? 'waktu yang sudah lewat'
+            : `hanya ${availableCalendarDays} hari kalender`;
+
         return {
           hasConflict: true,
           conflictType: 'DEADLINE_IMPOSSIBLE',
-          conflictReason: `Instruksi Anda meminta pembagian menjadi ${targetSessionCount} sesi pada hari berbeda, namun batas tenggat waktu jatuh pada ${timeLabel} (hari yang sama). Tidak mungkin mendistribusikan ${targetSessionCount} sesi pada hari-hari berbeda sebelum tenggat hari ini.`,
+          conflictReason: `Instruksi Anda meminta pembagian menjadi ${targetSessionCount} sesi pada hari berbeda, namun batas tenggat waktu menyisakan ${dayDesc}. Tidak mungkin mendistribusikan ${targetSessionCount} sesi pada hari-hari berbeda sebelum tenggat.`,
           conflictingInstructions: [
             `${targetSessionCount} sesi pada hari berbeda`,
             `Tenggat waktu selesai ${timeLabel}`,
           ],
           requiresClarification: true,
-          clarificationPrompt: `Tenggat waktu ${timeLabel} tidak memungkinkan pembagian sesi lintas hari. Apakah Anda ingin menyelesaikan seluruh sesi hari ini, atau memperpanjang tenggat waktu?`,
+          clarificationPrompt: `Tenggat waktu yang tersisa (${dayDesc}) tidak mencukupi untuk mendistribusikan ${targetSessionCount} sesi lintas hari. Apakah Anda ingin menyelesaikan seluruh sesi hari ini, atau memperpanjang tenggat waktu?`,
           clarificationOptions: [
             { label: 'Selesaikan Semua Sesi Hari Ini', actionValue: 'same_day' },
             { label: 'Perpanjang Tenggat (Tetap Lintas Hari)', actionValue: 'extend_deadline' },

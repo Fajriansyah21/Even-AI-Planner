@@ -733,6 +733,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
   const handleResolveClarificationAction = (actionValue: string) => {
     if (!proposedPlan) return;
+    activeRequestIdRef.current++; // Invalidate any in-flight async AI responses
 
     let targetStrategy: SessionDistributionStrategy = selectedDistributionStrategy;
     let targetMode: 'single' | 'split' = 'split';
@@ -838,6 +839,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
   const handleSelectSplitMode = (mode: 'single' | 'split') => {
     if (!proposedPlan) return;
+    activeRequestIdRef.current++; // Invalidate any in-flight async AI responses
     setSelectedSplitMode(mode);
 
     const splitOpts = getAvailableSplitOptions(
@@ -911,6 +913,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
   const handleSelectSplitOption = (opt: SplitOption) => {
     if (!proposedPlan) return;
+    activeRequestIdRef.current++; // Invalidate any in-flight async AI responses
     setSelectedSplitOption(opt);
     setSelectedSplitMode('split');
 
@@ -969,6 +972,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
   const handleSelectDistributionStrategy = (strategy: SessionDistributionStrategy) => {
     if (!proposedPlan) return;
+    activeRequestIdRef.current++; // Invalidate any in-flight async AI responses
     setSelectedDistributionStrategy(strategy);
     setSelectedSplitMode('split');
 

@@ -13,6 +13,7 @@ import { runAllAiSchedulerRegressionTests } from './ai-reasoning-and-scheduler-r
 import { runAiSchedulerSuite } from './aiScheduler.test';
 import { runLoadingUxTests } from './loadingUx.test';
 import { runDeadlineAndSlotDiagnosticsTests } from './deadlineAndSlotDiagnostics.test';
+import { runIndependentAuditSuite } from './independent-audit.test';
 
 async function main() {
   console.log('================================================================');
@@ -77,8 +78,12 @@ async function main() {
     await runLoadingUxTests();
 
     // 15. Deadline Bawaan Parser & Diagnosis Slot Penjadwalan Suite
-    console.log('\n>>> [15/15] Deadline Bawaan Parser & Diagnosis Slot Penjadwalan Suite...');
+    console.log('\n>>> [15/16] Deadline Bawaan Parser & Diagnosis Slot Penjadwalan Suite...');
     runDeadlineAndSlotDiagnosticsTests();
+
+    // 16. Independent Audit Suite (Manual Override, Deadline Contradiction, Cross-Layer Validation)
+    console.log('\n>>> [16/16] Independent Audit Suite (Manual Override & Contradictions)...');
+    await runIndependentAuditSuite();
 
     // Real Google Calendar Integration (Opt-in Check)
     console.log('\n>>> [Opsi] Pengujian Integrasi Google Calendar Nyata...');
