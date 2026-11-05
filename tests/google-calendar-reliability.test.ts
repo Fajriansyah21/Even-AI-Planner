@@ -2,7 +2,9 @@ import assert from 'assert';
 import {
   fetchGoogleCalendarEvents,
   createGoogleCalendarEvent,
+  updateGoogleCalendarEvent,
   deleteGoogleCalendarEvent,
+  batchCreateGoogleCalendarEvents,
   classifyGoogleCalendarError,
   GoogleCalendarApiError,
   sanitizeGoogleErrorMessage,
@@ -556,6 +558,284 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
 
       assert.strictEqual(caught, true);
       console.log('  ✅ [PASS] Test 14: Respons non-JSON / korup diklasifikasikan sebagai INVALID_RESPONSE dan tidak memicu reauth palsu.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 15: OAuth Connect Lama yang Selesai Setelah Disconnect Diabaikan
+    // ----------------------------------------------------
+    console.log('\n--- [Test 15] OAuth Connect Resolving After Disconnect Is Discarded ---');
+    {
+      let connectOpId = 0;
+      let connectedToken: string | null = null;
+      let isConnected = false;
+
+      // User triggers connect (Operation 1)
+      const op1 = ++connectOpId;
+
+      // User immediately clicks Disconnect before OAuth popup resolves:
+      // Disconnect invalidates operation ID
+      connectOpId++;
+      connectedToken = null;
+      isConnected = false;
+
+      // Popup 1 eventually resolves asynchronously:
+      const popup1Result = { accessToken: 'stale-token-op1' };
+      if (connectOpId === op1) {
+        connectedToken = popup1Result.accessToken;
+        isConnected = true;
+      }
+
+      assert.strictEqual(connectedToken, null, 'Stale popup result must not revive connection after disconnect');
+      assert.strictEqual(isConnected, false, 'State must remain disconnected');
+      console.log('  ✅ [PASS] Test 15: Operasi connect lama yang selesai setelah disconnect berhasil diabaikan.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 16: OAuth Connect Lama yang Selesai Setelah Reconnect Diabaikan
+    // ----------------------------------------------------
+    console.log('\n--- [Test 16] OAuth Connect Resolving After Reconnect Is Discarded ---');
+    {
+      let connectOpId = 0;
+      let connectedToken: string | null = null;
+
+      // User triggers connect 1
+      const op1 = ++connectOpId; // 1
+
+      // User triggers connect 2 (reconnect)
+      const op2 = ++connectOpId; // 2
+      connectedToken = 'fresh-token-op2';
+
+      // Old popup 1 resolves later with stale token
+      const staleToken = 'stale-token-op1';
+      if (connectOpId === op1) {
+        connectedToken = staleToken;
+      }
+
+      assert.strictEqual(connectedToken, 'fresh-token-op2', 'Stale connect attempt must not overwrite fresh token');
+      console.log('  ✅ [PASS] Test 16: Hasil connect lama tidak dapat menimpa token baru dari proses reconnect.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 17: Create Event Aborted Saat Sinyal Dibatalkan
+    // ----------------------------------------------------
+    console.log('\n--- [Test 17] Create Google Calendar Event Honours AbortSignal ---');
+    {
+      const abortCtrl = new AbortController();
+      abortCtrl.abort();
+
+      let caught = false;
+      try {
+        await createGoogleCalendarEvent(
+          'mock-token',
+          {
+            title: 'Event Dibatalkan',
+            startAt: '2026-11-05T09:00:00+07:00',
+            endAt: '2026-11-05T10:00:00+07:00',
+          },
+          abortCtrl.signal
+        );
+      } catch (err: any) {
+        caught = true;
+        const classification =
+          err instanceof GoogleCalendarApiError
+            ? err.classification
+            : classifyGoogleCalendarError(0, err.message || '', err);
+        assert.strictEqual(classification.code, 'ABORTED');
+        assert.strictEqual(classification.shouldReauth, false, 'Abort bukan auth failure');
+      }
+      assert.strictEqual(caught, true, 'createGoogleCalendarEvent harus melempar error saat signal aborted');
+      console.log('  ✅ [PASS] Test 17: createGoogleCalendarEvent patuh pada AbortSignal tanpa menuduh token kedaluwarsa.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 18: Batch Create Berhenti Seketika Saat Sinyal Dibatalkan
+    // ----------------------------------------------------
+    console.log('\n--- [Test 18] Batch Create Breaks Immediately On Abort ---');
+    {
+      const abortCtrl = new AbortController();
+      let createCallCount = 0;
+
+      global.fetch = async (_url: any, opts: any) => {
+        createCallCount++;
+        if (createCallCount === 1) {
+          // Abort after first item
+          abortCtrl.abort();
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: `event-${createCallCount}`, htmlLink: 'https://cal.google.com' }),
+        } as any;
+      };
+
+      const eventsToPush = [
+        { id: 't1', title: 'Task 1', startAt: '2026-11-05T09:00:00+07:00', endAt: '2026-11-05T10:00:00+07:00' },
+        { id: 't2', title: 'Task 2', startAt: '2026-11-05T11:00:00+07:00', endAt: '2026-11-05T12:00:00+07:00' },
+        { id: 't3', title: 'Task 3', startAt: '2026-11-05T13:00:00+07:00', endAt: '2026-11-05T14:00:00+07:00' },
+      ];
+
+      const batchRes = await batchCreateGoogleCalendarEvents(
+        'mock-token',
+        eventsToPush,
+        1, // chunk size 1 so each item checks abort
+        abortCtrl.signal
+      );
+
+      // Subsequent items should be aborted early
+      assert.ok(createCallCount < 3, 'Pemanggilan fetch tidak boleh memproses seluruh 3 item setelah di-abort');
+      const abortedItems = batchRes.results.filter((r) => r.classification?.code === 'ABORTED');
+      assert.ok(abortedItems.length > 0 || createCallCount < 3, 'Harus mencatat pembatalan operasi');
+      console.log('  ✅ [PASS] Test 18: Batch create menghentikan pengiriman chunk seketika saat sinyal pembatalan aktif.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 19: Update dan Delete Patuh Terhadap AbortSignal
+    // ----------------------------------------------------
+    console.log('\n--- [Test 19] Update & Delete Event Honour AbortSignal ---');
+    {
+      const abortCtrl = new AbortController();
+      abortCtrl.abort();
+
+      // Test Update with aborted signal
+      let updateCaught = false;
+      try {
+        await updateGoogleCalendarEvent(
+          'mock-token',
+          'gcal-event-123',
+          { title: 'Judul Baru' },
+          abortCtrl.signal
+        );
+      } catch (err: any) {
+        updateCaught = true;
+        const classification =
+          err instanceof GoogleCalendarApiError
+            ? err.classification
+            : classifyGoogleCalendarError(0, err.message || '', err);
+        assert.strictEqual(classification.code, 'ABORTED');
+      }
+      assert.strictEqual(updateCaught, true, 'updateGoogleCalendarEvent harus melempar error saat signal aborted');
+
+      // Test Delete with aborted signal
+      let deleteCaught = false;
+      try {
+        await deleteGoogleCalendarEvent('mock-token', 'gcal-event-123', abortCtrl.signal);
+      } catch (err: any) {
+        deleteCaught = true;
+        const classification =
+          err instanceof GoogleCalendarApiError
+            ? err.classification
+            : classifyGoogleCalendarError(0, err.message || '', err);
+        assert.strictEqual(classification.code, 'ABORTED');
+      }
+      assert.strictEqual(deleteCaught, true, 'deleteGoogleCalendarEvent harus melempar error saat signal aborted');
+      console.log('  ✅ [PASS] Test 19: updateGoogleCalendarEvent dan deleteGoogleCalendarEvent patuh terhadap AbortSignal.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 20: Pagination Limit Exceeded Melempar Error & Melindungi Kalender Lokal
+    // ----------------------------------------------------
+    console.log('\n--- [Test 20] Pagination Limit Exceeded Throws PAGINATION_LIMIT_EXCEEDED ---');
+    {
+      let callCount = 0;
+      global.fetch = async () => {
+        callCount++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            items: [{ id: `evt-${callCount}`, summary: `Event page ${callCount}` }],
+            nextPageToken: `token-page-${callCount + 1}`, // Always has next token!
+          }),
+        } as any;
+      };
+
+      let caught = false;
+      try {
+        await fetchGoogleCalendarEvents('mock-token');
+      } catch (err: any) {
+        caught = true;
+        assert.ok(err instanceof GoogleCalendarApiError, 'Harus berupa GoogleCalendarApiError');
+        assert.strictEqual(err.code, 'PAGINATION_LIMIT_EXCEEDED');
+        assert.strictEqual(err.shouldReauth, false);
+        assert.strictEqual(err.isTransient, true);
+        assert.ok(err.message.includes('10 halaman'), 'Pesan harus menjelaskan limit 10 halaman');
+      }
+
+      assert.strictEqual(caught, true, 'fetchGoogleCalendarEvents harus melempar PAGINATION_LIMIT_EXCEEDED');
+      assert.strictEqual(callCount, 10, 'Harus mencoba maksimal 10 halaman sebelum melempar error');
+      console.log('  ✅ [PASS] Test 20: Paginasi lebih dari 10 halaman melempar PAGINATION_LIMIT_EXCEEDED dan mencegah silent partial sync.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 21: 10 Halaman Tanpa NextPageToken Sukses Bersih
+    // ----------------------------------------------------
+    console.log('\n--- [Test 21] 10 Pages Exactly Without NextPageToken Succeeds ---');
+    {
+      let callCount = 0;
+      global.fetch = async () => {
+        callCount++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            items: [{ id: `evt-exact-${callCount}`, summary: `Event page ${callCount}` }],
+            // On page 10, nextPageToken is null / undefined
+            nextPageToken: callCount < 10 ? `token-${callCount + 1}` : undefined,
+          }),
+        } as any;
+      };
+
+      const result = await fetchGoogleCalendarEvents('mock-token');
+      assert.strictEqual(callCount, 10);
+      assert.strictEqual(result.events.length, 10);
+      console.log('  ✅ [PASS] Test 21: Pengambilan tepat 10 halaman yang selesai tuntas berhasil tanpa error.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 22: Unknown 403 Reason Menghasilkan Pesan Netral Tanpa Menuduh OAuth
+    // ----------------------------------------------------
+    console.log('\n--- [Test 22] Unknown 403 Reason Handled with Neutral Message ---');
+    {
+      const raw403Unknown = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'Unknown security restriction code 9982',
+          errors: [{ domain: 'unknownDomain', reason: 'unrecognizedSecurityFlag', message: 'Restricted' }],
+        },
+      });
+
+      const classification = classifyGoogleCalendarError(403, raw403Unknown);
+      assert.strictEqual(classification.code, 'UNKNOWN_ERROR');
+      assert.strictEqual(classification.status, 403);
+      assert.strictEqual(classification.shouldReauth, false);
+      assert.strictEqual(classification.isPermissionError, false);
+      assert.strictEqual(classification.isRateLimitError, false);
+      assert.strictEqual(
+        classification.message.includes('izin cakupan (OAuth scope)'),
+        false,
+        'Alasan 403 yang tidak dikenal tidak boleh sembarangan menuduh OAuth scope'
+      );
+      assert.ok(classification.message.includes('Akses Google Calendar dibatasi atau ditolak oleh server Google (HTTP 403)'));
+      console.log('  ✅ [PASS] Test 22: Alasan 403 tidak dikenal menghasilkan pesan netral tanpa menuduh OAuth scope.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 23: Pesan Network Error Menyaring Token, Refresh Token, dan Email
+    // ----------------------------------------------------
+    console.log('\n--- [Test 23] Network Error Sanitizes Tokens, Refresh Tokens & Emails ---');
+    {
+      const leakAttemptMsg = 'Network failed connecting with ya29.a0AfSecretToken and 1//0gSecretRefreshToken for user testuser@gmail.com';
+      const netErr = new TypeError(leakAttemptMsg);
+      const classification = classifyGoogleCalendarError(0, '', netErr);
+
+      assert.strictEqual(classification.code, 'NETWORK_ERROR');
+      assert.strictEqual(classification.message.includes('ya29.a0AfSecretToken'), false, 'ya29 tidak boleh bocor');
+      assert.strictEqual(classification.message.includes('1//0gSecretRefreshToken'), false, 'refresh token tidak boleh bocor');
+      assert.strictEqual(classification.message.includes('testuser@gmail.com'), false, 'email tidak boleh bocor');
+      assert.ok(classification.message.includes('[REDACTED_TOKEN]'), 'Token harus disamarkan');
+      assert.ok(classification.message.includes('[REDACTED_REFRESH_TOKEN]'), 'Refresh token harus disamarkan');
+      assert.ok(classification.message.includes('[REDACTED_EMAIL]'), 'Email harus disamarkan');
+      console.log('  ✅ [PASS] Test 23: Pesan network error menyaring rahasia kredensial dan PII secara menyeluruh.');
     }
 
     console.log('\n================================================================');

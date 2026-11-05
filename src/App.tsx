@@ -118,6 +118,8 @@ export default function App() {
   // Sync state & request race-condition guard
   const syncRequestIdRef = useRef<number>(0);
   const activeAbortControllerRef = useRef<AbortController | null>(null);
+  const connectOperationIdRef = useRef<number>(0);
+  const calendarPushAbortControllerRef = useRef<AbortController | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [diagnosticInfo, setDiagnosticInfo] = useState<CalendarDiagnosticInfo>({
@@ -288,14 +290,23 @@ export default function App() {
   };
 
   const handleConnectCalendar = async () => {
-    // Invalidate and abort any ongoing background syncs
+    // Invalidate and abort any ongoing background syncs and calendar pushes
+    const currentConnectOpId = ++connectOperationIdRef.current;
     syncRequestIdRef.current++;
     activeAbortControllerRef.current?.abort();
     activeAbortControllerRef.current = null;
+    calendarPushAbortControllerRef.current?.abort();
+    calendarPushAbortControllerRef.current = null;
 
     setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'connecting', lastErrorMessage: undefined }));
     try {
       const res = await googleSignIn();
+
+      // Guard: If disconnect was called or a newer connect was triggered while popup was open, discard result
+      if (connectOperationIdRef.current !== currentConnectOpId) {
+        return;
+      }
+
       if (res && res.accessToken) {
         setCachedAccessToken(res.accessToken);
         setHasGoogleAccessToken(true);
@@ -318,6 +329,11 @@ export default function App() {
         await handleSyncCalendar(res.accessToken);
       }
     } catch (err: any) {
+      // Guard: If disconnect was called or a newer connect was triggered, ignore errors from outdated connect
+      if (connectOperationIdRef.current !== currentConnectOpId) {
+        return;
+      }
+
       if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
         setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'unconnected' }));
         showToast('Penghubungan Google Calendar dibatalkan.', 'info');
@@ -334,10 +350,13 @@ export default function App() {
   };
 
   const handleDisconnectCalendar = () => {
-    // Invalidate and abort any ongoing sync requests
+    // Invalidate and abort any ongoing connect, sync, or calendar push operations
+    connectOperationIdRef.current++;
     syncRequestIdRef.current++;
     activeAbortControllerRef.current?.abort();
     activeAbortControllerRef.current = null;
+    calendarPushAbortControllerRef.current?.abort();
+    calendarPushAbortControllerRef.current = null;
 
     setCachedAccessToken(null);
     setHasGoogleAccessToken(false);
@@ -874,22 +893,36 @@ export default function App() {
     }
 
     // Live Google Calendar push
+    calendarPushAbortControllerRef.current?.abort();
+    const pushAbortController = new AbortController();
+    calendarPushAbortControllerRef.current = pushAbortController;
+
     let successCount = 0;
     let unconfirmedCount = 0;
     let failCount = 0;
     let hasEncounteredAuthError = false;
+    let wasAborted = false;
     const updatedSessions: TaskScheduleSession[] = [];
     const newCalendarEvents: CalendarEvent[] = [];
 
     for (const sess of initialSessions) {
+      if (pushAbortController.signal.aborted) {
+        wasAborted = true;
+        break;
+      }
+
       try {
-        const created = await createGoogleCalendarEvent(token, {
-          title: `[EVEN] ${sess.taskTitle}`,
-          description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
-          startAt: sess.startAt,
-          endAt: sess.endAt,
-          timezone: preferences.timezone,
-        });
+        const created = await createGoogleCalendarEvent(
+          token,
+          {
+            title: `[EVEN] ${sess.taskTitle}`,
+            description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
+            startAt: sess.startAt,
+            endAt: sess.endAt,
+            timezone: preferences.timezone,
+          },
+          pushAbortController.signal
+        );
 
         const syncedSess = {
           ...sess,
@@ -912,11 +945,22 @@ export default function App() {
         });
         successCount++;
       } catch (err: any) {
-        console.error('Single schedule Google push error:', sanitizeSensitiveText(err.message || ''));
         const classification =
           err instanceof GoogleCalendarApiError
             ? err.classification
             : classifyGoogleCalendarError(0, err.message || '', err);
+
+        // Aborted request: break immediately, preserve local data, NEVER mark as auth failure
+        if (pushAbortController.signal.aborted || classification.code === 'ABORTED') {
+          wasAborted = true;
+          updatedSessions.push({
+            ...sess,
+            syncStatus: 'pending' as const,
+          });
+          break;
+        }
+
+        console.error('Single schedule Google push error:', sanitizeSensitiveText(err.message || ''));
 
         if (classification.isAuthError) {
           hasEncounteredAuthError = true;
@@ -930,6 +974,17 @@ export default function App() {
         updatedSessions.push({
           ...sess,
           syncStatus: 'failed' as const,
+        });
+      }
+    }
+
+    // Append remaining sessions if aborted mid-way, so local data is 100% complete
+    if (wasAborted && updatedSessions.length < initialSessions.length) {
+      const processedCount = updatedSessions.length;
+      for (let i = processedCount; i < initialSessions.length; i++) {
+        updatedSessions.push({
+          ...initialSessions[i],
+          syncStatus: 'pending' as const,
         });
       }
     }
@@ -983,7 +1038,13 @@ export default function App() {
       setEvents((prev) => [...prev, ...newCalendarEvents]);
     }
 
-    if (successCount === initialSessions.length) {
+    if (wasAborted) {
+      if (successCount > 0) {
+        showToast(`Kegiatan "${res.taskTitle}": ${successCount} sesi tersimpan ke Google Calendar sebelum dibatalkan. Sisa sesi disimpan secara lokal.`, 'info');
+      } else {
+        showToast(`Kegiatan "${res.taskTitle}" disimpan secara lokal; pengiriman ke Google Calendar dibatalkan.`, 'info');
+      }
+    } else if (successCount === initialSessions.length) {
       showToast(`Kegiatan "${res.taskTitle}" dijadwalkan dan disimpan ke Google Calendar Anda!`, 'success');
     } else if (successCount > 0) {
       showToast(`Kegiatan "${res.taskTitle}": ${successCount} dari ${initialSessions.length} sesi tersimpan ke Google Calendar, sebagian gagal.`, 'info');
@@ -1083,22 +1144,36 @@ export default function App() {
     }
 
     // Google Calendar active write
+    calendarPushAbortControllerRef.current?.abort();
+    const pushAbortController = new AbortController();
+    calendarPushAbortControllerRef.current = pushAbortController;
+
     let successCount = 0;
     let failCount = 0;
     let unconfirmedCount = 0;
     let hasEncounteredAuthError = false;
+    let wasAborted = false;
     const updatedSessions: TaskScheduleSession[] = [];
     const newCalendarEvents: CalendarEvent[] = [];
 
     for (const sess of initialSessions) {
+      if (pushAbortController.signal.aborted) {
+        wasAborted = true;
+        break;
+      }
+
       try {
-        const created = await createGoogleCalendarEvent(token, {
-          title: `[EVEN] ${sess.taskTitle}`,
-          description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
-          startAt: sess.startAt,
-          endAt: sess.endAt,
-          timezone: plan.timezone || preferences.timezone,
-        });
+        const created = await createGoogleCalendarEvent(
+          token,
+          {
+            title: `[EVEN] ${sess.taskTitle}`,
+            description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
+            startAt: sess.startAt,
+            endAt: sess.endAt,
+            timezone: plan.timezone || preferences.timezone,
+          },
+          pushAbortController.signal
+        );
 
         updatedSessions.push({
           ...sess,
@@ -1121,11 +1196,22 @@ export default function App() {
         });
         successCount++;
       } catch (err: any) {
-        console.error('AI Calendar event push error:', sanitizeSensitiveText(err.message || ''));
         const classification =
           err instanceof GoogleCalendarApiError
             ? err.classification
             : classifyGoogleCalendarError(0, err.message || '', err);
+
+        // Aborted request: break immediately, preserve local data, NEVER mark as auth failure
+        if (pushAbortController.signal.aborted || classification.code === 'ABORTED') {
+          wasAborted = true;
+          updatedSessions.push({
+            ...sess,
+            syncStatus: 'pending' as const,
+          });
+          break;
+        }
+
+        console.error('AI Calendar event push error:', sanitizeSensitiveText(err.message || ''));
 
         if (classification.isAuthError) {
           hasEncounteredAuthError = true;
@@ -1139,6 +1225,17 @@ export default function App() {
         updatedSessions.push({
           ...sess,
           syncStatus: 'failed' as const,
+        });
+      }
+    }
+
+    // Append remaining sessions if aborted mid-way, so local data is 100% complete
+    if (wasAborted && updatedSessions.length < initialSessions.length) {
+      const processedCount = updatedSessions.length;
+      for (let i = processedCount; i < initialSessions.length; i++) {
+        updatedSessions.push({
+          ...initialSessions[i],
+          syncStatus: 'pending' as const,
         });
       }
     }
@@ -1206,7 +1303,13 @@ export default function App() {
       setEvents((prev) => [...prev, ...newCalendarEvents]);
     }
 
-    if (successCount === initialSessions.length) {
+    if (wasAborted) {
+      if (successCount > 0) {
+        showToast(`Rencana "${plan.title}": ${successCount} sesi tersimpan ke Google Calendar sebelum dibatalkan. Sesi tersisa disimpan lokal.`, 'info');
+      } else {
+        showToast(`Rencana "${plan.title}" disimpan secara lokal; pengiriman ke Google Calendar dibatalkan.`, 'info');
+      }
+    } else if (successCount === initialSessions.length) {
       showToast(`Rencana "${plan.title}" berhasil disimpan dan disinkronkan ke Google Calendar!`, 'success');
     } else if (successCount > 0) {
       showToast(`Rencana "${plan.title}": ${successCount} dari ${initialSessions.length} sesi berhasil disimpan ke Google Calendar, beberapa sesi gagal.`, 'info');
