@@ -57,6 +57,7 @@ import {
   deleteGoogleCalendarEvent,
   GoogleCalendarApiError,
   classifyGoogleCalendarError,
+  sanitizeSensitiveText,
 } from './lib/googleCalendar';
 import {
   getInitialKeepNotes,
@@ -116,6 +117,7 @@ export default function App() {
 
   // Sync state & request race-condition guard
   const syncRequestIdRef = useRef<number>(0);
+  const activeAbortControllerRef = useRef<AbortController | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [diagnosticInfo, setDiagnosticInfo] = useState<CalendarDiagnosticInfo>({
@@ -286,8 +288,11 @@ export default function App() {
   };
 
   const handleConnectCalendar = async () => {
-    // Invalidate any ongoing background syncs
+    // Invalidate and abort any ongoing background syncs
     syncRequestIdRef.current++;
+    activeAbortControllerRef.current?.abort();
+    activeAbortControllerRef.current = null;
+
     setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'connecting', lastErrorMessage: undefined }));
     try {
       const res = await googleSignIn();
@@ -329,8 +334,11 @@ export default function App() {
   };
 
   const handleDisconnectCalendar = () => {
-    // Invalidate any ongoing sync requests
+    // Invalidate and abort any ongoing sync requests
     syncRequestIdRef.current++;
+    activeAbortControllerRef.current?.abort();
+    activeAbortControllerRef.current = null;
+
     setCachedAccessToken(null);
     setHasGoogleAccessToken(false);
     setPreferences((prev) => ({
@@ -348,6 +356,11 @@ export default function App() {
 
   // Google Calendar Sync with race-condition resilience and classified error handling
   const handleSyncCalendar = async (tokenOverride?: string) => {
+    // Abort previous sync request if still in flight
+    activeAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    activeAbortControllerRef.current = abortController;
+
     const currentRequestId = ++syncRequestIdRef.current;
     setIsSyncing(true);
     setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'syncing' }));
@@ -370,17 +383,24 @@ export default function App() {
     }
 
     try {
-      const { events: liveGoogleEvents, rangeStart, rangeEnd } = await fetchGoogleCalendarEvents(token);
+      const { events: liveGoogleEvents, rangeStart, rangeEnd } = await fetchGoogleCalendarEvents(
+        token,
+        undefined,
+        undefined,
+        abortController.signal
+      );
 
       // Race-condition guard: ignore result if another connect/sync request was triggered in the meantime
       if (syncRequestIdRef.current !== currentRequestId) {
         return;
       }
 
-      // Safe merge: Never discard internal task sessions or user tasks
+      // Safe merge: Never discard internal task sessions or user tasks; deduplicate if ID collision occurs
       setEvents((prev) => {
         const internalEvents = prev.filter((e) => e.provider !== 'google');
-        return [...liveGoogleEvents, ...internalEvents];
+        const remoteIds = new Set(liveGoogleEvents.map((e) => e.id));
+        const safeInternal = internalEvents.filter((e) => !remoteIds.has(e.id));
+        return [...liveGoogleEvents, ...safeInternal];
       });
 
       const updatedTime = new Date().toISOString();
@@ -418,11 +438,17 @@ export default function App() {
         return;
       }
 
-      console.error('Calendar sync error:', err.message);
       const classification =
         err instanceof GoogleCalendarApiError
           ? err.classification
           : classifyGoogleCalendarError(0, err.message || '', err);
+
+      // AbortError semantics: if request was deliberately cancelled or replaced, exit cleanly
+      if (classification.code === 'ABORTED') {
+        return;
+      }
+
+      console.error('Calendar sync error:', sanitizeSensitiveText(err.message || ''));
 
       const isAuthError = classification.isAuthError;
       const nextStatus: ConnectionStatusType = isAuthError ? 'needs_reauth' : 'sync_failed';
@@ -886,7 +912,7 @@ export default function App() {
         });
         successCount++;
       } catch (err: any) {
-        console.error('Single schedule Google push error:', err.message);
+        console.error('Single schedule Google push error:', sanitizeSensitiveText(err.message || ''));
         const classification =
           err instanceof GoogleCalendarApiError
             ? err.classification
@@ -1095,7 +1121,7 @@ export default function App() {
         });
         successCount++;
       } catch (err: any) {
-        console.error('AI Calendar event push error:', err.message);
+        console.error('AI Calendar event push error:', sanitizeSensitiveText(err.message || ''));
         const classification =
           err instanceof GoogleCalendarApiError
             ? err.classification

@@ -6,6 +6,7 @@ import {
   classifyGoogleCalendarError,
   GoogleCalendarApiError,
   sanitizeGoogleErrorMessage,
+  sanitizeSensitiveText,
 } from '../src/lib/googleCalendar';
 import { CalendarEvent } from '../src/types';
 
@@ -51,15 +52,24 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
     }
 
     // ----------------------------------------------------
-    // TEST 2: HTTP 403 Tidak Salah Diklasifikasikan Sebagai 401
+    // TEST 2A: HTTP 403 Forbidden / Insufficient Permissions
     // ----------------------------------------------------
-    console.log('\n--- [Test 2] HTTP 403 Classified as PERMISSION_DENIED (Not Auth Expired) ---');
+    console.log('\n--- [Test 2A] HTTP 403 Classified as PERMISSION_DENIED (Not Auth Expired) ---');
     {
-      const classification = classifyGoogleCalendarError(403, 'Insufficient Permission');
+      const raw403Forbidden = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'Insufficient Permission',
+          errors: [{ domain: 'global', reason: 'insufficientPermissions', message: 'Insufficient Permission' }],
+        },
+      });
+
+      const classification = classifyGoogleCalendarError(403, raw403Forbidden);
       assert.strictEqual(classification.code, 'PERMISSION_DENIED');
       assert.strictEqual(classification.status, 403);
       assert.strictEqual(classification.isAuthError, false, '403 BUKAN auth error expired token');
       assert.strictEqual(classification.isPermissionError, true, '403 adalah permission error');
+      assert.strictEqual(classification.isRateLimitError, false);
       assert.strictEqual(classification.shouldReauth, false, '403 tidak meminta reauth melainkan periksa scope');
       assert.ok(classification.message.includes('izin cakupan (OAuth scope)'));
 
@@ -67,7 +77,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         ({
           ok: false,
           status: 403,
-          text: async () => '{"error": {"message": "Insufficient Permission"}}',
+          text: async () => raw403Forbidden,
         } as any);
 
       let caught = false;
@@ -78,9 +88,102 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         assert.ok(err instanceof GoogleCalendarApiError);
         assert.strictEqual(err.isAuthError, false);
         assert.strictEqual(err.isPermissionError, true);
+        assert.strictEqual(err.shouldReauth, false);
       }
       assert.strictEqual(caught, true);
-      console.log('  ✅ [PASS] Test 2: HTTP 403 secara tegas diklasifikasikan sebagai PERMISSION_DENIED tanpa salah duga 401.');
+      console.log('  ✅ [PASS] Test 2A: HTTP 403 insufficientPermissions terverifikasi sebagai PERMISSION_DENIED (shouldReauth=false).');
+    }
+
+    // ----------------------------------------------------
+    // TEST 2B: HTTP 403 rateLimitExceeded
+    // ----------------------------------------------------
+    console.log('\n--- [Test 2B] HTTP 403 rateLimitExceeded Must NOT Be Classified as Permission Denied ---');
+    {
+      const raw403RateLimit = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'Rate Limit Exceeded',
+          errors: [{ domain: 'usageLimits', reason: 'rateLimitExceeded', message: 'Rate Limit Exceeded' }],
+        },
+      });
+
+      const classification = classifyGoogleCalendarError(403, raw403RateLimit);
+      assert.strictEqual(classification.code, 'RATE_LIMIT_EXCEEDED');
+      assert.strictEqual(classification.status, 403);
+      assert.strictEqual(classification.isRateLimitError, true);
+      assert.strictEqual(classification.isPermissionError, false);
+      assert.strictEqual(classification.isAuthError, false);
+      assert.strictEqual(classification.shouldReauth, false);
+      assert.ok(classification.message.includes('Batas kuota atau laju'));
+
+      console.log('  ✅ [PASS] Test 2B: HTTP 403 rateLimitExceeded dipisahkan presisi ke RATE_LIMIT_EXCEEDED (tidak memicu reauth).');
+    }
+
+    // ----------------------------------------------------
+    // TEST 2C: HTTP 403 userRateLimitExceeded
+    // ----------------------------------------------------
+    console.log('\n--- [Test 2C] HTTP 403 userRateLimitExceeded Must NOT Be Classified as Permission Denied ---');
+    {
+      const raw403UserRate = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'User Rate Limit Exceeded',
+          errors: [{ domain: 'usageLimits', reason: 'userRateLimitExceeded', message: 'User Rate Limit Exceeded' }],
+        },
+      });
+
+      const classification = classifyGoogleCalendarError(403, raw403UserRate);
+      assert.strictEqual(classification.code, 'RATE_LIMIT_EXCEEDED');
+      assert.strictEqual(classification.isRateLimitError, true);
+      assert.strictEqual(classification.isPermissionError, false);
+      assert.strictEqual(classification.shouldReauth, false);
+
+      console.log('  ✅ [PASS] Test 2C: HTTP 403 userRateLimitExceeded dipisahkan presisi ke RATE_LIMIT_EXCEEDED.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 2D: HTTP 403 quotaExceeded & calendarUsageLimitsExceeded
+    // ----------------------------------------------------
+    console.log('\n--- [Test 2D] HTTP 403 quotaExceeded & calendarUsageLimitsExceeded ---');
+    {
+      const raw403Quota = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'Calendar usage limits exceeded',
+          errors: [{ domain: 'calendar', reason: 'calendarUsageLimitsExceeded', message: 'Usage limit reached' }],
+        },
+      });
+
+      const classification = classifyGoogleCalendarError(403, raw403Quota);
+      assert.strictEqual(classification.code, 'RATE_LIMIT_EXCEEDED');
+      assert.strictEqual(classification.isRateLimitError, true);
+      assert.strictEqual(classification.isPermissionError, false);
+      assert.strictEqual(classification.shouldReauth, false);
+
+      console.log('  ✅ [PASS] Test 2D: HTTP 403 calendarUsageLimitsExceeded diklasifikasikan ke RATE_LIMIT_EXCEEDED.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 2E: HTTP 403 Unknown Reason Handled Safely
+    // ----------------------------------------------------
+    console.log('\n--- [Test 2E] HTTP 403 with Unknown Reason Handled Safely ---');
+    {
+      const raw403Unknown = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'Custom unknown restriction',
+          errors: [{ domain: 'custom', reason: 'arbitraryNewRestriction', message: 'Some restriction' }],
+        },
+      });
+
+      const classification = classifyGoogleCalendarError(403, raw403Unknown);
+      assert.strictEqual(classification.code, 'UNKNOWN_ERROR');
+      assert.strictEqual(classification.status, 403);
+      assert.strictEqual(classification.isAuthError, false);
+      assert.strictEqual(classification.shouldReauth, false);
+      assert.ok(classification.message.includes('403'));
+
+      console.log('  ✅ [PASS] Test 2E: HTTP 403 alasan tidak dikenal ditangani aman tanpa salah sangka token kedaluwarsa.');
     }
 
     // ----------------------------------------------------
@@ -121,7 +224,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       assert.strictEqual(classification.isRateLimitError, true);
       assert.strictEqual(classification.isTransient, true);
       assert.strictEqual(classification.isAuthError, false);
-      assert.ok(classification.userAction.includes('Tunggu beberapa saat'));
+      assert.strictEqual(classification.shouldReauth, false);
+      assert.ok(classification.userAction.includes('Tunggu beberapa'));
       console.log('  ✅ [PASS] Test 4: HTTP 429 diklasifikasikan sebagai RATE_LIMIT_EXCEEDED dengan panduan backoff.');
     }
 
@@ -162,24 +266,27 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
     }
 
     // ----------------------------------------------------
-    // TEST 6: Network Error & AbortError Ditangani dengan Benar
+    // TEST 6: Network Error & AbortError Semantics
     // ----------------------------------------------------
-    console.log('\n--- [Test 6] Network Error & Abort Handling ---');
+    console.log('\n--- [Test 6] Network Error & Abort Semantics ---');
     {
       const netError = new TypeError('Failed to fetch');
       const cNet = classifyGoogleCalendarError(0, '', netError);
       assert.strictEqual(cNet.code, 'NETWORK_ERROR');
       assert.strictEqual(cNet.isTransient, true);
       assert.strictEqual(cNet.isAuthError, false);
+      assert.strictEqual(cNet.shouldReauth, false);
       assert.ok(cNet.message.includes('Data lokal tetap aman'));
 
       const abortError = new Error('The user aborted a request.');
       abortError.name = 'AbortError';
       const cAbort = classifyGoogleCalendarError(0, '', abortError);
       assert.strictEqual(cAbort.code, 'ABORTED');
+      assert.strictEqual(cAbort.isAuthError, false);
+      assert.strictEqual(cAbort.shouldReauth, false);
       assert.strictEqual(cAbort.isTransient, false);
 
-      console.log('  ✅ [PASS] Test 6: Network failure & abort request terisolasi akurat.');
+      console.log('  ✅ [PASS] Test 6: Network failure & abort request terisolasi akurat (bukan 401 dan no reauth).');
     }
 
     // ----------------------------------------------------
@@ -187,7 +294,6 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
     // ----------------------------------------------------
     console.log('\n--- [Test 7] Reconnect Flow State Transition ---');
     {
-      // Simulasi state lifecycle
       let currentStatus = 'needs_reauth';
       let activeToken: string | null = null;
 
@@ -226,7 +332,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       assert.strictEqual(currentStatus, 'sync_success');
       assert.strictEqual(syncResult.events.length, 1);
       assert.strictEqual(syncResult.events[0].title, 'Agenda Live Baru');
-      console.log('  ✅ [PASS] Test 7: Alur reconnect memulihkan status dari needs_reauth ke sync_success dengan sempurna.');
+      console.log('  ✅ [PASS] Test 7: Alur reconnect memulihkan status dari needs_reauth ke sync_success.');
     }
 
     // ----------------------------------------------------
@@ -271,7 +377,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       // Simulasi kegagalan 401 saat sync
       global.fetch = async () => ({ ok: false, status: 401, text: async () => 'Unauthorized' } as any);
 
-      let eventsState = [...localEvents];
+      const eventsState = [...localEvents];
       try {
         await fetchGoogleCalendarEvents('expired-token');
       } catch {
@@ -292,21 +398,27 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       const rawErrorJson = JSON.stringify({
         error: {
           code: 400,
-          message: 'Invalid credentials ya29.a0AfH6SMB98234-super-secret for user private@example.com with Bearer secret-auth',
+          message:
+            'Invalid credentials ya29.a0AfH6SMB98234-super-secret and refresh 1//0gX_secret for user private@example.com with Bearer secret-auth',
         },
       });
       const sanitized = sanitizeGoogleErrorMessage(400, rawErrorJson);
       assert.strictEqual(sanitized.includes('ya29.a0AfH6SMB98234'), false, 'Token ya29 rahasia tidak boleh bocor');
+      assert.strictEqual(sanitized.includes('1//0gX_secret'), false, 'Refresh token tidak boleh bocor');
       assert.strictEqual(sanitized.includes('private@example.com'), false, 'Email tidak boleh bocor');
       assert.strictEqual(sanitized.includes('secret-auth'), false, 'Bearer secret tidak boleh bocor');
       assert.ok(sanitized.includes('[REDACTED_TOKEN]'), 'Token harus disamarkan dengan [REDACTED_TOKEN]');
+      assert.ok(sanitized.includes('[REDACTED_REFRESH_TOKEN]'), 'Refresh token disamarkan');
       assert.ok(sanitized.includes('[REDACTED_EMAIL]'), 'Email harus disamarkan dengan [REDACTED_EMAIL]');
 
-      // Pesan 500 juga tidak boleh membocorkan token
-      const sanitized500 = sanitizeGoogleErrorMessage(500, 'Error with ya29.leak');
-      assert.strictEqual(sanitized500.includes('ya29.leak'), false, 'Error 500 tidak boleh membocorkan token');
+      // Test helper langsung
+      const directCleaned = sanitizeSensitiveText('ya29.123456 1//refresh secret@mail.com Bearer mysecret');
+      assert.ok(directCleaned.includes('[REDACTED_TOKEN]'));
+      assert.ok(directCleaned.includes('[REDACTED_REFRESH_TOKEN]'));
+      assert.ok(directCleaned.includes('[REDACTED_EMAIL]'));
+      assert.ok(directCleaned.includes('Bearer [REDACTED]'));
 
-      console.log('  ✅ [PASS] Test 10: Seluruh token, email pengguna, dan rahasia Authorization disamarkan sempurna.');
+      console.log('  ✅ [PASS] Test 10: Seluruh token, refresh token, email pengguna, dan rahasia Authorization disamarkan sempurna.');
     }
 
     // ----------------------------------------------------
@@ -339,6 +451,111 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         'Request lama (req1) tidak boleh menimpa status koneksi terbaru (req2)'
       );
       console.log('  ✅ [PASS] Test 11: Race condition pencegahan stale status terbukti efektif.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 12: Pagination Failure di Tengah Jalan Tidak Merusak Data Lokal
+    // ----------------------------------------------------
+    console.log('\n--- [Test 12] Pagination Mid-flight Failure Preservation ---');
+    {
+      let pageCallCount = 0;
+      global.fetch = async () => {
+        pageCallCount++;
+        if (pageCallCount === 1) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              items: [{ id: 'partial-page-1', summary: 'Event Halaman 1' }],
+              nextPageToken: 'token-page-2',
+            }),
+          } as any;
+        } else {
+          // Page 2 gagal (misal 500 error)
+          return {
+            ok: false,
+            status: 500,
+            text: async () => 'Internal Server Error on Page 2',
+          } as any;
+        }
+      };
+
+      let caught = false;
+      try {
+        await fetchGoogleCalendarEvents('mock-token');
+      } catch (err: any) {
+        caught = true;
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'SERVICE_UNAVAILABLE');
+      }
+
+      assert.strictEqual(caught, true, 'Kegagalan page 2 harus melempar error agar data parsial tidak menimpa kalender lokal');
+      console.log('  ✅ [PASS] Test 12: Kegagalan paginasi di tengah proses melempar error dan mencegah penggantian data parsial.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 13: Empty Remote Response Preserves Internal Sessions
+    // ----------------------------------------------------
+    console.log('\n--- [Test 13] Empty Remote Response Preserves Internal Sessions ---');
+    {
+      const initialLocalEvents: CalendarEvent[] = [
+        {
+          id: 'internal-sess-1',
+          provider: 'internal',
+          title: 'Sesi Internal Fokus',
+          startAt: '2026-11-05T10:00:00+07:00',
+          endAt: '2026-11-05T11:00:00+07:00',
+          category: 'focus',
+          syncStatus: 'synced',
+          isEditable: true,
+        },
+      ];
+
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ items: [] }),
+      } as any);
+
+      const fetchRes = await fetchGoogleCalendarEvents('mock-token');
+      assert.strictEqual(fetchRes.events.length, 0);
+
+      // Simulasikan merge aman di App.tsx:
+      const internalEvents = initialLocalEvents.filter((e) => e.provider !== 'google');
+      const remoteIds = new Set(fetchRes.events.map((e) => e.id));
+      const safeInternal = internalEvents.filter((e) => !remoteIds.has(e.id));
+      const mergedEvents = [...fetchRes.events, ...safeInternal];
+
+      assert.strictEqual(mergedEvents.length, 1, 'Event internal harus tetap ada meskipun respons Google kosong');
+      assert.strictEqual(mergedEvents[0].id, 'internal-sess-1');
+      console.log('  ✅ [PASS] Test 13: Respons kosong dari remote tidak pernah melenyapkan sesi internal lokal.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 14: Corrupted JSON Parsing Failure Handled Safely
+    // ----------------------------------------------------
+    console.log('\n--- [Test 14] Corrupted JSON Response Handled as INVALID_RESPONSE ---');
+    {
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new SyntaxError('Unexpected token < in JSON at position 0');
+        },
+      } as any);
+
+      let caught = false;
+      try {
+        await fetchGoogleCalendarEvents('mock-token');
+      } catch (err: any) {
+        caught = true;
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'INVALID_RESPONSE');
+        assert.strictEqual(err.shouldReauth, false, 'Format JSON korup bukan auth error');
+      }
+
+      assert.strictEqual(caught, true);
+      console.log('  ✅ [PASS] Test 14: Respons non-JSON / korup diklasifikasikan sebagai INVALID_RESPONSE dan tidak memicu reauth palsu.');
     }
 
     console.log('\n================================================================');

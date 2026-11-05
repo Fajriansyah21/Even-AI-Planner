@@ -100,6 +100,18 @@ export class GoogleCalendarApiError extends Error {
 }
 
 /**
+ * Sanitizes any text to prevent access tokens, refresh tokens, Bearer headers, or PII from leaking.
+ */
+export function sanitizeSensitiveText(text: string): string {
+  if (!text) return '';
+  return String(text)
+    .replace(/ya29\.[a-zA-Z0-9_-]+/g, '[REDACTED_TOKEN]')
+    .replace(/1\/\/[a-zA-Z0-9_-]+/g, '[REDACTED_REFRESH_TOKEN]')
+    .replace(/Bearer\s+[^\s]+/gi, 'Bearer [REDACTED]')
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[REDACTED_EMAIL]');
+}
+
+/**
  * Sanitizes error messages to prevent access tokens, bearer headers, or PII from leaking.
  */
 export function sanitizeGoogleErrorMessage(status: number, rawText: string): string {
@@ -107,6 +119,9 @@ export function sanitizeGoogleErrorMessage(status: number, rawText: string): str
     return 'Token Google Calendar kedaluwarsa atau tidak valid (HTTP 401). Silakan putuskan dan sambungkan kembali akun Google Anda di Pengaturan.';
   }
   if (status === 403) {
+    if (/userRateLimitExceeded|rateLimitExceeded|quotaExceeded|calendarUsageLimitsExceeded/i.test(rawText)) {
+      return 'Batas kuota atau laju panggilan Google Calendar terlampaui (HTTP 403). Mohon tunggu beberapa saat sebelum mencoba kembali.';
+    }
     return 'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.';
   }
   if (status === 404) {
@@ -115,19 +130,20 @@ export function sanitizeGoogleErrorMessage(status: number, rawText: string): str
   if (status === 429) {
     return 'Batas panggilan API Google Calendar terlampaui (HTTP 429). Mohon tunggu beberapa saat sebelum mencoba kembali.';
   }
-  if (status >= 500 && status <= 599) {
+  if (status >= 500 && status <= 599 && (!rawText || !rawText.trim().startsWith('{'))) {
     return `Layanan Google Calendar sedang mengalami gangguan sementara (HTTP ${status}). Data lokal tetap tersimpan.`;
   }
 
   try {
     const parsed = JSON.parse(rawText);
     const message = parsed?.error?.message || `HTTP ${status}`;
-    return message
-      .replace(/ya29\.[a-zA-Z0-9_-]+/g, '[REDACTED_TOKEN]')
-      .replace(/Bearer\s+[^\s]+/gi, 'Bearer [REDACTED]')
-      .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[REDACTED_EMAIL]');
+    return sanitizeSensitiveText(message);
   } catch {
-    return `HTTP ${status} - Layanan Google Calendar tidak dapat dihubungi secara normal.`;
+    const cleaned = sanitizeSensitiveText(rawText);
+    if (status >= 500 && status <= 599) {
+      return `Layanan Google Calendar sedang mengalami gangguan sementara (HTTP ${status}). Data lokal tetap tersimpan.`;
+    }
+    return `HTTP ${status} - ${cleaned || 'Layanan Google Calendar tidak dapat dihubungi secara normal.'}`;
   }
 }
 
@@ -190,18 +206,81 @@ export function classifyGoogleCalendarError(
     };
   }
 
-  // HTTP 403: Forbidden / Permission Denied
+  // HTTP 403: Forbidden vs Rate Limit Exceeded vs Quota Exceeded vs Unknown
   if (status === 403) {
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      // not JSON
+    }
+
+    const reasons: string[] = [];
+    if (Array.isArray(parsed?.error?.errors)) {
+      for (const errItem of parsed.error.errors) {
+        if (typeof errItem?.reason === 'string') {
+          reasons.push(errItem.reason);
+        }
+      }
+    }
+
+    const rawLower = (rawBody + ' ' + (parsed?.error?.message || '')).toLowerCase();
+    const isRateOrQuota =
+      reasons.some((r) =>
+        /^(rateLimitExceeded|userRateLimitExceeded|quotaExceeded|calendarUsageLimitsExceeded|dailyLimitExceeded)$/i.test(r)
+      ) ||
+      rawLower.includes('ratelimitexceeded') ||
+      rawLower.includes('userratelimitexceeded') ||
+      rawLower.includes('quotaexceeded') ||
+      rawLower.includes('calendarusagelimits');
+
+    if (isRateOrQuota) {
+      return {
+        code: 'RATE_LIMIT_EXCEEDED',
+        status: 403,
+        isAuthError: false,
+        isPermissionError: false,
+        isRateLimitError: true,
+        isTransient: true,
+        shouldReauth: false,
+        message: 'Batas kuota atau laju panggilan Google Calendar terlampaui (HTTP 403). Mohon tunggu beberapa saat sebelum mencoba kembali.',
+        userAction: 'Tunggu beberapa menit sebelum mencoba kembali operasi kalender.',
+      };
+    }
+
+    const isPermission =
+      reasons.some((r) =>
+        /^(insufficientPermissions|forbidden|accessNotConfigured)$/i.test(r)
+      ) ||
+      rawLower.includes('insufficient') ||
+      rawLower.includes('forbidden') ||
+      rawLower.includes('permission');
+
+    if (isPermission) {
+      return {
+        code: 'PERMISSION_DENIED',
+        status: 403,
+        isAuthError: false,
+        isPermissionError: true,
+        isRateLimitError: false,
+        isTransient: false,
+        shouldReauth: false,
+        message: 'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.',
+        userAction: 'Periksa izin akses aplikasi pada Akun Google Anda dan berikan izin kalender.',
+      };
+    }
+
+    // Unknown 403 reason
     return {
-      code: 'PERMISSION_DENIED',
+      code: 'UNKNOWN_ERROR',
       status: 403,
       isAuthError: false,
-      isPermissionError: true,
+      isPermissionError: false,
       isRateLimitError: false,
       isTransient: false,
       shouldReauth: false,
-      message: 'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.',
-      userAction: 'Periksa izin akses aplikasi pada Akun Google Anda dan berikan izin kalender.',
+      message: `Akses Google Calendar dibatasi (HTTP 403): ${sanitizeGoogleErrorMessage(403, rawBody)}`,
+      userAction: 'Periksa izin akun Google Anda atau coba kembali dalam beberapa saat.',
     };
   }
 
