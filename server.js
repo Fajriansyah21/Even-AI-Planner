@@ -93,6 +93,186 @@ function addDaysInTimezone(date, days, timeZone = "Asia/Jakarta") {
   return new Date(iso);
 }
 
+// src/lib/splitValidation.ts
+function validateSplitConfiguration(params) {
+  const {
+    estimatedDurationMinutes,
+    hasExplicitTotalDuration = false,
+    splitConfig,
+    minimumSessionMinutes = 30
+  } = params;
+  if (!splitConfig || splitConfig.forcedMode !== "split") {
+    return {
+      isValid: true,
+      totalTaskDuration: estimatedDurationMinutes,
+      totalSessionsDuration: estimatedDurationMinutes
+    };
+  }
+  if (typeof estimatedDurationMinutes !== "number" || !Number.isFinite(estimatedDurationMinutes) || Number.isNaN(estimatedDurationMinutes) || estimatedDurationMinutes <= 0) {
+    return {
+      isValid: false,
+      errorCode: "INVALID_DURATION_VALUE",
+      errorMessage: `Total durasi tugas tidak valid (${estimatedDurationMinutes}). Durasi harus berupa angka positif.`
+    };
+  }
+  const targetCount = splitConfig.targetSessionCount;
+  if (typeof targetCount !== "number" || !Number.isInteger(targetCount) || targetCount < 1) {
+    return {
+      isValid: false,
+      errorCode: "SESSION_COUNT_MISMATCH",
+      errorMessage: `Jumlah sesi tidak valid (${targetCount}). Jumlah sesi harus berupa bilangan bulat minimal 1.`
+    };
+  }
+  const sessionDurations = splitConfig.sessionDurations;
+  if (sessionDurations) {
+    if (!Array.isArray(sessionDurations)) {
+      return {
+        isValid: false,
+        errorCode: "INVALID_DURATION_VALUE",
+        errorMessage: "Format daftar durasi sesi harus berupa array angka."
+      };
+    }
+    if (sessionDurations.length !== targetCount) {
+      return {
+        isValid: false,
+        errorCode: "SESSION_COUNT_MISMATCH",
+        errorMessage: `Jumlah sesi yang diminta (${targetCount}) tidak sesuai dengan rincian durasi yang diberikan (${sessionDurations.length} sesi).`
+      };
+    }
+    for (let i = 0; i < sessionDurations.length; i++) {
+      const dur = sessionDurations[i];
+      if (typeof dur !== "number" || !Number.isFinite(dur) || Number.isNaN(dur) || dur <= 0) {
+        return {
+          isValid: false,
+          errorCode: "INVALID_DURATION_VALUE",
+          errorMessage: `Durasi sesi ke-${i + 1} (${dur}) tidak valid. Setiap sesi harus berupa angka positif.`
+        };
+      }
+      if (dur < minimumSessionMinutes) {
+        return {
+          isValid: false,
+          errorCode: "BELOW_MINIMUM_DURATION",
+          errorMessage: `Durasi sesi ke-${i + 1} (${dur} menit) di bawah batas minimal ${minimumSessionMinutes} menit.`
+        };
+      }
+    }
+    const sumDurations = sessionDurations.reduce((sum, d) => sum + d, 0);
+    if (hasExplicitTotalDuration && sumDurations !== estimatedDurationMinutes) {
+      return {
+        isValid: false,
+        errorCode: "DURATION_MISMATCH",
+        errorMessage: `Total durasi tugas adalah ${estimatedDurationMinutes} menit, tetapi pembagian sesi hanya berjumlah ${sumDurations} menit (${sessionDurations.join(" + ")}). Silakan sesuaikan durasi sesi agar totalnya tepat ${estimatedDurationMinutes} menit.`,
+        totalTaskDuration: estimatedDurationMinutes,
+        totalSessionsDuration: sumDurations
+      };
+    }
+    return {
+      isValid: true,
+      totalTaskDuration: estimatedDurationMinutes,
+      totalSessionsDuration: sumDurations
+    };
+  }
+  if (typeof splitConfig.sessionDurationMinutes === "number" && (Number.isNaN(splitConfig.sessionDurationMinutes) || !Number.isFinite(splitConfig.sessionDurationMinutes) || splitConfig.sessionDurationMinutes <= 0)) {
+    return {
+      isValid: false,
+      errorCode: "INVALID_DURATION_VALUE",
+      errorMessage: `Durasi per sesi (${splitConfig.sessionDurationMinutes}) tidak valid.`
+    };
+  }
+  return {
+    isValid: true,
+    totalTaskDuration: estimatedDurationMinutes,
+    totalSessionsDuration: estimatedDurationMinutes
+  };
+}
+function detectSplitContradictions(params) {
+  const {
+    prompt,
+    isAcrossDays,
+    isSameDay,
+    targetSessionCount = 2,
+    sessionDurations,
+    estimatedDurationMinutes,
+    hasExplicitTotal = false,
+    deadlineIso,
+    referenceDate = /* @__PURE__ */ new Date(),
+    timezone = "Asia/Jakarta"
+  } = params;
+  const p = prompt.toLowerCase();
+  const mentionsSameDayConstraint = isSameDay || /\b(?:selesaikan|harus\s+selesai|semuanya|semua\s+sesi)\s+(?:semuanya\s+)?hari\s+ini\b/i.test(p) || /\bdalam\s+satu\s+hari\b/i.test(p);
+  if (isAcrossDays && mentionsSameDayConstraint) {
+    return {
+      hasConflict: true,
+      conflictType: "STRATEGY_MISMATCH",
+      conflictReason: "Instruksi Anda meminta sesi dijadwalkan pada hari berbeda, tetapi juga meminta seluruh sesi selesai pada hari yang sama / hari ini. Kedua instruksi ini bertentangan secara logis.",
+      conflictingInstructions: [
+        "Jadwalkan pada hari yang berbeda (lintas hari)",
+        "Selesaikan seluruh sesi pada hari yang sama / hari ini"
+      ],
+      requiresClarification: true,
+      clarificationPrompt: "Instruksi Anda meminta sesi dijadwalkan pada hari berbeda, tetapi juga meminta seluruh sesi selesai hari ini. Mana yang ingin diprioritaskan?",
+      clarificationOptions: [
+        { label: "Jadwalkan Lintas Hari (Hari Berbeda)", actionValue: "across_days" },
+        { label: "Selesaikan Hari Ini (Hari yang Sama)", actionValue: "same_day" }
+      ]
+    };
+  }
+  if (isAcrossDays && deadlineIso) {
+    try {
+      const dDate = new Date(deadlineIso);
+      const rDate = new Date(referenceDate);
+      const refDayParts = new Intl.DateTimeFormat("en-CA", { timeZone: timezone }).format(rDate).split("-").map(Number);
+      const dlDayParts = new Intl.DateTimeFormat("en-CA", { timeZone: timezone }).format(dDate).split("-").map(Number);
+      const refUtcDays = Date.UTC(refDayParts[0], refDayParts[1] - 1, refDayParts[2]) / 864e5;
+      const dlUtcDays = Date.UTC(dlDayParts[0], dlDayParts[1] - 1, dlDayParts[2]) / 864e5;
+      const diffCalendarDays = dlUtcDays - refUtcDays;
+      const availableCalendarDays = diffCalendarDays >= 0 ? diffCalendarDays + 1 : 0;
+      if (availableCalendarDays < targetSessionCount && targetSessionCount > 1) {
+        const timeStrMatch = p.match(/(?:jam|pukul)\s*(\d{1,2})(?:[:.](\d{2}))?/i);
+        const timeLabel = timeStrMatch ? `pukul ${timeStrMatch[1]}.${timeStrMatch[2] || "00"} WIB` : "hari batas tenggat";
+        const dayDesc = availableCalendarDays === 1 ? "hari yang sama / hari ini" : availableCalendarDays === 0 ? "waktu yang sudah lewat" : `hanya ${availableCalendarDays} hari kalender`;
+        return {
+          hasConflict: true,
+          conflictType: "DEADLINE_IMPOSSIBLE",
+          conflictReason: `Instruksi Anda meminta pembagian menjadi ${targetSessionCount} sesi pada hari berbeda, namun batas tenggat waktu menyisakan ${dayDesc}. Tidak mungkin mendistribusikan ${targetSessionCount} sesi pada hari-hari berbeda sebelum tenggat.`,
+          conflictingInstructions: [
+            `${targetSessionCount} sesi pada hari berbeda`,
+            `Tenggat waktu selesai ${timeLabel}`
+          ],
+          requiresClarification: true,
+          clarificationPrompt: `Tenggat waktu yang tersisa (${dayDesc}) tidak mencukupi untuk mendistribusikan ${targetSessionCount} sesi lintas hari. Apakah Anda ingin menyelesaikan seluruh sesi hari ini, atau memperpanjang tenggat waktu?`,
+          clarificationOptions: [
+            { label: "Selesaikan Semua Sesi Hari Ini", actionValue: "same_day" },
+            { label: "Perpanjang Tenggat (Tetap Lintas Hari)", actionValue: "extend_deadline" }
+          ]
+        };
+      }
+    } catch {
+    }
+  }
+  if (hasExplicitTotal && typeof estimatedDurationMinutes === "number" && sessionDurations && sessionDurations.length > 0) {
+    const sumDur = sessionDurations.reduce((sum, d) => sum + d, 0);
+    if (sumDur !== estimatedDurationMinutes) {
+      return {
+        hasConflict: true,
+        conflictType: "DURATION_MISMATCH",
+        conflictReason: `Total durasi tugas adalah ${estimatedDurationMinutes} menit, tetapi pembagian sesi hanya berjumlah ${sumDur} menit (${sessionDurations.join(" + ")}). Silakan sesuaikan durasi sesi agar totalnya tepat ${estimatedDurationMinutes} menit.`,
+        conflictingInstructions: [
+          `Total durasi kegiatan: ${estimatedDurationMinutes} menit`,
+          `Rincian sesi: ${sessionDurations.join("m + ")}m = ${sumDur} menit`
+        ],
+        requiresClarification: true,
+        clarificationPrompt: `Total durasi tugas (${estimatedDurationMinutes}m) berbeda dengan total rincian sesi (${sumDur}m). Mana durasi yang ingin Anda gunakan?`,
+        clarificationOptions: [
+          { label: `Gunakan Total ${estimatedDurationMinutes} Menit`, actionValue: "keep_total" },
+          { label: `Gunakan Rincian ${sumDur} Menit`, actionValue: "use_session_sum" }
+        ]
+      };
+    }
+  }
+  return { hasConflict: false };
+}
+
 // src/lib/temporalParser.ts
 var INDONESIAN_WEEKDAYS = [
   { name: "minggu", dayIndex: 0 },
@@ -225,6 +405,18 @@ function extractCleanActivityTitle(prompt, aiTitle) {
   );
   text = text.replace(/\b(?:deadline[-a-zA-Z0-9]*|tenggat(?:\s+waktu)?|paling\s+lambat)\s*(?:hari\s+\w+|\w+)?\b/gi, "");
   text = text.replace(/\b(?:kalo|kalau|jika|bila)\s+belum\s+selesai\b/gi, "");
+  text = text.replace(
+    /\b(?:di)?(?:bagi|pecah|cicil)\s+(?:menjadi|jadi)?\s*(?:\d+|dua|tiga|empat|lima|enam|beberapa)?\s*(?:sesi|kali|bagian)?\b/gi,
+    ""
+  );
+  text = text.replace(
+    /\bmasing-masing\s+(?:\d+|dua|tiga|empat|lima|enam)\s*(?:dan\s+\d+)?\s*(?:menit|mnt|jam)?\b/gi,
+    ""
+  );
+  text = text.replace(/\b(?:pada\s+|di\s+)?hari\s+(?:yang\s+)?(?:berbeda|sama)\b/gi, "");
+  text = text.replace(/\b(?:satu|1)\s+sesi\s+per\s+hari\b/gi, "");
+  text = text.replace(/\blintas\s+hari\b/gi, "");
+  text = text.replace(/\b(?:total|durasi\s+total)\b/gi, "");
   text = text.replace(/\b(?:akan\s+ada|ada|mau|selama|dan|atau|serta|yang|untuk|ini|itu|pada|di|ke)\b/gi, "");
   text = text.replace(/[,;:.–—-]+/g, " ").replace(/\s+/g, " ").trim();
   const invalidSingleWords = /* @__PURE__ */ new Set([
@@ -348,6 +540,180 @@ function parseIndonesianDayNames(prompt) {
     });
   }
   return { days, isRecurring, deadlineDay };
+}
+function parseIndonesianSplitIntent(prompt, totalDurationMinutes, timeConstraintType, minimumSessionMinutes = 30, contextOptions) {
+  if (timeConstraintType === "fixed_event") {
+    return {
+      allowSplit: false,
+      splitConfig: {
+        forcedMode: "single",
+        configSource: "auto_detected"
+      }
+    };
+  }
+  const p = prompt.trim().toLowerCase();
+  const promptHasSplitVerb = /\b(bagi|dibagi|pecah|dipecah|cicil|dicicil)\b/i.test(p);
+  const promptHasSessionClause = /\b(?:kerjakan\s+dalam|jadwalkan\s+dalam|dalam)\s+(?:\d+|dua|tiga|empat|lima|enam|beberapa)\s+sesi\b/i.test(p) || /\b(?:\d+|dua|tiga|empat|lima|enam)\s+sesi\b/i.test(p) || /\b(?:\d+|dua|tiga|empat|lima|enam)\s+kali\s*(?:pengerjaan|sesi)?\b/i.test(p) || /\b(?:masing-masing|tiap|setiap)\s+sesi\b/i.test(p) || /\b(?:satu|1)\s+sesi\s+per\s+hari\b/i.test(p) || /\bsebar\s+ke\s+(?:\d+|dua|tiga|empat|lima|beberapa)\s+hari\b/i.test(p);
+  const isSplitExplicit = promptHasSplitVerb || promptHasSessionClause;
+  if (!isSplitExplicit) {
+    return {
+      allowSplit: totalDurationMinutes >= minimumSessionMinutes * 2,
+      splitConfig: {
+        forcedMode: "single",
+        configSource: "auto_detected"
+      }
+    };
+  }
+  const hasExplicitTotalDuration = Boolean(
+    p.match(/\b(?:total|durasi\s+total|selama\s+total|totalnya)\s*(?:adalah\s+)?(\d+)/i) || p.match(/\b(?:selama|durasi)\s+(?:total\s+)?(\d+)\s*(?:menit|mnt|jam)/i)
+  );
+  let targetSessionCount = void 0;
+  const multiDurationMatch = p.match(
+    /masing-masing\s+(\d+)\s*(?:menit|mnt)?\s*(?:dan|,)\s*(\d+)\s*(?:menit|mnt)?/i
+  );
+  let parsedCustomDurations = void 0;
+  if (multiDurationMatch) {
+    parsedCustomDurations = [
+      parseInt(multiDurationMatch[1], 10),
+      parseInt(multiDurationMatch[2], 10)
+    ];
+    targetSessionCount = 2;
+  }
+  const numWordMap = {
+    se: 1,
+    satu: 1,
+    dua: 2,
+    tiga: 3,
+    empat: 4,
+    lima: 5,
+    enam: 6,
+    tujuh: 7,
+    delapan: 8
+  };
+  if (!targetSessionCount) {
+    const sessionCountMatch = p.match(
+      /(?:bagi|dibagi|pecah|dipecah|cicil|dicicil|jadwalkan|kerjakan|dalam)?\s*(?:menjadi|jadi|dalam)?\s*(\d+|dua|tiga|empat|lima|enam)\s*(?:sesi|kali|bagian)/i
+    );
+    if (sessionCountMatch) {
+      const rawCount = sessionCountMatch[1].toLowerCase();
+      targetSessionCount = numWordMap[rawCount] || parseInt(rawCount, 10);
+    } else if (/\bbeberapa\s+sesi\b/i.test(p)) {
+      targetSessionCount = 2;
+    }
+  }
+  if (!targetSessionCount || targetSessionCount < 1) {
+    targetSessionCount = 2;
+  }
+  let sessionDurations = [];
+  let effectiveTotalMinutes = totalDurationMinutes;
+  if (parsedCustomDurations && parsedCustomDurations.length === targetSessionCount) {
+    sessionDurations = parsedCustomDurations;
+    if (!hasExplicitTotalDuration) {
+      effectiveTotalMinutes = sessionDurations.reduce((sum, d) => sum + d, 0);
+    }
+  } else {
+    const perSessionMinMatch = p.match(
+      /(?:masing-masing|tiap\s+sesi|setiap\s+sesi|per\s+sesi)\s*(?:selama\s+)?(\d+)\s*(?:menit|mnt)/i
+    );
+    const perSessionHourMatch = p.match(
+      /(?:masing-masing|tiap\s+sesi|setiap\s+sesi|per\s+sesi)\s*(?:selama\s+)?(\d+|se|satu|dua)\s*jam/i
+    );
+    if (perSessionMinMatch) {
+      const singleDur = parseInt(perSessionMinMatch[1], 10);
+      sessionDurations = Array(targetSessionCount).fill(singleDur);
+      if (!hasExplicitTotalDuration) {
+        effectiveTotalMinutes = singleDur * targetSessionCount;
+      }
+    } else if (perSessionHourMatch) {
+      const hStr = perSessionHourMatch[1].toLowerCase();
+      const h = numWordMap[hStr] || parseInt(hStr, 10) || 1;
+      const singleDur = h * 60;
+      sessionDurations = Array(targetSessionCount).fill(singleDur);
+      if (!hasExplicitTotalDuration) {
+        effectiveTotalMinutes = singleDur * targetSessionCount;
+      }
+    } else {
+      const base = Math.floor(effectiveTotalMinutes / targetSessionCount);
+      const rem = effectiveTotalMinutes % targetSessionCount;
+      sessionDurations = Array.from(
+        { length: targetSessionCount },
+        (_, i) => i < rem ? base + 1 : base
+      );
+    }
+  }
+  let distributionStrategy = "flexible";
+  const isAcrossDays = /\b(?:pada\s+|di\s+)?hari\s+(?:yang\s+)?berbeda\b/i.test(p) || /\b(?:beda|berbeda)\s+hari\b/i.test(p) || /\b(?:beda|berbeda)\s+tanggal\b/i.test(p) || /\blintas\s+hari\b/i.test(p) || /\b(?:masing-masing\s+)?(?:satu|1)\s+sesi\s+per\s+hari\b/i.test(p) || /\b(?:tiap|setiap)\s+hari\s+(?:satu|1)\s+sesi\b/i.test(p) || /\bsebar\s+ke\s+(?:\w+|\d+)\s+hari\b/i.test(p) || /\bmaksimal\s+(?:satu|1)\s+sesi\s+(?:setiap|per|tiap)\s+hari\b/i.test(p);
+  const isSameDay = /\b(?:pada\s+|di\s+)?hari\s+(?:yang\s+)?sama\b/i.test(p) || /\bsatu\s+hari\s+(?:yang\s+)?sama\b/i.test(p) || /\bselesaikan\s+dalam\s+(?:satu|1)\s+hari\b/i.test(p) || /\bdalam\s+(?:satu|1)\s+hari\s+dengan\s+jeda\b/i.test(p) || /\b(?:pisahkan\s+menjadi\s+beberapa\s+sesi|semua\s+sesi)\s+hari\s+ini\b/i.test(p) || /\bpada\s+hari\s+ini\s+juga\b/i.test(p);
+  if (isAcrossDays) {
+    distributionStrategy = "across_days";
+  } else if (isSameDay) {
+    distributionStrategy = "same_day";
+  } else {
+    distributionStrategy = "flexible";
+  }
+  const contradictionCheck = detectSplitContradictions({
+    prompt: p,
+    isAcrossDays,
+    isSameDay,
+    targetSessionCount,
+    sessionDurations,
+    estimatedDurationMinutes: effectiveTotalMinutes,
+    hasExplicitTotal: hasExplicitTotalDuration,
+    deadlineIso: contextOptions?.deadlineIso,
+    referenceDate: contextOptions?.referenceDate,
+    timezone: contextOptions?.timezone
+  });
+  const validationResult = validateSplitConfiguration({
+    estimatedDurationMinutes: effectiveTotalMinutes,
+    hasExplicitTotalDuration,
+    splitConfig: {
+      forcedMode: "split",
+      targetSessionCount,
+      sessionDurationMinutes: sessionDurations[0] || Math.round(effectiveTotalMinutes / targetSessionCount),
+      sessionDurations,
+      minGapMinutes: 60,
+      distributionStrategy,
+      configSource: "auto_detected"
+    },
+    minimumSessionMinutes
+  });
+  const hasConflict = contradictionCheck.hasConflict || !validationResult.isValid;
+  const conflictType = contradictionCheck.conflictType || validationResult.errorCode;
+  const conflictReason = contradictionCheck.conflictReason || validationResult.errorMessage;
+  const conflictingInstructions = contradictionCheck.conflictingInstructions;
+  const requiresClarification = contradictionCheck.requiresClarification || !validationResult.isValid;
+  const clarificationPrompt = contradictionCheck.clarificationPrompt || validationResult.errorMessage;
+  const clarificationOptions = contradictionCheck.clarificationOptions;
+  const splitConfig = {
+    forcedMode: "split",
+    targetSessionCount,
+    sessionDurationMinutes: sessionDurations[0] || Math.round(effectiveTotalMinutes / targetSessionCount),
+    sessionDurations,
+    minGapMinutes: 60,
+    distributionStrategy,
+    configSource: "auto_detected",
+    hasConflict,
+    conflictType,
+    conflictReason,
+    conflictingInstructions,
+    requiresClarification,
+    clarificationPrompt,
+    clarificationOptions,
+    validation: validationResult
+  };
+  return {
+    allowSplit: true,
+    adjustedDurationMinutes: effectiveTotalMinutes,
+    splitConfig,
+    hasConflict,
+    conflictType,
+    conflictReason,
+    conflictingInstructions,
+    requiresClarification,
+    clarificationPrompt,
+    clarificationOptions,
+    validation: validationResult
+  };
 }
 function parseIndonesianTemporalRules(ctx) {
   const prompt = ctx.userPrompt.trim().toLowerCase();
@@ -516,7 +882,8 @@ function parseIndonesianTemporalRules(ctx) {
     tujuh: 7,
     delapan: 8
   };
-  const durMatch = prompt.match(/(\d+)\s*(menit|mnt|jam)/i);
+  const totalDurMatch = prompt.match(/(?:total|selama\s+total|durasi\s+total)\s*(\d+)\s*(menit|mnt|jam)/i);
+  const durMatch = totalDurMatch || prompt.match(/(\d+)\s*(menit|mnt|jam)/i);
   const wordDurMatch = prompt.match(/(?:selama\s+)?(se|satu|dua|tiga|empat|lima|enam|tujuh|delapan)\s*jam/i);
   const wordMinMatch = prompt.match(/(?:selama\s+)?(tiga puluh|empat puluh lima)\s*(?:menit|mnt)/i);
   if (durMatch) {
@@ -808,16 +1175,37 @@ function parseIndonesianTemporalRules(ctx) {
   } else if (prompt.includes("santai") || prompt.includes("low")) {
     priority = "LOW";
   }
-  const allowSplit = timeConstraintType !== "fixed_event" && (promptHasTotalSplitKeyword || prompt.includes("bagi") || prompt.includes("sesi") || prompt.includes("cicil"));
   const minSession = 30;
+  const splitIntent = parseIndonesianSplitIntent(
+    ctx.userPrompt,
+    duration,
+    timeConstraintType,
+    minSession,
+    {
+      deadlineIso,
+      referenceDate: baseDate,
+      timezone: tz
+    }
+  );
+  const allowSplit = splitIntent.allowSplit;
+  const splitConfig = splitIntent.splitConfig;
+  if (splitIntent.adjustedDurationMinutes && splitIntent.adjustedDurationMinutes > duration) {
+    duration = splitIntent.adjustedDurationMinutes;
+  }
   const title = extractCleanActivityTitle(ctx.userPrompt);
   let reasoning = "";
-  if (timeConstraintType === "fixed_event") {
+  if (splitIntent.hasConflict && splitIntent.conflictReason) {
+    reasoning = splitIntent.conflictReason;
+  } else if (timeConstraintType === "fixed_event") {
     if (targetOccurrences && targetOccurrences.length > 1) {
       reasoning = `AI mendeteksi ${targetOccurrences.length} komitmen waktu tetap terpisah (${targetOccurrences.map((o) => o.dayName).join(" dan ")}) pukul ${fixedStartHour ? String(fixedStartHour).padStart(2, "0") : "00"}:${String(fixedStartMin).padStart(2, "0")} - ${fixedEndHour ? String(fixedEndHour).padStart(2, "0") : "00"}:${String(fixedEndMin).padStart(2, "0")} sehingga dijadwalkan per hari tanpa digeser.`;
     } else {
       reasoning = `AI mendeteksi komitmen waktu tetap (${fixedStartHour ? String(fixedStartHour).padStart(2, "0") : "00"}:${String(fixedStartMin).padStart(2, "0")} - ${fixedEndHour ? String(fixedEndHour).padStart(2, "0") : "00"}:${String(fixedEndMin).padStart(2, "0")}) sehingga dijaga tanpa digeser.`;
     }
+  } else if (splitConfig?.forcedMode === "split") {
+    const stratLabel = splitConfig.distributionStrategy === "across_days" ? "lintas hari berbeda (maksimal 1 sesi per hari)" : splitConfig.distributionStrategy === "same_day" ? "hari yang sama dengan jeda minimal 60 menit" : "fleksibel sesuai ketersediaan slot";
+    const durSummary = splitConfig.sessionDurations && splitConfig.sessionDurations.every((d) => d === splitConfig.sessionDurations[0]) ? `masing-masing ${splitConfig.sessionDurations[0]} menit` : `(${splitConfig.sessionDurations?.map((d, i) => `Sesi ${i + 1}: ${d}m`).join(", ")})`;
+    reasoning = `AI mendeteksi instruksi pembagian tugas menjadi ${splitConfig.targetSessionCount} sesi ${durSummary} (total ${duration} menit) dengan strategi distribusi ${stratLabel}.`;
   } else if (isDurationAmbiguous && clarificationPrompt) {
     reasoning = `AI mendeteksi alokasi waktu pada ${detectedWeekdays.map((d) => d.dayName).join(" dan ")} dengan durasi ${duration} menit (${Math.round(duration / 60)} jam). ${clarificationPrompt}`;
   } else if (detectedWeekdays.length > 1) {
@@ -862,7 +1250,15 @@ function parseIndonesianTemporalRules(ctx) {
     priority,
     allowSplit,
     minimumSessionMinutes: minSession,
-    reasoning
+    splitConfig,
+    reasoning,
+    hasConflict: splitIntent.hasConflict,
+    conflictType: splitIntent.conflictType,
+    conflictReason: splitIntent.conflictReason,
+    conflictingInstructions: splitIntent.conflictingInstructions,
+    requiresClarification: splitIntent.requiresClarification,
+    clarificationOptions: splitIntent.clarificationOptions,
+    splitValidation: splitIntent.validation
   };
 }
 
@@ -1366,6 +1762,32 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.totalDurationMinutes = baselinePlan.totalDurationMinutes;
         sanitizedPlan.durationPerDayMinutes = baselinePlan.durationPerDayMinutes;
         sanitizedPlan.clarificationPrompt = baselinePlan.clarificationPrompt;
+      }
+      if (baselinePlan.splitConfig) {
+        sanitizedPlan.splitConfig = baselinePlan.splitConfig;
+        if (baselinePlan.splitConfig.forcedMode === "split") {
+          sanitizedPlan.allowSplit = true;
+          sanitizedPlan.reasoning = baselinePlan.reasoning;
+        }
+      } else if (baselinePlan.allowSplit !== void 0) {
+        sanitizedPlan.allowSplit = baselinePlan.allowSplit;
+      }
+      if (baselinePlan.timeConstraintType === "fixed_event") {
+        sanitizedPlan.allowSplit = false;
+        sanitizedPlan.splitConfig = { forcedMode: "single" };
+      }
+      if (baselinePlan.hasConflict) {
+        sanitizedPlan.hasConflict = true;
+        sanitizedPlan.conflictType = baselinePlan.conflictType;
+        sanitizedPlan.conflictReason = baselinePlan.conflictReason;
+        sanitizedPlan.conflictingInstructions = baselinePlan.conflictingInstructions;
+        sanitizedPlan.requiresClarification = true;
+        sanitizedPlan.clarificationPrompt = baselinePlan.clarificationPrompt;
+        sanitizedPlan.clarificationOptions = baselinePlan.clarificationOptions;
+        sanitizedPlan.reasoning = baselinePlan.reasoning;
+      }
+      if (baselinePlan.splitValidation) {
+        sanitizedPlan.splitValidation = baselinePlan.splitValidation;
       }
       sanitizedPlan.title = extractCleanActivityTitle(trimmedPrompt, rawPlan.title || baselinePlan.title);
       if (!sanitizedPlan.description || sanitizedPlan.description.trim() === "") {

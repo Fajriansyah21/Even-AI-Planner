@@ -12,6 +12,10 @@ import {
   classifyGeminiError,
   executeWithRetryAndTimeout,
 } from './src/lib/geminiErrorHandling';
+import {
+  createCorsOptions,
+  createAiPlanRateLimiter,
+} from './src/server/securityConfig';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,10 +26,15 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 async function startServer() {
   const app = express();
 
-  app.use(cors());
+  // Configure reverse proxy hop trust for containerized deployment (e.g. Google Cloud Run)
+  app.set('trust proxy', 1);
+
+  // Apply restricted CORS configuration
+  const corsOptions = createCorsOptions(isProduction);
+  app.use(cors(corsOptions));
   app.use(express.json({ limit: '1mb' }));
 
-  // Health check endpoint
+  // Health check endpoint (not rate-limited)
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({
       status: 'ok',
@@ -34,8 +43,11 @@ async function startServer() {
     });
   });
 
-  // AI Plan generation route (Express-based, Next.js removed)
-  app.post('/api/gemini/plan', async (req: Request, res: Response) => {
+  // AI Plan generation rate limiter (20 req/min per IP)
+  const aiPlanRateLimiter = createAiPlanRateLimiter();
+
+  // AI Plan generation route with rate limiting
+  app.post('/api/gemini/plan', aiPlanRateLimiter, async (req: Request, res: Response) => {
     const startTime = Date.now();
     try {
       const { userPrompt, currentDateTime, userLocalTimeStr, userTimezone, workHours } = req.body;

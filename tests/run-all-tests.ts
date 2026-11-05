@@ -14,6 +14,8 @@ import { runAiSchedulerSuite } from './aiScheduler.test';
 import { runLoadingUxTests } from './loadingUx.test';
 import { runDeadlineAndSlotDiagnosticsTests } from './deadlineAndSlotDiagnostics.test';
 import { runIndependentAuditSuite } from './independent-audit.test';
+import { runSecurityPhase1Tests } from './securityPhase1.test';
+import { runGoogleCalendarReliabilitySuite } from './google-calendar-reliability.test';
 
 async function main() {
   console.log('================================================================');
@@ -82,8 +84,16 @@ async function main() {
     runDeadlineAndSlotDiagnosticsTests();
 
     // 16. Independent Audit Suite (Manual Override, Deadline Contradiction, Cross-Layer Validation)
-    console.log('\n>>> [16/16] Independent Audit Suite (Manual Override & Contradictions)...');
+    console.log('\n>>> [16/17] Independent Audit Suite (Manual Override & Contradictions)...');
     await runIndependentAuditSuite();
+
+    // 17. Security Hardening Phase 1 Suite (CORS, Rate Limiting, Route Isolation)
+    console.log('\n>>> [17/18] Phase 1 Security Hardening Suite (CORS & AI Rate Limiter)...');
+    await runSecurityPhase1Tests();
+
+    // 18. Google Calendar Reliability Hardening Suite (Phase 2A)
+    console.log('\n>>> [18/18] Google Calendar Reliability Hardening Suite (Phase 2A)...');
+    await runGoogleCalendarReliabilitySuite();
 
     // Real Google Calendar Integration (Opt-in Check)
     console.log('\n>>> [Opsi] Pengujian Integrasi Google Calendar Nyata...');

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Sidebar, SidebarTab } from './components/Sidebar';
 import { Header } from './components/Header';
 import { CalendarView } from './components/CalendarView';
@@ -55,6 +55,8 @@ import {
   fetchGoogleCalendarEvents,
   createGoogleCalendarEvent,
   deleteGoogleCalendarEvent,
+  GoogleCalendarApiError,
+  classifyGoogleCalendarError,
 } from './lib/googleCalendar';
 import {
   getInitialKeepNotes,
@@ -112,7 +114,8 @@ export default function App() {
     }
   });
 
-  // Sync state
+  // Sync state & request race-condition guard
+  const syncRequestIdRef = useRef<number>(0);
   const [isSyncing, setIsSyncing] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [diagnosticInfo, setDiagnosticInfo] = useState<CalendarDiagnosticInfo>({
@@ -283,7 +286,9 @@ export default function App() {
   };
 
   const handleConnectCalendar = async () => {
-    setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'connecting' }));
+    // Invalidate any ongoing background syncs
+    syncRequestIdRef.current++;
+    setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'connecting', lastErrorMessage: undefined }));
     try {
       const res = await googleSignIn();
       if (res && res.accessToken) {
@@ -301,26 +306,31 @@ export default function App() {
           ...prev,
           connectionStatus: 'connected_unsynced',
           accountEmail: res.user.email || prev.accountEmail,
+          lastErrorMessage: undefined,
         }));
         showToast('Google Calendar berhasil dihubungkan!', 'success');
-        await handleSyncCalendar();
+        // Immediately sync with the freshly acquired token
+        await handleSyncCalendar(res.accessToken);
       }
     } catch (err: any) {
       if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') {
         setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'unconnected' }));
         showToast('Penghubungan Google Calendar dibatalkan.', 'info');
       } else {
+        const classification = classifyGoogleCalendarError(0, err.message || '', err);
         setDiagnosticInfo((prev) => ({
           ...prev,
           connectionStatus: 'sync_failed',
-          lastErrorMessage: err.message,
+          lastErrorMessage: classification.message,
         }));
-        showToast(`Gagal menghubungkan Google Calendar: ${err.message}`, 'error');
+        showToast(`Gagal menghubungkan Google Calendar: ${classification.message}`, 'error');
       }
     }
   };
 
   const handleDisconnectCalendar = () => {
+    // Invalidate any ongoing sync requests
+    syncRequestIdRef.current++;
     setCachedAccessToken(null);
     setHasGoogleAccessToken(false);
     setPreferences((prev) => ({
@@ -336,11 +346,12 @@ export default function App() {
     showToast('Hubungan Google Calendar telah diputuskan.', 'info');
   };
 
-  // Google Calendar Sync
-  const handleSyncCalendar = async () => {
+  // Google Calendar Sync with race-condition resilience and classified error handling
+  const handleSyncCalendar = async (tokenOverride?: string) => {
+    const currentRequestId = ++syncRequestIdRef.current;
     setIsSyncing(true);
     setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'syncing' }));
-    const token = getCachedAccessToken();
+    const token = tokenOverride || getCachedAccessToken();
 
     if (!token) {
       setIsSyncing(false);
@@ -352,16 +363,21 @@ export default function App() {
       setDiagnosticInfo((prev) => ({
         ...prev,
         connectionStatus: 'needs_reauth',
-        lastErrorMessage: 'Token Google Calendar tidak aktif. Silakan hubungkan akun Google Calendar di Pengaturan.',
+        lastErrorMessage: 'Token Google Calendar tidak aktif atau kedaluwarsa. Silakan hubungkan ulang akun di Pengaturan.',
       }));
-      showToast('Token Google Calendar tidak aktif. Silakan klik Hubungkan Kalender di Pengaturan.', 'error');
+      showToast('Token Google Calendar tidak aktif. Silakan hubungkan ulang akun Google Calendar di Pengaturan.', 'error');
       return;
     }
 
     try {
       const { events: liveGoogleEvents, rangeStart, rangeEnd } = await fetchGoogleCalendarEvents(token);
-      
-      // Merge live Google events with internal task sessions
+
+      // Race-condition guard: ignore result if another connect/sync request was triggered in the meantime
+      if (syncRequestIdRef.current !== currentRequestId) {
+        return;
+      }
+
+      // Safe merge: Never discard internal task sessions or user tasks
       setEvents((prev) => {
         const internalEvents = prev.filter((e) => e.provider !== 'google');
         return [...liveGoogleEvents, ...internalEvents];
@@ -397,10 +413,25 @@ export default function App() {
         showToast(`Sinkronisasi Google Calendar berhasil! Dimuat ${liveGoogleEvents.length} agenda.`);
       }
     } catch (err: any) {
+      // Race-condition guard: ignore error if another request superceded this one
+      if (syncRequestIdRef.current !== currentRequestId) {
+        return;
+      }
+
       console.error('Calendar sync error:', err.message);
-      const isAuthError = err.message.includes('401') || err.message.includes('Token');
-      const isForbidden = err.message.includes('403');
-      const nextStatus = isAuthError ? 'needs_reauth' : 'sync_failed';
+      const classification =
+        err instanceof GoogleCalendarApiError
+          ? err.classification
+          : classifyGoogleCalendarError(0, err.message || '', err);
+
+      const isAuthError = classification.isAuthError;
+      const nextStatus: ConnectionStatusType = isAuthError ? 'needs_reauth' : 'sync_failed';
+
+      if (isAuthError) {
+        // Invalidate stale token from memory cache to prevent recurring failed attempts
+        setCachedAccessToken(null);
+        setHasGoogleAccessToken(false);
+      }
 
       setPreferences((prev) => ({
         ...prev,
@@ -411,12 +442,14 @@ export default function App() {
       setDiagnosticInfo((prev) => ({
         ...prev,
         connectionStatus: nextStatus,
-        lastErrorMessage: err.message,
+        lastErrorMessage: classification.message,
       }));
 
-      showToast(`Gagal menyinkronkan Google Calendar: ${err.message}`, 'error');
+      showToast(`Gagal menyinkronkan Google Calendar: ${classification.message}`, 'error');
     } finally {
-      setIsSyncing(false);
+      if (syncRequestIdRef.current === currentRequestId) {
+        setIsSyncing(false);
+      }
     }
   };
 
@@ -816,11 +849,11 @@ export default function App() {
 
     // Live Google Calendar push
     let successCount = 0;
-    const updatedSessions: TaskScheduleSession[] = [];
-    const newCalendarEvents: CalendarEvent[] = [];
-
     let unconfirmedCount = 0;
     let failCount = 0;
+    let hasEncounteredAuthError = false;
+    const updatedSessions: TaskScheduleSession[] = [];
+    const newCalendarEvents: CalendarEvent[] = [];
 
     for (const sess of initialSessions) {
       try {
@@ -854,6 +887,15 @@ export default function App() {
         successCount++;
       } catch (err: any) {
         console.error('Single schedule Google push error:', err.message);
+        const classification =
+          err instanceof GoogleCalendarApiError
+            ? err.classification
+            : classifyGoogleCalendarError(0, err.message || '', err);
+
+        if (classification.isAuthError) {
+          hasEncounteredAuthError = true;
+        }
+
         if (err.message?.includes('tidak dapat dikonfirmasi')) {
           unconfirmedCount++;
         } else {
@@ -866,8 +908,22 @@ export default function App() {
       }
     }
 
+    if (hasEncounteredAuthError) {
+      setCachedAccessToken(null);
+      setHasGoogleAccessToken(false);
+      setPreferences((prev) => ({
+        ...prev,
+        googleCalendarConnected: false,
+        calendarSyncStatus: 'failed',
+      }));
+    }
+
     setDiagnosticInfo((prev) => ({
       ...prev,
+      connectionStatus: hasEncounteredAuthError ? 'needs_reauth' : prev.connectionStatus,
+      lastErrorMessage: hasEncounteredAuthError
+        ? 'Token Google Calendar kedaluwarsa saat menyimpan sesi. Silakan hubungkan ulang di Pengaturan.'
+        : prev.lastErrorMessage,
       eventsCreatedCount: prev.eventsCreatedCount + successCount,
       eventsFailedCount: prev.eventsFailedCount + failCount,
       eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
@@ -1004,6 +1060,7 @@ export default function App() {
     let successCount = 0;
     let failCount = 0;
     let unconfirmedCount = 0;
+    let hasEncounteredAuthError = false;
     const updatedSessions: TaskScheduleSession[] = [];
     const newCalendarEvents: CalendarEvent[] = [];
 
@@ -1039,6 +1096,15 @@ export default function App() {
         successCount++;
       } catch (err: any) {
         console.error('AI Calendar event push error:', err.message);
+        const classification =
+          err instanceof GoogleCalendarApiError
+            ? err.classification
+            : classifyGoogleCalendarError(0, err.message || '', err);
+
+        if (classification.isAuthError) {
+          hasEncounteredAuthError = true;
+        }
+
         if (err.message?.includes('tidak dapat dikonfirmasi')) {
           unconfirmedCount++;
         } else {
@@ -1051,8 +1117,22 @@ export default function App() {
       }
     }
 
+    if (hasEncounteredAuthError) {
+      setCachedAccessToken(null);
+      setHasGoogleAccessToken(false);
+      setPreferences((prev) => ({
+        ...prev,
+        googleCalendarConnected: false,
+        calendarSyncStatus: 'failed',
+      }));
+    }
+
     setDiagnosticInfo((prev) => ({
       ...prev,
+      connectionStatus: hasEncounteredAuthError ? 'needs_reauth' : prev.connectionStatus,
+      lastErrorMessage: hasEncounteredAuthError
+        ? 'Token Google Calendar kedaluwarsa saat menyimpan sesi. Silakan hubungkan ulang di Pengaturan.'
+        : prev.lastErrorMessage,
       eventsCreatedCount: prev.eventsCreatedCount + successCount,
       eventsFailedCount: prev.eventsFailedCount + failCount,
       eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
