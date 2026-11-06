@@ -61,6 +61,7 @@ import {
 } from './lib/googleCalendar';
 import { CalendarOperationGuard } from './lib/calendarOperationGuard';
 import { persistScheduledTask } from './lib/taskPersistence';
+import { executeSchedulePush } from './lib/calendarPushService';
 import {
   getInitialKeepNotes,
   convertKeepNoteToTask,
@@ -878,166 +879,45 @@ export default function App() {
       return;
     }
 
-    // Live Google Calendar push
+    // Live Google Calendar push using unified production orchestration service
     const pushTicket = calendarGuardRef.current.startPush();
-
-    let successCount = 0;
-    let unconfirmedCount = 0;
-    let failCount = 0;
-    let hasEncounteredAuthError = false;
-    let wasAborted = false;
-    const updatedSessions: TaskScheduleSession[] = [];
-    const newCalendarEvents: CalendarEvent[] = [];
-
-    for (const sess of initialSessions) {
-      if (pushTicket.isAborted()) {
-        wasAborted = true;
-        break;
-      }
-
-      // Idempotency: Sesi hanya dianggap tersinkron jika syncStatus === 'synced' dan memiliki ID Google Calendar valid
-      const hasValidRemoteId =
-        typeof (sess as any).googleCalendarEventId === 'string' &&
-        (sess as any).googleCalendarEventId.trim().length > 0;
-
-      if (sess.syncStatus === 'synced' && hasValidRemoteId) {
-        updatedSessions.push(sess);
-        continue;
-      }
-
-      // Anomali: status synced tapi ID kosong -> tidak klaim sukses palsu, tandai rekonsiliasi
-      if (sess.syncStatus === 'synced' && !hasValidRemoteId) {
-        unconfirmedCount++;
-        updatedSessions.push({
-          ...sess,
-          syncStatus: 'failed' as const,
-        });
-        continue;
-      }
-
-      try {
-        const created = await createGoogleCalendarEvent(
-          token,
-          {
-            title: `[EVEN] ${sess.taskTitle}`,
-            description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
-            startAt: sess.startAt,
-            endAt: sess.endAt,
-            timezone: preferences.timezone,
-          },
-          pushTicket.signal
-        );
-
-        const syncedSess = {
-          ...sess,
-          syncStatus: 'synced' as const,
-          googleCalendarEventId: created.id,
-          htmlLink: created.htmlLink,
-        };
-        updatedSessions.push(syncedSess);
-        newCalendarEvents.push({
-          id: `gcal-${created.id}`,
-          provider: 'google',
-          title: `[EVEN] ${sess.taskTitle}`,
-          description: `Sesi ${sess.sessionIndex} dari ${sess.totalSessions}`,
-          startAt: sess.startAt,
-          endAt: sess.endAt,
-          htmlLink: created.htmlLink,
-          isEditable: false,
-          syncStatus: 'synced',
-          category: 'focus',
-        });
-        successCount++;
-      } catch (err: any) {
-        const classification =
-          err instanceof GoogleCalendarApiError
-            ? err.classification
-            : classifyGoogleCalendarError(0, err.message || '', err);
-
-        // Aborted request: break immediately, preserve local data, NEVER mark as auth failure
-        if (pushTicket.isAborted() || classification.code === 'ABORTED') {
-          wasAborted = true;
-          updatedSessions.push({
-            ...sess,
-            syncStatus: 'pending' as const,
-          });
-          break;
-        }
-
-        console.error('Single schedule Google push error:', sanitizeSensitiveText(err.message || ''));
-
-        if (classification.isAuthError) {
-          hasEncounteredAuthError = true;
-        }
-
-        if (err.message?.includes('tidak dapat dikonfirmasi')) {
-          unconfirmedCount++;
-        } else {
-          failCount++;
-        }
-        updatedSessions.push({
-          ...sess,
-          syncStatus: 'failed' as const,
-        });
-      }
+    if (pushTicket.isAborted()) {
+      return;
     }
-
-    // Append remaining sessions if aborted mid-way, so local data is 100% complete
-    if (wasAborted && updatedSessions.length < initialSessions.length) {
-      const processedCount = updatedSessions.length;
-      for (let i = processedCount; i < initialSessions.length; i++) {
-        updatedSessions.push({
-          ...initialSessions[i],
-          syncStatus: 'pending' as const,
-        });
-      }
-    }
-
-    // 1. Siapkan finalTaskObj dengan seluruh updatedSessions (baik yang berhasil dibuat dengan ID maupun pending)
-    let finalTaskObj: Task | null = null;
     const existingTask = tasks.find((t) => t.id === res.taskId);
-    if (existingTask) {
-      finalTaskObj = {
-        ...existingTask,
-        userId: userId || existingTask.userId || 'user-default',
-        status: 'SCHEDULED',
-        scheduledSessions: updatedSessions,
-      };
-    } else {
-      finalTaskObj = {
-        id: res.taskId,
-        userId: userId || 'user-default',
-        title: res.taskTitle,
-        estimatedDurationMinutes: initialSessions.reduce((acc, s) => acc + s.durationMinutes, 0),
-        priority: 'MEDIUM',
-        status: 'SCHEDULED',
-        allowSplit: initialSessions.length > 1,
-        minimumSessionMinutes: 30,
-        createdAt: new Date().toISOString(),
-        scheduledSessions: updatedSessions,
-      };
-    }
+    const taskBase: Task = existingTask || {
+      id: res.taskId,
+      userId: userId || 'user-default',
+      title: res.taskTitle,
+      estimatedDurationMinutes: initialSessions.reduce((acc, s) => acc + s.durationMinutes, 0),
+      priority: 'MEDIUM',
+      status: 'SCHEDULED',
+      allowSplit: initialSessions.length > 1,
+      minimumSessionMinutes: 30,
+      createdAt: new Date().toISOString(),
+      scheduledSessions: initialSessions,
+    };
 
-    // 2. Persistensikan secara mutlak ke React state dan Firestore jika terautentikasi
-    await persistScheduledTask({
-      task: finalTaskObj,
+    const pushResult = await executeSchedulePush({
+      token,
+      task: taskBase,
+      sessions: initialSessions,
+      timezone: preferences.timezone,
       userId,
-      newCalendarEvents,
+      pushTicket,
       setTasks,
       setEvents,
-      isUpdate: true,
+      isTaskUpdate: true,
     });
 
     setSingleScheduleResult(null);
 
-    // 3. Jika operasi push telah menjadi stale (misal akibat disconnect atau push baru),
-    // BERHENTI DI SINI agar status koneksi atau diagnostik operasi baru tidak tertimpa!
-    if (pushTicket.isStale()) {
+    // Stale guard: Jangan menimpa status koneksi atau diagnostik jika push telah menjadi stale
+    if (pushResult.isStale) {
       return;
     }
 
-    // 4. Operasi push aktif: lanjutkan pemutakhiran preferensi & diagnostik
-    if (hasEncounteredAuthError) {
+    if (pushResult.hasEncounteredAuthError) {
       setCachedAccessToken(null);
       setHasGoogleAccessToken(false);
       setPreferences((prev) => ({
@@ -1049,25 +929,27 @@ export default function App() {
 
     setDiagnosticInfo((prev) => ({
       ...prev,
-      connectionStatus: hasEncounteredAuthError ? 'needs_reauth' : prev.connectionStatus,
-      lastErrorMessage: hasEncounteredAuthError
+      connectionStatus: pushResult.hasEncounteredAuthError ? 'needs_reauth' : prev.connectionStatus,
+      lastErrorMessage: pushResult.hasEncounteredAuthError
         ? 'Token Google Calendar kedaluwarsa saat menyimpan sesi. Silakan hubungkan ulang di Pengaturan.'
         : prev.lastErrorMessage,
-      eventsCreatedCount: prev.eventsCreatedCount + successCount,
-      eventsFailedCount: prev.eventsFailedCount + failCount,
-      eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
+      eventsCreatedCount: prev.eventsCreatedCount + pushResult.successCount,
+      eventsFailedCount: prev.eventsFailedCount + pushResult.failCount,
+      eventsUnconfirmedCount: prev.eventsUnconfirmedCount + pushResult.unconfirmedCount,
     }));
 
-    if (wasAborted) {
-      if (successCount > 0) {
-        showToast(`Kegiatan "${res.taskTitle}": ${successCount} sesi tersimpan ke Google Calendar sebelum dibatalkan. Sisa sesi disimpan secara lokal.`, 'info');
+    if (pushResult.wasAborted) {
+      if (pushResult.successCount > 0) {
+        showToast(`Kegiatan "${res.taskTitle}": ${pushResult.successCount} sesi tersimpan ke Google Calendar sebelum dibatalkan. Sisa sesi disimpan secara lokal.`, 'info');
       } else {
         showToast(`Kegiatan "${res.taskTitle}" disimpan secara lokal; pengiriman ke Google Calendar dibatalkan.`, 'info');
       }
-    } else if (successCount === initialSessions.length) {
+    } else if (pushResult.reconciliationCount > 0 && pushResult.successCount === 0) {
+      showToast(`Hasil penyimpanan ke Google Calendar belum terkonfirmasi. Sesi dialihkan ke status "Perlu Rekonsiliasi".`, 'info');
+    } else if (pushResult.successCount === initialSessions.length) {
       showToast(`Kegiatan "${res.taskTitle}" dijadwalkan dan disimpan ke Google Calendar Anda!`, 'success');
-    } else if (successCount > 0) {
-      showToast(`Kegiatan "${res.taskTitle}": ${successCount} dari ${initialSessions.length} sesi tersimpan ke Google Calendar, sebagian gagal.`, 'info');
+    } else if (pushResult.successCount > 0) {
+      showToast(`Kegiatan "${res.taskTitle}": ${pushResult.successCount} dari ${initialSessions.length} sesi tersimpan ke Google Calendar, sebagian memerlukan rekonsiliasi atau gagal.`, 'info');
     } else {
       showToast(`Jadwal disimpan secara lokal, namun gagal terkirim ke Google Calendar.`, 'error');
     }
@@ -1163,122 +1045,13 @@ export default function App() {
       return;
     }
 
-    // Google Calendar active write
+    // Google Calendar active write using unified production orchestration service
     const pushTicket = calendarGuardRef.current.startPush();
-
-    let successCount = 0;
-    let failCount = 0;
-    let unconfirmedCount = 0;
-    let hasEncounteredAuthError = false;
-    let wasAborted = false;
-    const updatedSessions: TaskScheduleSession[] = [];
-    const newCalendarEvents: CalendarEvent[] = [];
-
-    for (const sess of initialSessions) {
-      if (pushTicket.isAborted()) {
-        wasAborted = true;
-        break;
-      }
-
-      // Idempotency: Sesi hanya dianggap tersinkron jika syncStatus === 'synced' dan memiliki ID Google Calendar valid
-      const hasValidRemoteId =
-        typeof (sess as any).googleCalendarEventId === 'string' &&
-        (sess as any).googleCalendarEventId.trim().length > 0;
-
-      if (sess.syncStatus === 'synced' && hasValidRemoteId) {
-        updatedSessions.push(sess);
-        continue;
-      }
-
-      // Anomali: status synced tapi ID kosong -> tidak klaim sukses palsu, tandai rekonsiliasi
-      if (sess.syncStatus === 'synced' && !hasValidRemoteId) {
-        unconfirmedCount++;
-        updatedSessions.push({
-          ...sess,
-          syncStatus: 'failed' as const,
-        });
-        continue;
-      }
-
-      try {
-        const created = await createGoogleCalendarEvent(
-          token,
-          {
-            title: `[EVEN] ${sess.taskTitle}`,
-            description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
-            startAt: sess.startAt,
-            endAt: sess.endAt,
-            timezone: plan.timezone || preferences.timezone,
-          },
-          pushTicket.signal
-        );
-
-        updatedSessions.push({
-          ...sess,
-          syncStatus: 'synced' as const,
-          googleCalendarEventId: created.id,
-          htmlLink: created.htmlLink,
-        });
-
-        newCalendarEvents.push({
-          id: `gcal-${created.id}`,
-          provider: 'google',
-          title: `[EVEN] ${sess.taskTitle}`,
-          description: plan.description || 'Dijadwalkan oleh Asisten AI EVEN.',
-          startAt: sess.startAt,
-          endAt: sess.endAt,
-          htmlLink: created.htmlLink,
-          isEditable: false,
-          syncStatus: 'synced',
-          category: 'focus',
-        });
-        successCount++;
-      } catch (err: any) {
-        const classification =
-          err instanceof GoogleCalendarApiError
-            ? err.classification
-            : classifyGoogleCalendarError(0, err.message || '', err);
-
-        // Aborted request: break immediately, preserve local data, NEVER mark as auth failure
-        if (pushTicket.isAborted() || classification.code === 'ABORTED') {
-          wasAborted = true;
-          updatedSessions.push({
-            ...sess,
-            syncStatus: 'pending' as const,
-          });
-          break;
-        }
-
-        console.error('AI Calendar event push error:', sanitizeSensitiveText(err.message || ''));
-
-        if (classification.isAuthError) {
-          hasEncounteredAuthError = true;
-        }
-
-        if (err.message?.includes('tidak dapat dikonfirmasi')) {
-          unconfirmedCount++;
-        } else {
-          failCount++;
-        }
-        updatedSessions.push({
-          ...sess,
-          syncStatus: 'failed' as const,
-        });
-      }
+    if (pushTicket.isAborted()) {
+      return;
     }
 
-    // Append remaining sessions if aborted mid-way, so local data is 100% complete
-    if (wasAborted && updatedSessions.length < initialSessions.length) {
-      const processedCount = updatedSessions.length;
-      for (let i = processedCount; i < initialSessions.length; i++) {
-        updatedSessions.push({
-          ...initialSessions[i],
-          syncStatus: 'pending' as const,
-        });
-      }
-    }
-
-    const newTask: Task = {
+    const taskBase: Task = {
       id: taskId,
       userId: userId || 'user-default',
       title: plan.title,
@@ -1302,27 +1075,29 @@ export default function App() {
       preferredWindow: plan.preferredWindow,
       timezone: plan.timezone,
       createdAt: new Date().toISOString(),
-      scheduledSessions: updatedSessions,
+      scheduledSessions: initialSessions,
     };
 
-    // 1. Persistensikan secara mutlak ke React state dan Firestore jika terautentikasi
-    await persistScheduledTask({
-      task: newTask,
+    const pushResult = await executeSchedulePush({
+      token,
+      task: taskBase,
+      sessions: initialSessions,
+      timezone: plan.timezone || preferences.timezone,
       userId,
-      newCalendarEvents,
+      pushTicket,
       setTasks,
       setEvents,
-      isUpdate: false,
+      isTaskUpdate: false,
+      description: plan.description,
     });
 
-    // 2. Jika operasi push telah menjadi stale (misal akibat disconnect atau push baru),
-    // BERHENTI DI SINI agar status koneksi atau diagnostik operasi baru tidak tertimpa!
-    if (pushTicket.isStale()) {
+    // 1. Jika operasi push telah menjadi stale, BERHENTI DI SINI
+    if (pushResult.isStale) {
       return;
     }
 
-    // 3. Operasi push aktif: lanjutkan pemutakhiran preferensi & diagnostik
-    if (hasEncounteredAuthError) {
+    // 2. Operasi push aktif: perbarui status auth jika terjadi error autentikasi
+    if (pushResult.hasEncounteredAuthError) {
       setCachedAccessToken(null);
       setHasGoogleAccessToken(false);
       setPreferences((prev) => ({
@@ -1334,25 +1109,27 @@ export default function App() {
 
     setDiagnosticInfo((prev) => ({
       ...prev,
-      connectionStatus: hasEncounteredAuthError ? 'needs_reauth' : prev.connectionStatus,
-      lastErrorMessage: hasEncounteredAuthError
+      connectionStatus: pushResult.hasEncounteredAuthError ? 'needs_reauth' : prev.connectionStatus,
+      lastErrorMessage: pushResult.hasEncounteredAuthError
         ? 'Token Google Calendar kedaluwarsa saat menyimpan sesi. Silakan hubungkan ulang di Pengaturan.'
         : prev.lastErrorMessage,
-      eventsCreatedCount: prev.eventsCreatedCount + successCount,
-      eventsFailedCount: prev.eventsFailedCount + failCount,
-      eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
+      eventsCreatedCount: prev.eventsCreatedCount + pushResult.successCount,
+      eventsFailedCount: prev.eventsFailedCount + pushResult.failCount,
+      eventsUnconfirmedCount: prev.eventsUnconfirmedCount + pushResult.unconfirmedCount,
     }));
 
-    if (wasAborted) {
-      if (successCount > 0) {
-        showToast(`Rencana "${plan.title}": ${successCount} sesi tersimpan ke Google Calendar sebelum dibatalkan. Sesi tersisa disimpan lokal.`, 'info');
+    if (pushResult.wasAborted) {
+      if (pushResult.successCount > 0) {
+        showToast(`Rencana "${plan.title}": ${pushResult.successCount} sesi tersimpan ke Google Calendar sebelum dibatalkan. Sesi tersisa disimpan lokal.`, 'info');
       } else {
         showToast(`Rencana "${plan.title}" disimpan secara lokal; pengiriman ke Google Calendar dibatalkan.`, 'info');
       }
-    } else if (successCount === initialSessions.length) {
+    } else if (pushResult.reconciliationCount > 0 && pushResult.successCount === 0) {
+      showToast(`Hasil penyimpanan ke Google Calendar belum terkonfirmasi. Sesi dialihkan ke status "Perlu Rekonsiliasi".`, 'info');
+    } else if (pushResult.successCount === initialSessions.length) {
       showToast(`Rencana "${plan.title}" berhasil disimpan dan disinkronkan ke Google Calendar!`, 'success');
-    } else if (successCount > 0) {
-      showToast(`Rencana "${plan.title}": ${successCount} dari ${initialSessions.length} sesi berhasil disimpan ke Google Calendar, beberapa sesi gagal.`, 'info');
+    } else if (pushResult.successCount > 0) {
+      showToast(`Rencana "${plan.title}": ${pushResult.successCount} dari ${initialSessions.length} sesi tersimpan ke Google Calendar, beberapa sesi memerlukan rekonsiliasi atau gagal.`, 'info');
     } else {
       showToast(`Rencana "${plan.title}" disimpan lokal, namun gagal disinkronkan ke Google Calendar.`, 'error');
     }

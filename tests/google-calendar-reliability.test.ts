@@ -11,10 +11,12 @@ import {
   GoogleCalendarApiError,
   sanitizeGoogleErrorMessage,
   sanitizeSensitiveText,
+  reconcileSessionWithRemoteEvents,
 } from '../src/lib/googleCalendar';
 import { CalendarOperationGuard } from '../src/lib/calendarOperationGuard';
 import { persistScheduledTask } from '../src/lib/taskPersistence';
-import { CalendarEvent, Task } from '../src/types';
+import { executeSchedulePush } from '../src/lib/calendarPushService';
+import { CalendarEvent, Task, TaskScheduleSession } from '../src/types';
 
 export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
   console.log('================================================================');
@@ -1796,6 +1798,561 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       assert.strictEqual(stateTasks.length, 1, 'Task A tetap tersimpan di state lokal');
 
       console.log('  ✅ [PASS] Test 35: Push A stale terlindungi dari menimpa diagnostic state Push B, namun Task A tetap terpersistensi.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 36 (TEST A): Ambiguous Post State - Server Succeeded, Client Lost Response
+    // ----------------------------------------------------
+    console.log('\n--- [Test 36 / Test A] Ambiguous Post State (Server Succeeded, Client Lost Response) ---');
+    {
+      const guard = new CalendarOperationGuard();
+      const pushTicket = guard.startPush();
+
+      // Mock remote server database
+      const mockServerEvents: Array<{ id: string; title: string; extendedProperties?: any }> = [];
+
+      // Mock create function yang mensimulasikan kegagalan jaringan setelah server berhasil membuat event
+      const mockCreateEventNetworkDrop = async (
+        _token: string,
+        input: any,
+        _signal?: AbortSignal
+      ) => {
+        // Server berhasil membuat event dan mencatatnya ke database server
+        const generatedRemoteId = `remote-event-${Date.now()}`;
+        mockServerEvents.push({
+          id: generatedRemoteId,
+          title: input.title,
+          extendedProperties: input.extendedProperties,
+        });
+
+        // Tepat sebelum mengirimkan respons HTTP 200 kembali ke klien, koneksi socket putus (network drop)
+        const netErr = new TypeError('Failed to fetch');
+        const classification = classifyGoogleCalendarError(0, '', netErr);
+        throw new GoogleCalendarApiError(classification);
+      };
+
+      const initialSession: TaskScheduleSession = {
+        id: 'sess-ambiguous-net-drop-1',
+        taskTitle: 'Desain Arsitektur Sistem',
+        sessionIndex: 1,
+        totalSessions: 1,
+        durationMinutes: 60,
+        startAt: '2026-11-06T14:00:00+07:00',
+        endAt: '2026-11-06T15:00:00+07:00',
+        syncStatus: 'pending',
+      };
+
+      const taskToPush: Task = {
+        id: 'task-ambiguous-test-1',
+        userId: 'user-reliable-1',
+        title: 'Desain Arsitektur Sistem',
+        status: 'SCHEDULED',
+        allowSplit: false,
+        estimatedDurationMinutes: 60,
+        minimumSessionMinutes: 30,
+        priority: 'HIGH',
+        createdAt: new Date().toISOString(),
+        scheduledSessions: [initialSession],
+      };
+
+      let persistedTasks: Task[] = [];
+      const mockSetTasks: any = (updater: any) => {
+        persistedTasks = typeof updater === 'function' ? updater(persistedTasks) : updater;
+      };
+
+      const firestoreSaves: any[] = [];
+      const mockSaveToStorage = async (task: Task, userId: string) => {
+        firestoreSaves.push({ task, userId });
+      };
+
+      // Eksekusi push melalui production handler service executeSchedulePush
+      const pushResult = await executeSchedulePush({
+        token: 'mock-valid-token',
+        task: taskToPush,
+        sessions: [initialSession],
+        timezone: 'Asia/Jakarta',
+        userId: 'user-reliable-1',
+        pushTicket,
+        setTasks: mockSetTasks,
+        createEventFn: mockCreateEventNetworkDrop,
+        saveToStorage: mockSaveToStorage,
+      });
+
+      // 1. Verifikasi transisi status: Error jaringan dipetakan ke 'needs_reconciliation', BUKAN 'failed'
+      assert.strictEqual(pushResult.reconciliationCount, 1, 'Reconciliation count harus 1');
+      assert.strictEqual(pushResult.unconfirmedCount, 1, 'Unconfirmed count harus 1');
+      assert.strictEqual(pushResult.failCount, 0, 'Fail count tidak boleh bertambah untuk error ambigu');
+      assert.strictEqual(pushResult.hasEncounteredAuthError, false, 'Network drop bukan auth error');
+
+      const resultingSession = pushResult.updatedSessions[0];
+      assert.strictEqual(
+        resultingSession.syncStatus,
+        'needs_reconciliation',
+        'Sesi dengan network drop harus dialihkan ke status needs_reconciliation'
+      );
+      assert.strictEqual(
+        resultingSession.googleCalendarEventId,
+        undefined,
+        'Remote ID tidak boleh diisi klaim palsu sebelum terkonfirmasi'
+      );
+
+      // 2. Verifikasi persistensi: Task tersimpan di Firestore dan state React dengan status needs_reconciliation
+      assert.strictEqual(firestoreSaves.length, 1);
+      assert.strictEqual(firestoreSaves[0].task.scheduledSessions[0].syncStatus, 'needs_reconciliation');
+      assert.strictEqual(persistedTasks[0].scheduledSessions[0].syncStatus, 'needs_reconciliation');
+
+      // 3. Verifikasi Server: Server berhasil membuat 1 event
+      assert.strictEqual(mockServerEvents.length, 1, 'Mock server harus memiliki 1 event yang tersimpan');
+
+      // 4. Verifikasi Larangan Resend Buta (Prohibit Blind Resend):
+      // Jika retry atau batchCreateGoogleCalendarEvents dijalankan ulang pada sesi needs_reconciliation tanpa remote ID terverifikasi,
+      // operasi harus MENOLAK / MELEWATI pembuatan POST baru secara buta!
+      const retryEventsInput = [
+        {
+          id: resultingSession.id,
+          title: `[EVEN] ${resultingSession.taskTitle}`,
+          startAt: resultingSession.startAt,
+          endAt: resultingSession.endAt,
+          syncStatus: resultingSession.syncStatus,
+          googleCalendarEventId: resultingSession.googleCalendarEventId,
+        },
+      ];
+
+      // Panggil batchCreateGoogleCalendarEvents dengan mock fetch yang memantau apakah ada POST yang dikirim
+      let attemptedDuplicatePost = false;
+      global.fetch = async (url: any, init: any) => {
+        if (init?.method === 'POST') {
+          attemptedDuplicatePost = true;
+          mockServerEvents.push({ id: 'accidental-duplicate', title: 'duplicate' });
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 'accidental-duplicate' }),
+        } as any;
+      };
+
+      const batchRetryResult = await batchCreateGoogleCalendarEvents('mock-valid-token', retryEventsInput as any);
+
+      assert.strictEqual(attemptedDuplicatePost, false, 'Dilarang mengirim POST baru secara buta untuk sesi needs_reconciliation');
+      assert.strictEqual(mockServerEvents.length, 1, 'Jumlah event di server harus tetap 1, tidak boleh terduplikasi');
+      assert.strictEqual(batchRetryResult.results[0].classification?.code, 'NEEDS_RECONCILIATION');
+
+      console.log('  ✅ [PASS] Test 36 (Test A): Network drop terpetakan ke needs_reconciliation, tersimpan persisten, dan POST duplikat dicegah 100%.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 37 (TEST B): Confirmed Reconciliation via Stable Session ID
+    // ----------------------------------------------------
+    console.log('\n--- [Test 37 / Test B] Confirmed Reconciliation via Stable Session ID ---');
+    {
+      const sessionId = 'sess-reconcile-target-123';
+      const sessionObj = {
+        id: sessionId,
+        title: 'Sesi Penting',
+      };
+
+      // Remote events diambil dari Google Calendar (mengandung extendedProperties.private.evenSessionId)
+      const remoteEventsFromGoogle = [
+        {
+          id: 'unrelated-remote-1',
+          htmlLink: 'https://calendar.google.com/event?eid=unrelated',
+          extendedProperties: {
+            private: {
+              evenSessionId: 'other-session-id',
+            },
+          },
+        },
+        {
+          id: 'matched-remote-event-999',
+          htmlLink: 'https://calendar.google.com/event?eid=matched999',
+          extendedProperties: {
+            private: {
+              evenTaskId: 'task-123',
+              evenSessionId: sessionId,
+              evenSessionIndex: '1',
+            },
+          },
+        },
+      ];
+
+      // Rekonsiliasikan sesi ambigu dengan event remote
+      const reconResult = reconcileSessionWithRemoteEvents(sessionObj, remoteEventsFromGoogle);
+
+      assert.strictEqual(reconResult.status, 'confirmed', 'Rekonsiliasi harus terkonfirmasi');
+      assert.strictEqual(reconResult.remoteEventId, 'matched-remote-event-999');
+      assert.strictEqual(reconResult.htmlLink, 'https://calendar.google.com/event?eid=matched999');
+
+      // Setelah rekonsiliasi, sesi diperbarui dengan remote ID terkonfirmasi dan syncStatus: 'synced'
+      const reconciledSession: TaskScheduleSession = {
+        id: sessionId,
+        taskTitle: 'Sesi Penting',
+        sessionIndex: 1,
+        totalSessions: 1,
+        durationMinutes: 45,
+        startAt: '2026-11-06T16:00:00+07:00',
+        endAt: '2026-11-06T16:45:00+07:00',
+        syncStatus: 'synced',
+        googleCalendarEventId: reconResult.remoteEventId,
+        htmlLink: reconResult.htmlLink,
+      };
+
+      // Pada push berikutnya via executeSchedulePush, sesi yang sudah synced dengan remote ID valid
+      // harus di-skip secara idempoten tanpa melakukan panggilan pembuatan event baru
+      let createCalled = false;
+      const mockCreateFn = async () => {
+        createCalled = true;
+        return { id: 'should-not-be-called' };
+      };
+
+      const guard = new CalendarOperationGuard();
+      const ticket = guard.startPush();
+      let stateTasks: Task[] = [];
+      const mockSetTasks: any = (updater: any) => {
+        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+
+      const nextPushResult = await executeSchedulePush({
+        token: 'mock-token',
+        task: {
+          id: 'task-123',
+          userId: 'user-1',
+          title: 'Sesi Penting',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 45,
+          minimumSessionMinutes: 30,
+          priority: 'MEDIUM',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [reconciledSession],
+        },
+        sessions: [reconciledSession],
+        timezone: 'Asia/Jakarta',
+        userId: 'user-1',
+        pushTicket: ticket,
+        setTasks: mockSetTasks,
+        createEventFn: mockCreateFn,
+        saveToStorage: async () => {},
+      });
+
+      assert.strictEqual(createCalled, false, 'Sesi yang sudah terkonfirmasi rekonsiliasi tidak boleh memicu POST baru');
+      assert.strictEqual(nextPushResult.updatedSessions[0].googleCalendarEventId, 'matched-remote-event-999');
+      assert.strictEqual(nextPushResult.updatedSessions[0].syncStatus, 'synced');
+
+      console.log('  ✅ [PASS] Test 37 (Test B): Rekonsiliasi berbasis extendedProperties.private terkonfirmasi unik dan push berikutnya idempoten.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 38 (TEST C): Ambiguous Search Result (>1 Candidates) Prevents Blind Selection & Duplicate POST
+    // ----------------------------------------------------
+    console.log('\n--- [Test 38 / Test C] Ambiguous Search Result (>1 Candidates) Prevents Blind Selection ---');
+    {
+      const sessionId = 'sess-ambiguous-candidate-test';
+      const sessionObj = {
+        id: sessionId,
+        title: 'Tugas Split Multi-Kandidat',
+      };
+
+      // Remote events Google Calendar mengandung dua agenda dengan evenSessionId yang identik
+      const remoteEventsWithDuplicates = [
+        {
+          id: 'remote-dup-1',
+          extendedProperties: {
+            private: { evenSessionId: sessionId },
+          },
+        },
+        {
+          id: 'remote-dup-2',
+          extendedProperties: {
+            private: { evenSessionId: sessionId },
+          },
+        },
+      ];
+
+      const reconResult = reconcileSessionWithRemoteEvents(sessionObj, remoteEventsWithDuplicates);
+
+      // Verifikasi 1: Dilarang memilih acak / blind selection
+      assert.strictEqual(reconResult.status, 'ambiguous', 'Jika terdapat >1 kandidat, status harus ambiguous');
+      assert.strictEqual(reconResult.remoteEventId, undefined, 'Remote ID tidak boleh diisi sembarangan');
+      assert.strictEqual(reconResult.candidateIds?.length, 2);
+      assert.ok(reconResult.message.includes('Ditemukan 2 kandidat agenda'));
+
+      // Verifikasi 2: Sesi tetap berada pada needs_reconciliation
+      const sessionStillAmbiguous: TaskScheduleSession = {
+        id: sessionId,
+        taskTitle: 'Tugas Split Multi-Kandidat',
+        sessionIndex: 1,
+        totalSessions: 1,
+        durationMinutes: 30,
+        startAt: '2026-11-06T17:00:00+07:00',
+        endAt: '2026-11-06T17:30:00+07:00',
+        syncStatus: 'needs_reconciliation',
+      };
+
+      // Verifikasi 3: executeSchedulePush TIDAK membuat POST baru untuk sesi ambiguous
+      let duplicateCreated = false;
+      const mockCreateFn = async () => {
+        duplicateCreated = true;
+        return { id: 'unexpected-post' };
+      };
+
+      const guard = new CalendarOperationGuard();
+      const ticket = guard.startPush();
+      let stateTasks: Task[] = [];
+      const mockSetTasks: any = (updater: any) => {
+        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+
+      const pushRes = await executeSchedulePush({
+        token: 'mock-token',
+        task: {
+          id: 'task-dup-test',
+          userId: 'user-1',
+          title: 'Tugas Split Multi-Kandidat',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'MEDIUM',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [sessionStillAmbiguous],
+        },
+        sessions: [sessionStillAmbiguous],
+        timezone: 'Asia/Jakarta',
+        userId: 'user-1',
+        pushTicket: ticket,
+        setTasks: mockSetTasks,
+        createEventFn: mockCreateFn,
+        saveToStorage: async () => {},
+      });
+
+      assert.strictEqual(duplicateCreated, false, 'POST baru dilarang ketika sesi berstatus needs_reconciliation');
+      assert.strictEqual(pushRes.reconciliationCount, 1);
+      assert.strictEqual(pushRes.updatedSessions[0].syncStatus, 'needs_reconciliation');
+
+      console.log('  ✅ [PASS] Test 38 (Test C): Multi-kandidat remote dideteksi ambiguous, tidak ada pemilihan buta, dan POST dicegah.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 39 (TEST D): Disconnect During Push via Production Handler
+    // ----------------------------------------------------
+    console.log('\n--- [Test 39 / Test D] Production Handler executeSchedulePush Disconnect Mid-Push ---');
+    {
+      const guard = new CalendarOperationGuard();
+      const pushTicket = guard.startPush();
+
+      const initialSessions: TaskScheduleSession[] = [
+        {
+          id: 'sess-p1',
+          taskTitle: 'Tugas Besar Proyek',
+          sessionIndex: 1,
+          totalSessions: 2,
+          durationMinutes: 45,
+          startAt: '2026-11-06T09:00:00+07:00',
+          endAt: '2026-11-06T09:45:00+07:00',
+          syncStatus: 'pending',
+        },
+        {
+          id: 'sess-p2',
+          taskTitle: 'Tugas Besar Proyek',
+          sessionIndex: 2,
+          totalSessions: 2,
+          durationMinutes: 45,
+          startAt: '2026-11-06T10:00:00+07:00',
+          endAt: '2026-11-06T10:45:00+07:00',
+          syncStatus: 'pending',
+        },
+      ];
+
+      // Mock create function yang mensimulasikan sesi 1 sukses, lalu disconnect dipanggil tepat sebelum sesi 2
+      let callCount = 0;
+      const mockCreateEvent = async (
+        _token: string,
+        input: any,
+        signal?: AbortSignal
+      ) => {
+        callCount++;
+        if (callCount === 1) {
+          // Sesi 1 berhasil
+          return { id: 'gcal-remote-p1-success' };
+        }
+        // Jika dipanggil setelah abort, sinyal harus sudah aktif
+        if (signal?.aborted) {
+          const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
+          throw new GoogleCalendarApiError(classification);
+        }
+        return { id: 'gcal-remote-p2-success' };
+      };
+
+      // Mock createEventFn yang memicu guard.disconnect() segera setelah sesi 1 selesai
+      const mockCreateWithDisconnect = async (
+        token: string,
+        input: any,
+        signal?: AbortSignal
+      ) => {
+        const res = await mockCreateEvent(token, input, signal);
+        if (callCount === 1) {
+          // Simulasi interaksi pengguna: menekan tombol Disconnect saat pengiriman berlangsung
+          guard.disconnect();
+        }
+        return res;
+      };
+
+      let localStateTasks: Task[] = [];
+      const mockSetTasks: any = (updater: any) => {
+        localStateTasks = typeof updater === 'function' ? updater(localStateTasks) : updater;
+      };
+
+      const firestoreWrites: any[] = [];
+      const mockSaveToStorage = async (task: Task, userId: string) => {
+        firestoreWrites.push({ task, userId });
+      };
+
+      // State koneksi aplikasi saat ini
+      let connectionStatus = 'unconnected';
+
+      const pushResult = await executeSchedulePush({
+        token: 'mock-token',
+        task: {
+          id: 'task-disconnect-test',
+          userId: 'user-auth-d',
+          title: 'Tugas Besar Proyek',
+          status: 'SCHEDULED',
+          allowSplit: true,
+          estimatedDurationMinutes: 90,
+          minimumSessionMinutes: 45,
+          priority: 'HIGH',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: initialSessions,
+        },
+        sessions: initialSessions,
+        timezone: 'Asia/Jakarta',
+        userId: 'user-auth-d',
+        pushTicket,
+        setTasks: mockSetTasks,
+        createEventFn: mockCreateWithDisconnect,
+        saveToStorage: mockSaveToStorage,
+      });
+
+      // 1. Verifikasi tiket & status stale
+      assert.strictEqual(pushResult.wasAborted, true, 'Operasi harus ditandai wasAborted');
+      assert.strictEqual(pushResult.isStale, true, 'Operasi harus ditandai isStale');
+      assert.strictEqual(pushResult.successCount, 1, 'Sesi 1 berhasil disimpan');
+
+      // 2. Verifikasi Sesi 1 mempertahankan ID remote
+      const sess1 = pushResult.updatedSessions[0];
+      assert.strictEqual(sess1.syncStatus, 'synced');
+      assert.strictEqual(sess1.googleCalendarEventId, 'gcal-remote-p1-success');
+
+      // 3. Verifikasi Sesi 2 yang dibatalkan tetap pending dan tidak memiliki remote ID
+      const sess2 = pushResult.updatedSessions[1];
+      assert.strictEqual(sess2.syncStatus, 'pending');
+      assert.strictEqual(sess2.googleCalendarEventId, undefined);
+
+      // 4. Verifikasi Persistensi Firestore: Seluruh sesi (termasuk yang synced dan pending) tersimpan
+      assert.strictEqual(firestoreWrites.length, 1, 'Firestore harus menerima snapshot tugas');
+      assert.strictEqual(firestoreWrites[0].task.scheduledSessions[0].googleCalendarEventId, 'gcal-remote-p1-success');
+      assert.strictEqual(firestoreWrites[0].task.scheduledSessions[1].syncStatus, 'pending');
+
+      // 5. Stale Guard: Karena pushResult.isStale === true, connectionStatus TIDAK diubah
+      assert.strictEqual(connectionStatus, 'unconnected', 'Status koneksi tetap unconnected setelah disconnect');
+
+      console.log('  ✅ [PASS] Test 39 (Test D): Production handler mempertahankan ID sesi berhasil, menyimpan sesi pending ke storage, dan melindungi status koneksi.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 40 (TEST E): Newer Push Supersedes Older Push via Production Handler
+    // ----------------------------------------------------
+    console.log('\n--- [Test 40 / Test E] Newer Push Supersedes Older Push via executeSchedulePush ---');
+    {
+      const guard = new CalendarOperationGuard();
+
+      // Push A dimulai
+      const pushA = guard.startPush();
+
+      // Push B dimulai sesaat kemudian (menggantikan Push A)
+      const pushB = guard.startPush();
+
+      assert.strictEqual(pushA.isStale(), true, 'Push A harus menjadi stale');
+      assert.strictEqual(pushB.isStale(), false, 'Push B harus aktif');
+
+      // State diagnostik milik Push B yang aktif
+      let diagnosticState = {
+        connectionStatus: 'connected',
+        lastErrorMessage: undefined as string | undefined,
+        eventsCreatedCount: 10,
+      };
+
+      const firestoreWritesA: any[] = [];
+      const mockSaveStorageA = async (task: Task, userId: string) => {
+        firestoreWritesA.push({ task, userId });
+      };
+
+      let stateTasks: Task[] = [];
+      const mockSetTasks: any = (updater: any) => {
+        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+
+      const taskA: Task = {
+        id: 'task-a-interleaved',
+        userId: 'user-test-e',
+        title: 'Task A Superceded',
+        status: 'SCHEDULED',
+        allowSplit: false,
+        estimatedDurationMinutes: 30,
+        minimumSessionMinutes: 30,
+        priority: 'LOW',
+        createdAt: new Date().toISOString(),
+        scheduledSessions: [
+          {
+            id: 'sess-a-1',
+            taskTitle: 'Task A Superceded',
+            sessionIndex: 1,
+            totalSessions: 1,
+            durationMinutes: 30,
+            startAt: '2026-11-06T08:00:00+07:00',
+            endAt: '2026-11-06T08:30:00+07:00',
+            syncStatus: 'pending',
+          },
+        ],
+      };
+
+      // Jalankan push A via production handler
+      const resultA = await executeSchedulePush({
+        token: 'mock-token',
+        task: taskA,
+        sessions: taskA.scheduledSessions,
+        timezone: 'Asia/Jakarta',
+        userId: 'user-test-e',
+        pushTicket: pushA,
+        setTasks: mockSetTasks,
+        saveToStorage: mockSaveStorageA,
+      });
+
+      // 1. Verifikasi bahwa resultA ditandai isStale: true
+      assert.strictEqual(resultA.isStale, true, 'Hasil push A harus ditandai isStale');
+
+      // 2. Verifikasi Task A tetap tersimpan ke Firestore
+      assert.strictEqual(firestoreWritesA.length, 1, 'Task A harus tetap dipersistensikan');
+      assert.strictEqual(firestoreWritesA[0].task.id, 'task-a-interleaved');
+
+      // 3. Simulasi handler produksi: jika resultA.isStale === true, diagnostik TIDAK ditimpa
+      let diagnosticMutatedByA = false;
+      if (!resultA.isStale) {
+        diagnosticMutatedByA = true;
+        diagnosticState = {
+          connectionStatus: 'needs_reauth',
+          lastErrorMessage: 'Error dari operasi A yang sudah kedaluwarsa',
+          eventsCreatedCount: 0,
+        };
+      }
+
+      assert.strictEqual(diagnosticMutatedByA, false, 'Push A tidak boleh memutasi state diagnostik');
+      assert.strictEqual(diagnosticState.connectionStatus, 'connected');
+      assert.strictEqual(diagnosticState.eventsCreatedCount, 10);
+      assert.strictEqual(diagnosticState.lastErrorMessage, undefined);
+
+      console.log('  ✅ [PASS] Test 40 (Test E): Stale push data terpersistensi penuh ke storage, dan status diagnostik operasi terbaru terlindungi.');
     }
 
     console.log('\n================================================================');

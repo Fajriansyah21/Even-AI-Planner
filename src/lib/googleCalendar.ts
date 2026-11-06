@@ -625,17 +625,27 @@ export async function fetchGoogleCalendarEvents(
  * Creates a scheduled event directly on Google Calendar
  * Validates non-empty ID and handles unconfirmed responses.
  */
+export interface GoogleCalendarEventInput {
+  title: string;
+  description?: string;
+  startAt: string;
+  endAt: string;
+  isAllDay?: boolean;
+  timezone?: string;
+  clientRequestId?: string;
+  extendedProperties?: {
+    private?: Record<string, string>;
+    shared?: Record<string, string>;
+  };
+}
+
+/**
+ * Creates a scheduled event directly on Google Calendar
+ * Validates non-empty ID and handles unconfirmed responses.
+ */
 export async function createGoogleCalendarEvent(
   accessToken: string,
-  event: {
-    title: string;
-    description?: string;
-    startAt: string;
-    endAt: string;
-    isAllDay?: boolean;
-    timezone?: string;
-    clientRequestId?: string;
-  },
+  event: GoogleCalendarEventInput,
   signal?: AbortSignal
 ): Promise<{ id: string; htmlLink?: string }> {
   if (!accessToken || !accessToken.trim()) {
@@ -672,6 +682,10 @@ export async function createGoogleCalendarEvent(
       useDefault: true,
     },
   };
+
+  if (event.extendedProperties) {
+    payload.extendedProperties = event.extendedProperties;
+  }
 
   if (event.isAllDay) {
     const startDateOnly = event.startAt.split('T')[0];
@@ -1033,20 +1047,21 @@ export async function batchCreateGoogleCalendarEvents(
         };
       }
 
-      // 2. Anomali: Ditandai sebagai 'synced' namun ID Google Calendar kosong/hilang.
+      // 2. Anomali & Rekonsiliasi: Ditandai sebagai 'synced' atau 'needs_reconciliation' namun ID Google Calendar belum valid.
       // DOKUMENTASI ARSITEKTUR REKONSILIASI:
       // Google Calendar v3 REST API tidak menyediakan native client Idempotency-Key.
       // Mekanisme rekonsiliasi otomatis berbasis pencocokan 'summary' (judul) dan rentang waktu semata
       // TIDAK DIAKTIFKAN karena rawan false-positive (misal user memiliki agenda berulang atau agenda
       // bernama serupa di jam yang sama tanpa penanda unik task ID).
       // Oleh karena itu:
-      // a) Sistem TIDAK mengklaim sukses palsu.
-      // b) Sistem TIDAK membuat ulang agenda duplikat secara otomatis bila berstatus ambigu.
-      // c) Status diklasifikasikan sebagai NEEDS_RECONCILIATION (HTTP 409) agar transparan kepada pengguna.
-      if (ev.syncStatus === 'synced' && !hasValidRemoteId) {
+      // a) Sesi 'needs_reconciliation' DILARANG dikirim ulang melalui POST otomatis.
+      // b) Sistem TIDAK mengklaim sukses palsu.
+      // c) Sistem TIDAK membuat ulang agenda duplikat secara otomatis bila berstatus ambigu.
+      // d) Status diklasifikasikan sebagai NEEDS_RECONCILIATION (HTTP 409) agar transparan kepada pengguna.
+      if ((ev.syncStatus === 'synced' || ev.syncStatus === 'needs_reconciliation') && !hasValidRemoteId) {
         return {
           localId: ev.id,
-          error: 'Status agenda tercatat tersinkronkan namun tidak memiliki ID Google Calendar valid. Memerlukan rekonsiliasi data.',
+          error: 'Status agenda memerlukan rekonsiliasi (ID Google Calendar belum dikonfirmasi). POST otomatis dilarang untuk mencegah duplikasi.',
           classification: {
             code: 'NEEDS_RECONCILIATION' as const,
             status: 409,
@@ -1055,7 +1070,7 @@ export async function batchCreateGoogleCalendarEvents(
             isRateLimitError: false,
             isTransient: false,
             shouldReauth: false,
-            message: 'Status agenda tercatat tersinkronkan namun tidak memiliki ID Google Calendar valid. Memerlukan rekonsiliasi data.',
+            message: 'Status agenda memerlukan rekonsiliasi. Tidak boleh dikirim ulang secara otomatis tanpa remote ID yang terkonfirmasi.',
             userAction: 'Lakukan rekonsiliasi kalender atau periksa agenda Google Calendar.',
           },
         };
@@ -1070,6 +1085,7 @@ export async function batchCreateGoogleCalendarEvents(
             endAt: ev.endAt,
             timezone: ev.timezone,
             isAllDay: ev.isAllDay,
+            extendedProperties: (ev as any).extendedProperties,
           },
           signal
         );
@@ -1125,5 +1141,69 @@ export async function batchCreateGoogleCalendarEvents(
     successfulCount,
     failedCount,
     results,
+  };
+}
+
+export interface SessionReconciliationResult {
+  status: 'confirmed' | 'ambiguous' | 'not_found';
+  remoteEventId?: string;
+  htmlLink?: string;
+  candidateIds?: string[];
+  message: string;
+}
+
+/**
+ * Merekonsiliasi sesi ambigu (needs_reconciliation) terhadap daftar agenda remote.
+ * Memanfaatkan identitas sesi stabil extendedProperties.private.evenSessionId atau ID remote eksisting.
+ *
+ * Aturan Rekonsiliasi:
+ * 1. Jika ditemukan tepat 1 event yang cocok via evenSessionId -> status: 'confirmed'.
+ * 2. Jika ditemukan lebih dari 1 kandidat yang cocok -> status: 'ambiguous' (DILARANG memilih otomatis).
+ * 3. Jika tidak ada event yang cocok -> status: 'not_found'.
+ */
+export function reconcileSessionWithRemoteEvents(
+  session: { id: string; googleCalendarEventId?: string; title?: string },
+  remoteEvents: Array<{ id: string; htmlLink?: string; extendedProperties?: { private?: Record<string, string> } }>
+): SessionReconciliationResult {
+  // 1. Cek kecocokan langsung berdasarkan ID remote yang sudah diketahui
+  if (session.googleCalendarEventId) {
+    const directMatch = remoteEvents.find(
+      (e) => e.id === session.googleCalendarEventId || `gcal-${e.id}` === session.googleCalendarEventId
+    );
+    if (directMatch) {
+      return {
+        status: 'confirmed',
+        remoteEventId: directMatch.id,
+        htmlLink: directMatch.htmlLink,
+        message: 'Agenda remote terkonfirmasi berdasarkan ID remote yang tercatat.',
+      };
+    }
+  }
+
+  // 2. Cek berdasarkan identitas stabil session ID pada extendedProperties.private
+  const identityMatches = remoteEvents.filter(
+    (e) => e.extendedProperties?.private?.evenSessionId === session.id
+  );
+
+  if (identityMatches.length === 1) {
+    return {
+      status: 'confirmed',
+      remoteEventId: identityMatches[0].id,
+      htmlLink: identityMatches[0].htmlLink,
+      message: 'Agenda remote terkonfirmasi secara unik berdasarkan identitas sesi EVEN.',
+    };
+  }
+
+  if (identityMatches.length > 1) {
+    return {
+      status: 'ambiguous',
+      candidateIds: identityMatches.map((e) => e.id),
+      message: `Ditemukan ${identityMatches.length} kandidat agenda yang cocok. Pemilihan otomatis dilarang untuk mencegah ketidakkonsistenan.`,
+    };
+  }
+
+  return {
+    status: 'not_found',
+    message: 'Agenda remote tidak ditemukan dalam rentang kalender.',
   };
 }

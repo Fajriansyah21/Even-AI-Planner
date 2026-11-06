@@ -158,6 +158,10 @@ export interface CalendarEvent {
   isRecurring?: boolean;
   syncStatus: SyncStatus;
   category?: 'meeting' | 'focus' | 'personal' | 'deadline';
+  extendedProperties?: {
+    private?: Record<string, string>;
+    shared?: Record<string, string>;
+  };
 }
 
 export interface UserPreferences {
