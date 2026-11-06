@@ -45,6 +45,7 @@ export interface CalendarDiagnosticState {
 export type GoogleCalendarErrorCode =
   | 'AUTH_EXPIRED_OR_INVALID' // HTTP 401: Token invalid or expired
   | 'PERMISSION_DENIED'       // HTTP 403: Scope or calendar access not permitted
+  | 'API_NOT_CONFIGURED'      // HTTP 403: Google Calendar API disabled / not configured in Cloud project
   | 'NOT_FOUND'               // HTTP 404: Resource or primary calendar not found
   | 'RATE_LIMIT_EXCEEDED'     // HTTP 429 atau 403: API quota or rate limit exceeded
   | 'SERVICE_UNAVAILABLE'     // HTTP 500-599: Google service temporary failure
@@ -114,12 +115,18 @@ export class GoogleCalendarApiError extends Error {
 export function sanitizeSensitiveText(text: string): string {
   if (!text) return '';
   return String(text)
-    .replace(/ya29\.[a-zA-Z0-9_-]+/g, '[REDACTED_TOKEN]')
-    .replace(/1\/\/[a-zA-Z0-9_-]+/g, '[REDACTED_REFRESH_TOKEN]')
-    .replace(/Bearer\s+[^\s]+/gi, 'Bearer [REDACTED]')
+    // Google OAuth access tokens (ya29.xxx)
+    .replace(/ya29\.[a-zA-Z0-9_\-.]+/g, '[REDACTED_TOKEN]')
+    // Google OAuth refresh tokens (1//xxx)
+    .replace(/1\/\/[a-zA-Z0-9_\-.]+/g, '[REDACTED_REFRESH_TOKEN]')
+    // Authorization: Bearer <token>
+    .replace(/Bearer\s+[a-zA-Z0-9_\-.]+/gi, 'Bearer [REDACTED]')
+    // Email addresses
     .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, '[REDACTED_EMAIL]')
-    .replace(/access_token=[^\s&]+/gi, 'access_token=[REDACTED]')
-    .replace(/refresh_token=[^\s&]+/gi, 'refresh_token=[REDACTED]');
+    // Sensitive URL query parameters: ?access_token=..., &refresh_token=..., &client_secret=..., &key=..., &code=..., &token=..., &apiKey=...
+    .replace(/([?&](?:access_token|refresh_token|token|client_secret|client_id|apiKey|key|code|auth)=)[^&\s]+/gi, '$1[REDACTED]')
+    // JSON / key-value format e.g. "access_token": "secret" or 'client_secret': 'abc'
+    .replace(/(["']?(?:access_token|refresh_token|client_secret|apiKey)["']?\s*[:=]\s*["']?)[^"',\s&}]+/gi, '$1[REDACTED]');
 }
 
 /**
@@ -130,10 +137,16 @@ export function sanitizeGoogleErrorMessage(status: number, rawText: string): str
     return 'Token Google Calendar kedaluwarsa atau tidak valid (HTTP 401). Silakan putuskan dan sambungkan kembali akun Google Anda di Pengaturan.';
   }
   if (status === 403) {
-    if (/userRateLimitExceeded|rateLimitExceeded|quotaExceeded|calendarUsageLimitsExceeded/i.test(rawText)) {
+    if (/userRateLimitExceeded|rateLimitExceeded|quotaExceeded|calendarUsageLimitsExceeded|dailyLimitExceeded|limitExceeded/i.test(rawText)) {
       return 'Batas kuota atau laju panggilan Google Calendar terlampaui (HTTP 403). Mohon tunggu beberapa saat sebelum mencoba kembali.';
     }
-    return 'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.';
+    if (/accessNotConfigured/i.test(rawText)) {
+      return 'Google Calendar API belum diaktifkan atau belum dikonfigurasi pada proyek Google Cloud pengembang.';
+    }
+    if (/insufficientPermissions|forbidden/i.test(rawText)) {
+      return 'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.';
+    }
+    return 'Akses Google Calendar dibatasi atau ditolak oleh server Google (HTTP 403). Silakan periksa status layanan Google atau coba beberapa saat lagi.';
   }
   if (status === 404) {
     return 'Kalender atau agenda tidak ditemukan di Google Calendar (HTTP 404). Data lokal Anda tetap aman.';
@@ -257,8 +270,26 @@ export function classifyGoogleCalendarError(
         };
       }
 
+      const isAccessNotConfigured = reasons.some((r) =>
+        /^(accessNotConfigured)$/i.test(r)
+      );
+
+      if (isAccessNotConfigured) {
+        return {
+          code: 'API_NOT_CONFIGURED',
+          status: 403,
+          isAuthError: false,
+          isPermissionError: false,
+          isRateLimitError: false,
+          isTransient: false,
+          shouldReauth: false,
+          message: 'Google Calendar API belum diaktifkan atau belum dikonfigurasi pada proyek Google Cloud pengembang.',
+          userAction: 'Hubungi administrator atau pastikan Google Calendar API telah diaktifkan di Google Cloud Console.',
+        };
+      }
+
       const isPermission = reasons.some((r) =>
-        /^(insufficientPermissions|forbidden|accessNotConfigured)$/i.test(r)
+        /^(insufficientPermissions|forbidden)$/i.test(r)
       );
 
       if (isPermission) {
@@ -302,6 +333,20 @@ export function classifyGoogleCalendarError(
         shouldReauth: false,
         message: 'Batas kuota atau laju panggilan Google Calendar terlampaui (HTTP 403). Mohon tunggu beberapa saat sebelum mencoba kembali.',
         userAction: 'Tunggu beberapa menit sebelum mencoba kembali operasi kalender.',
+      };
+    }
+
+    if (/access not configured|has not been used in project|is not enabled/i.test(parsedMsg)) {
+      return {
+        code: 'API_NOT_CONFIGURED',
+        status: 403,
+        isAuthError: false,
+        isPermissionError: false,
+        isRateLimitError: false,
+        isTransient: false,
+        shouldReauth: false,
+        message: 'Google Calendar API belum diaktifkan atau belum dikonfigurasi pada proyek Google Cloud pengembang.',
+        userAction: 'Hubungi administrator atau pastikan Google Calendar API telah diaktifkan di Google Cloud Console.',
       };
     }
 
@@ -483,28 +528,43 @@ export async function fetchGoogleCalendarEvents(
     }
 
     if (!res.ok) {
-      const errText = await res.text();
-      const sanitized = sanitizeGoogleErrorMessage(res.status, errText);
-      console.error(`Google Calendar Fetch Error [${res.status}]:`, sanitized);
+      let errText = '';
+      try {
+        errText = await res.text();
+      } catch (readErr: any) {
+        if (signal?.aborted || readErr?.name === 'AbortError' || String(readErr?.message).toLowerCase().includes('abort')) {
+          const classification = classifyGoogleCalendarError(0, '', readErr || { name: 'AbortError' });
+          throw new GoogleCalendarApiError(classification);
+        }
+      }
+      if (signal?.aborted) {
+        const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
+        throw new GoogleCalendarApiError(classification);
+      }
       const classification = classifyGoogleCalendarError(res.status, errText);
-      // Ensure the error message retains compatibility with existing error expectations (including 401/403 tags)
-      const errorMsg = `Gagal membaca Google Calendar (${res.status}): ${sanitized}`;
-      throw new GoogleCalendarApiError({
-        ...classification,
-        message: errorMsg,
-      });
+      console.error(`Google Calendar Fetch Error [${res.status}]:`, classification.message);
+      throw new GoogleCalendarApiError(classification);
     }
 
     let data: any;
     try {
       data = await res.json();
-    } catch {
+    } catch (parseErr: any) {
+      if (signal?.aborted || parseErr?.name === 'AbortError' || String(parseErr?.message).toLowerCase().includes('abort')) {
+        const classification = classifyGoogleCalendarError(0, '', parseErr || { name: 'AbortError' });
+        throw new GoogleCalendarApiError(classification);
+      }
       const classification = classifyGoogleCalendarError(200, 'Format JSON tidak valid');
       throw new GoogleCalendarApiError({
         ...classification,
         code: 'INVALID_RESPONSE',
         message: 'Respons dari Google Calendar tidak dapat diverifikasi (format JSON tidak valid).',
       });
+    }
+
+    if (signal?.aborted) {
+      const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
+      throw new GoogleCalendarApiError(classification);
     }
 
     const items: GoogleEventResponse[] = data.items || [];
@@ -645,27 +705,43 @@ export async function createGoogleCalendarEvent(
   }
 
   if (!res.ok) {
-    const errText = await res.text();
-    const sanitized = sanitizeGoogleErrorMessage(res.status, errText);
-    console.error(`Google Calendar Event Write Error [${res.status}]:`, sanitized);
+    let errText = '';
+    try {
+      errText = await res.text();
+    } catch (readErr: any) {
+      if (signal?.aborted || readErr?.name === 'AbortError' || String(readErr?.message).toLowerCase().includes('abort')) {
+        const classification = classifyGoogleCalendarError(0, '', readErr || { name: 'AbortError' });
+        throw new GoogleCalendarApiError(classification);
+      }
+    }
+    if (signal?.aborted) {
+      const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
+      throw new GoogleCalendarApiError(classification);
+    }
     const classification = classifyGoogleCalendarError(res.status, errText);
-    const errorMsg = `Gagal menyimpan event ke Google Calendar (${res.status}): ${sanitized}`;
-    throw new GoogleCalendarApiError({
-      ...classification,
-      message: errorMsg,
-    });
+    console.error(`Google Calendar Event Write Error [${res.status}]:`, classification.message);
+    throw new GoogleCalendarApiError(classification);
   }
 
   let created: any;
   try {
     created = await res.json();
-  } catch {
+  } catch (parseErr: any) {
+    if (signal?.aborted || parseErr?.name === 'AbortError' || String(parseErr?.message).toLowerCase().includes('abort')) {
+      const classification = classifyGoogleCalendarError(0, '', parseErr || { name: 'AbortError' });
+      throw new GoogleCalendarApiError(classification);
+    }
     const classification = classifyGoogleCalendarError(200, 'Format JSON tidak valid');
     throw new GoogleCalendarApiError({
       ...classification,
       code: 'INVALID_RESPONSE',
       message: 'Respons sukses diterima dari Google Calendar tetapi format JSON tidak valid.',
     });
+  }
+
+  if (signal?.aborted) {
+    const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
+    throw new GoogleCalendarApiError(classification);
   }
 
   // CRITICAL VALIDATION: Check for valid, non-empty event ID
@@ -723,15 +799,22 @@ export async function deleteGoogleCalendarEvent(
 
   // 404 is considered successfully deleted (already gone)
   if (!res.ok && res.status !== 404) {
-    const errText = await res.text();
-    const sanitized = sanitizeGoogleErrorMessage(res.status, errText);
-    console.error(`Google Calendar Event Delete Error [${res.status}]:`, sanitized);
+    let errText = '';
+    try {
+      errText = await res.text();
+    } catch (readErr: any) {
+      if (signal?.aborted || readErr?.name === 'AbortError' || String(readErr?.message).toLowerCase().includes('abort')) {
+        const classification = classifyGoogleCalendarError(0, '', readErr || { name: 'AbortError' });
+        throw new GoogleCalendarApiError(classification);
+      }
+    }
+    if (signal?.aborted) {
+      const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
+      throw new GoogleCalendarApiError(classification);
+    }
     const classification = classifyGoogleCalendarError(res.status, errText);
-    const errorMsg = `Gagal menghapus event dari Google Calendar (${res.status}): ${sanitized}`;
-    throw new GoogleCalendarApiError({
-      ...classification,
-      message: errorMsg,
-    });
+    console.error(`Google Calendar Event Delete Error [${res.status}]:`, classification.message);
+    throw new GoogleCalendarApiError(classification);
   }
 }
 
@@ -815,27 +898,43 @@ export async function updateGoogleCalendarEvent(
   }
 
   if (!res.ok) {
-    const errText = await res.text();
-    const sanitized = sanitizeGoogleErrorMessage(res.status, errText);
-    console.error(`Google Calendar Event Update Error [${res.status}]:`, sanitized);
+    let errText = '';
+    try {
+      errText = await res.text();
+    } catch (readErr: any) {
+      if (signal?.aborted || readErr?.name === 'AbortError' || String(readErr?.message).toLowerCase().includes('abort')) {
+        const classification = classifyGoogleCalendarError(0, '', readErr || { name: 'AbortError' });
+        throw new GoogleCalendarApiError(classification);
+      }
+    }
+    if (signal?.aborted) {
+      const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
+      throw new GoogleCalendarApiError(classification);
+    }
     const classification = classifyGoogleCalendarError(res.status, errText);
-    const errorMsg = `Gagal memperbarui event di Google Calendar (${res.status}): ${sanitized}`;
-    throw new GoogleCalendarApiError({
-      ...classification,
-      message: errorMsg,
-    });
+    console.error(`Google Calendar Event Update Error [${res.status}]:`, classification.message);
+    throw new GoogleCalendarApiError(classification);
   }
 
   let updated: any;
   try {
     updated = await res.json();
-  } catch {
+  } catch (parseErr: any) {
+    if (signal?.aborted || parseErr?.name === 'AbortError' || String(parseErr?.message).toLowerCase().includes('abort')) {
+      const classification = classifyGoogleCalendarError(0, '', parseErr || { name: 'AbortError' });
+      throw new GoogleCalendarApiError(classification);
+    }
     const classification = classifyGoogleCalendarError(200, 'Format JSON tidak valid');
     throw new GoogleCalendarApiError({
       ...classification,
       code: 'INVALID_RESPONSE',
       message: 'Respons sukses diterima dari Google Calendar tetapi format JSON tidak valid.',
     });
+  }
+
+  if (signal?.aborted) {
+    const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
+    throw new GoogleCalendarApiError(classification);
   }
 
   if (!updated || typeof updated.id !== 'string' || !updated.id.trim()) {
@@ -857,6 +956,8 @@ export interface BatchCreateEventItem {
   endAt: string;
   timezone?: string;
   isAllDay?: boolean;
+  googleCalendarEventId?: string;
+  syncStatus?: string;
 }
 
 export interface BatchCreateResult {
@@ -920,6 +1021,13 @@ export async function batchCreateGoogleCalendarEvents(
           classification: classifyGoogleCalendarError(0, '', { name: 'AbortError' }),
         };
       }
+      if (ev.googleCalendarEventId || ev.syncStatus === 'synced') {
+        // Event already created in Google Calendar; prevent duplicate creation on retry
+        return {
+          localId: ev.id,
+          googleCalendarEventId: ev.googleCalendarEventId,
+        };
+      }
       try {
         const created = await createGoogleCalendarEvent(
           accessToken,
@@ -961,6 +1069,18 @@ export async function batchCreateGoogleCalendarEvents(
 
     if (i + chunkSize < events.length) {
       await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  // If aborted before all events were processed, record remaining events as ABORTED so unpushed sessions are tracked
+  if (results.length < events.length) {
+    const unhandled = events.slice(results.length);
+    for (const ev of unhandled) {
+      results.push({
+        localId: ev.id,
+        error: 'Operasi dibatalkan oleh pengguna.',
+        classification: classifyGoogleCalendarError(0, '', { name: 'AbortError' }),
+      });
     }
   }
 

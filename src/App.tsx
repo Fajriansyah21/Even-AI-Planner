@@ -59,6 +59,7 @@ import {
   classifyGoogleCalendarError,
   sanitizeSensitiveText,
 } from './lib/googleCalendar';
+import { CalendarOperationGuard } from './lib/calendarOperationGuard';
 import {
   getInitialKeepNotes,
   convertKeepNoteToTask,
@@ -115,11 +116,8 @@ export default function App() {
     }
   });
 
-  // Sync state & request race-condition guard
-  const syncRequestIdRef = useRef<number>(0);
-  const activeAbortControllerRef = useRef<AbortController | null>(null);
-  const connectOperationIdRef = useRef<number>(0);
-  const calendarPushAbortControllerRef = useRef<AbortController | null>(null);
+  // Centralized concurrency and operation guard for Google Calendar
+  const calendarGuardRef = useRef<CalendarOperationGuard>(new CalendarOperationGuard());
   const [isSyncing, setIsSyncing] = useState(false);
   const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [diagnosticInfo, setDiagnosticInfo] = useState<CalendarDiagnosticInfo>({
@@ -291,19 +289,14 @@ export default function App() {
 
   const handleConnectCalendar = async () => {
     // Invalidate and abort any ongoing background syncs and calendar pushes
-    const currentConnectOpId = ++connectOperationIdRef.current;
-    syncRequestIdRef.current++;
-    activeAbortControllerRef.current?.abort();
-    activeAbortControllerRef.current = null;
-    calendarPushAbortControllerRef.current?.abort();
-    calendarPushAbortControllerRef.current = null;
+    const ticket = calendarGuardRef.current.startConnect();
 
     setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'connecting', lastErrorMessage: undefined }));
     try {
       const res = await googleSignIn();
 
       // Guard: If disconnect was called or a newer connect was triggered while popup was open, discard result
-      if (connectOperationIdRef.current !== currentConnectOpId) {
+      if (ticket.isStale()) {
         return;
       }
 
@@ -330,7 +323,7 @@ export default function App() {
       }
     } catch (err: any) {
       // Guard: If disconnect was called or a newer connect was triggered, ignore errors from outdated connect
-      if (connectOperationIdRef.current !== currentConnectOpId) {
+      if (ticket.isStale()) {
         return;
       }
 
@@ -351,12 +344,7 @@ export default function App() {
 
   const handleDisconnectCalendar = () => {
     // Invalidate and abort any ongoing connect, sync, or calendar push operations
-    connectOperationIdRef.current++;
-    syncRequestIdRef.current++;
-    activeAbortControllerRef.current?.abort();
-    activeAbortControllerRef.current = null;
-    calendarPushAbortControllerRef.current?.abort();
-    calendarPushAbortControllerRef.current = null;
+    calendarGuardRef.current.disconnect();
 
     setCachedAccessToken(null);
     setHasGoogleAccessToken(false);
@@ -375,12 +363,8 @@ export default function App() {
 
   // Google Calendar Sync with race-condition resilience and classified error handling
   const handleSyncCalendar = async (tokenOverride?: string) => {
-    // Abort previous sync request if still in flight
-    activeAbortControllerRef.current?.abort();
-    const abortController = new AbortController();
-    activeAbortControllerRef.current = abortController;
+    const ticket = calendarGuardRef.current.startSync();
 
-    const currentRequestId = ++syncRequestIdRef.current;
     setIsSyncing(true);
     setDiagnosticInfo((prev) => ({ ...prev, connectionStatus: 'syncing' }));
     const token = tokenOverride || getCachedAccessToken();
@@ -406,11 +390,11 @@ export default function App() {
         token,
         undefined,
         undefined,
-        abortController.signal
+        ticket.signal
       );
 
       // Race-condition guard: ignore result if another connect/sync request was triggered in the meantime
-      if (syncRequestIdRef.current !== currentRequestId) {
+      if (ticket.isStale()) {
         return;
       }
 
@@ -453,7 +437,7 @@ export default function App() {
       }
     } catch (err: any) {
       // Race-condition guard: ignore error if another request superceded this one
-      if (syncRequestIdRef.current !== currentRequestId) {
+      if (ticket.isStale()) {
         return;
       }
 
@@ -893,9 +877,7 @@ export default function App() {
     }
 
     // Live Google Calendar push
-    calendarPushAbortControllerRef.current?.abort();
-    const pushAbortController = new AbortController();
-    calendarPushAbortControllerRef.current = pushAbortController;
+    const pushTicket = calendarGuardRef.current.startPush();
 
     let successCount = 0;
     let unconfirmedCount = 0;
@@ -906,9 +888,15 @@ export default function App() {
     const newCalendarEvents: CalendarEvent[] = [];
 
     for (const sess of initialSessions) {
-      if (pushAbortController.signal.aborted) {
+      if (pushTicket.isAborted()) {
         wasAborted = true;
         break;
+      }
+
+      // Idempotency: If this session was already created in Google Calendar, do not recreate
+      if (sess.syncStatus === 'synced' && (sess as any).googleCalendarEventId) {
+        updatedSessions.push(sess);
+        continue;
       }
 
       try {
@@ -921,7 +909,7 @@ export default function App() {
             endAt: sess.endAt,
             timezone: preferences.timezone,
           },
-          pushAbortController.signal
+          pushTicket.signal
         );
 
         const syncedSess = {
@@ -1144,9 +1132,7 @@ export default function App() {
     }
 
     // Google Calendar active write
-    calendarPushAbortControllerRef.current?.abort();
-    const pushAbortController = new AbortController();
-    calendarPushAbortControllerRef.current = pushAbortController;
+    const pushTicket = calendarGuardRef.current.startPush();
 
     let successCount = 0;
     let failCount = 0;
@@ -1157,9 +1143,15 @@ export default function App() {
     const newCalendarEvents: CalendarEvent[] = [];
 
     for (const sess of initialSessions) {
-      if (pushAbortController.signal.aborted) {
+      if (pushTicket.isAborted()) {
         wasAborted = true;
         break;
+      }
+
+      // Idempotency: If this session was already created in Google Calendar, do not recreate
+      if (sess.syncStatus === 'synced' && (sess as any).googleCalendarEventId) {
+        updatedSessions.push(sess);
+        continue;
       }
 
       try {
@@ -1172,7 +1164,7 @@ export default function App() {
             endAt: sess.endAt,
             timezone: plan.timezone || preferences.timezone,
           },
-          pushAbortController.signal
+          pushTicket.signal
         );
 
         updatedSessions.push({

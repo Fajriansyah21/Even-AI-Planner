@@ -10,6 +10,7 @@ import {
   sanitizeGoogleErrorMessage,
   sanitizeSensitiveText,
 } from '../src/lib/googleCalendar';
+import { CalendarOperationGuard } from '../src/lib/calendarOperationGuard';
 import { CalendarEvent } from '../src/types';
 
 export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
@@ -836,6 +837,476 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       assert.ok(classification.message.includes('[REDACTED_REFRESH_TOKEN]'), 'Refresh token harus disamarkan');
       assert.ok(classification.message.includes('[REDACTED_EMAIL]'), 'Email harus disamarkan');
       console.log('  ✅ [PASS] Test 23: Pesan network error menyaring rahasia kredensial dan PII secara menyeluruh.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 24: accessNotConfigured Dipisahkan Menjadi API_NOT_CONFIGURED
+    // ----------------------------------------------------
+    console.log('\n--- [Test 24] accessNotConfigured Separated as API_NOT_CONFIGURED ---');
+    {
+      const rawAccessNotConfigured = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'Google Calendar API has not been used in project 123456 before or it is disabled.',
+          errors: [{ domain: 'usageLimits', reason: 'accessNotConfigured', message: 'API not enabled' }],
+        },
+      });
+
+      const classification = classifyGoogleCalendarError(403, rawAccessNotConfigured);
+      assert.strictEqual(classification.code, 'API_NOT_CONFIGURED');
+      assert.strictEqual(classification.status, 403);
+      assert.strictEqual(classification.isAuthError, false);
+      assert.strictEqual(classification.isPermissionError, false, 'Bukan permission error scope pengguna');
+      assert.strictEqual(classification.isRateLimitError, false);
+      assert.strictEqual(classification.shouldReauth, false);
+      assert.ok(
+        classification.message.includes('Google Calendar API belum diaktifkan'),
+        'Pesan harus menjelaskan API belum diaktifkan di GCP'
+      );
+      assert.strictEqual(
+        classification.message.includes('izin cakupan (OAuth scope)'),
+        false,
+        'accessNotConfigured TIDAK boleh menuduh OAuth scope'
+      );
+
+      // Uji juga fallback text parsing tanpa errors array
+      const rawFallback = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'Access not configured on project.',
+        },
+      });
+      const cFallback = classifyGoogleCalendarError(403, rawFallback);
+      assert.strictEqual(cFallback.code, 'API_NOT_CONFIGURED');
+
+      console.log('  ✅ [PASS] Test 24: accessNotConfigured terpisah bersih ke API_NOT_CONFIGURED tanpa salah sangka OAuth scope.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 25: Konsistensi Pesan HTTP 403 di 4 Operasi (Tanpa Ditimpa Generik)
+    // ----------------------------------------------------
+    console.log('\n--- [Test 25] HTTP 403 Message Consistency Across All 4 Operations ---');
+    {
+      const raw403Scope = JSON.stringify({
+        error: {
+          code: 403,
+          message: 'Insufficient Permission',
+          errors: [{ domain: 'global', reason: 'insufficientPermissions', message: 'Insufficient Permission' }],
+        },
+      });
+
+      global.fetch = async () =>
+        ({
+          ok: false,
+          status: 403,
+          text: async () => raw403Scope,
+        } as any);
+
+      // 1. fetch
+      try {
+        await fetchGoogleCalendarEvents('mock-token');
+        assert.fail('fetch harus melempar error');
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'PERMISSION_DENIED');
+        assert.strictEqual(
+          err.message,
+          'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.',
+          'Pesan tidak boleh ditimpa prefix generik'
+        );
+      }
+
+      // 2. create
+      try {
+        await createGoogleCalendarEvent('mock-token', {
+          title: 'Test Create',
+          startAt: '2026-11-05T09:00:00+07:00',
+          endAt: '2026-11-05T10:00:00+07:00',
+        });
+        assert.fail('create harus melempar error');
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'PERMISSION_DENIED');
+        assert.strictEqual(
+          err.message,
+          'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.'
+        );
+      }
+
+      // 3. update
+      try {
+        await updateGoogleCalendarEvent('mock-token', 'gcal-test-1', {
+          title: 'Test Update',
+        });
+        assert.fail('update harus melempar error');
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'PERMISSION_DENIED');
+        assert.strictEqual(
+          err.message,
+          'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.'
+        );
+      }
+
+      // 4. delete
+      try {
+        await deleteGoogleCalendarEvent('mock-token', 'gcal-test-1');
+        assert.fail('delete harus melempar error');
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'PERMISSION_DENIED');
+        assert.strictEqual(
+          err.message,
+          'Akses Google Calendar ditolak (HTTP 403). Pastikan izin cakupan (OAuth scope) kalender telah disetujui pada akun Google Anda.'
+        );
+      }
+
+      console.log('  ✅ [PASS] Test 25: Keempat operasi mempertahankan pesan klasifikasi HTTP 403 tanpa ditimpa string generik.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 26: Uji Mendalam Sanitasi Token, URL Query Params, & PII
+    // ----------------------------------------------------
+    console.log('\n--- [Test 26] Comprehensive Sensitive Token, Query Param & PII Sanitization ---');
+    {
+      // 1. Variasi Token
+      const tokenVar = 'Error with ya29.a0AfH6S-token.val_123 and refresh 1//0gX_secret.code-456';
+      const cleanToken = sanitizeSensitiveText(tokenVar);
+      assert.strictEqual(cleanToken.includes('ya29.'), false);
+      assert.strictEqual(cleanToken.includes('1//'), false);
+      assert.ok(cleanToken.includes('[REDACTED_TOKEN]'));
+      assert.ok(cleanToken.includes('[REDACTED_REFRESH_TOKEN]'));
+
+      // 2. Bearer Header variasi
+      const bearerVar = 'Authorization failed for Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.token_payload';
+      const cleanBearer = sanitizeSensitiveText(bearerVar);
+      assert.strictEqual(cleanBearer.includes('eyJhbGciOi'), false);
+      assert.ok(cleanBearer.includes('Bearer [REDACTED]'));
+
+      // 3. Email variasi (termasuk subdomain & alias)
+      const emailVar = 'User fajriansyah.pratama+planner@sub.domain.co.id encountered error';
+      const cleanEmail = sanitizeSensitiveText(emailVar);
+      assert.strictEqual(cleanEmail.includes('fajriansyah.pratama'), false);
+      assert.ok(cleanEmail.includes('[REDACTED_EMAIL]'));
+
+      // 4. URL Query Parameters Sensitif
+      const urlVar =
+        'https://www.googleapis.com/calendar/v3/events?access_token=ya29.secret&key=AIzaSySecretKey&client_secret=supersecret&code=4/authCode&apiKey=AIzaSecret&refresh_token=1//refreshSecret';
+      const cleanUrl = sanitizeSensitiveText(urlVar);
+      assert.strictEqual(cleanUrl.includes('AIzaSySecretKey'), false);
+      assert.strictEqual(cleanUrl.includes('supersecret'), false);
+      assert.strictEqual(cleanUrl.includes('authCode'), false);
+      assert.ok(cleanUrl.includes('access_token=[REDACTED]'));
+      assert.ok(cleanUrl.includes('key=[REDACTED]'));
+      assert.ok(cleanUrl.includes('client_secret=[REDACTED]'));
+      assert.ok(cleanUrl.includes('code=[REDACTED]'));
+      assert.ok(cleanUrl.includes('apiKey=[REDACTED]'));
+      assert.ok(cleanUrl.includes('refresh_token=[REDACTED]'));
+
+      // 5. JSON Key-Value Format
+      const jsonVar = '{"access_token": "ya29.secret123", "client_secret": "mySecretPass"}';
+      const cleanJson = sanitizeSensitiveText(jsonVar);
+      assert.strictEqual(cleanJson.includes('secret123'), false);
+      assert.strictEqual(cleanJson.includes('mySecretPass'), false);
+
+      console.log('  ✅ [PASS] Test 26: Sanitasi token, query parameter, Bearer, email, dan JSON terbukti 100% aman.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 27: Abort Saat Pembacaan Response Body (res.text & res.json)
+    // ----------------------------------------------------
+    console.log('\n--- [Test 27] Abort During Body Stream/Reading Classified as ABORTED ---');
+    {
+      const abortCtrl = new AbortController();
+
+      // Mock fetch: headers arrive OK (status 200), but json() body read is aborted
+      global.fetch = async () =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => {
+            abortCtrl.abort();
+            const err = new Error('The user aborted a request.');
+            err.name = 'AbortError';
+            throw err;
+          },
+          text: async () => {
+            abortCtrl.abort();
+            const err = new Error('The user aborted a request.');
+            err.name = 'AbortError';
+            throw err;
+          },
+        } as any);
+
+      // Test fetchGoogleCalendarEvents body read abort
+      try {
+        await fetchGoogleCalendarEvents('mock-token', undefined, undefined, abortCtrl.signal);
+        assert.fail('Harus melempar error saat json() di-abort');
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(
+          err.code,
+          'ABORTED',
+          'Abort saat membaca json body HARUS diklasifikasikan sebagai ABORTED (bukan INVALID_RESPONSE)'
+        );
+        assert.strictEqual(err.shouldReauth, false);
+      }
+
+      // Test createGoogleCalendarEvent body read abort
+      const abortCtrlCreate = new AbortController();
+      global.fetch = async () =>
+        ({
+          ok: true,
+          status: 200,
+          json: async () => {
+            abortCtrlCreate.abort();
+            const err = new Error('The user aborted a request.');
+            err.name = 'AbortError';
+            throw err;
+          },
+        } as any);
+
+      try {
+        await createGoogleCalendarEvent(
+          'mock-token',
+          {
+            title: 'Test Abort Body',
+            startAt: '2026-11-05T09:00:00+07:00',
+            endAt: '2026-11-05T10:00:00+07:00',
+          },
+          abortCtrlCreate.signal
+        );
+        assert.fail('Harus melempar error saat json() di-abort');
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'ABORTED');
+      }
+
+      // Test error text read abort (status 500, but text() read is aborted)
+      const abortCtrlText = new AbortController();
+      global.fetch = async () =>
+        ({
+          ok: false,
+          status: 500,
+          text: async () => {
+            abortCtrlText.abort();
+            const err = new Error('The user aborted a request.');
+            err.name = 'AbortError';
+            throw err;
+          },
+        } as any);
+
+      try {
+        await fetchGoogleCalendarEvents('mock-token', undefined, undefined, abortCtrlText.signal);
+        assert.fail('Harus melempar error saat text() di-abort');
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(
+          err.code,
+          'ABORTED',
+          'Abort saat membaca error body HARUS diklasifikasikan sebagai ABORTED (bukan SERVICE_UNAVAILABLE)'
+        );
+      }
+
+      console.log('  ✅ [PASS] Test 27: Pembatalan saat membaca streaming body (res.json & res.text) tepat diklasifikasikan sebagai ABORTED.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 28: Integration Test OAuth Race Condition dengan CalendarOperationGuard
+    // ----------------------------------------------------
+    console.log('\n--- [Test 28] Integration Tests: OAuth Race Condition via CalendarOperationGuard ---');
+    {
+      const guard = new CalendarOperationGuard();
+
+      // Skenario 1: Connect → Disconnect → OAuth popup resolve
+      {
+        let storedToken: string | null = null;
+        let connectionStatus = 'unconnected';
+
+        const ticket1 = guard.startConnect();
+        connectionStatus = 'connecting';
+
+        // Pengguna memutus koneksi sebelum popup 1 selesai
+        guard.disconnect();
+        connectionStatus = 'unconnected';
+        storedToken = null;
+
+        // Popup 1 selesai setelah disconnect
+        if (!ticket1.isStale()) {
+          storedToken = 'stale-token-op1';
+          connectionStatus = 'connected_unsynced';
+        }
+
+        assert.strictEqual(storedToken, null, 'Popup lama setelah disconnect tidak boleh menyimpan token');
+        assert.strictEqual(connectionStatus, 'unconnected', 'Status harus tetap unconnected');
+      }
+
+      // Skenario 2: Connect A → Connect B → A resolve lebih lambat
+      {
+        let storedToken: string | null = null;
+
+        const ticketA = guard.startConnect();
+        const ticketB = guard.startConnect();
+
+        // Popup B selesai lebih dahulu
+        if (!ticketB.isStale()) {
+          storedToken = 'token-from-B';
+        }
+
+        // Popup A selesai belakangan
+        if (!ticketA.isStale()) {
+          storedToken = 'token-from-A';
+        }
+
+        assert.strictEqual(storedToken, 'token-from-B', 'Token B harus dipertahankan, Token A diabaikan');
+      }
+
+      // Skenario 3: Connect A → Disconnect → Connect B → A resolve paling akhir
+      {
+        let storedToken: string | null = null;
+
+        const ticketA = guard.startConnect();
+        guard.disconnect();
+        const ticketB = guard.startConnect();
+
+        // Popup B selesai
+        if (!ticketB.isStale()) {
+          storedToken = 'token-from-B';
+        }
+
+        // Popup A lama menyelesaikan paling akhir
+        if (!ticketA.isStale()) {
+          storedToken = 'stale-token-A';
+        }
+
+        assert.strictEqual(storedToken, 'token-from-B', 'Popup A lama tidak boleh menimpa koneksi baru B');
+      }
+
+      // Skenario 4: OAuth popup lama gagal setelah koneksi baru berhasil
+      {
+        let connectionStatus = 'unconnected';
+
+        const ticketOld = guard.startConnect();
+        const ticketNew = guard.startConnect();
+
+        if (!ticketNew.isStale()) {
+          connectionStatus = 'sync_success';
+        }
+
+        // Popup lama gagal dengan error auth/cancelled
+        if (!ticketOld.isStale()) {
+          connectionStatus = 'sync_failed';
+        }
+
+        assert.strictEqual(connectionStatus, 'sync_success', 'Error dari popup lama tidak boleh merusak status sukses koneksi baru');
+      }
+
+      console.log('  ✅ [PASS] Test 28: Keempat skenario balapan OAuth diverifikasi kokoh menggunakan CalendarOperationGuard produksi.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 29: Verifikasi Integritas Data & Pencegahan Duplikasi
+    // ----------------------------------------------------
+    console.log('\n--- [Test 29] Data Integrity & Duplicate Creation Prevention ---');
+    {
+      // 1. Pagination Limit Exceeded tidak merusak state event lokal
+      const initialLocalEvents: CalendarEvent[] = [
+        {
+          id: 'task-local-1',
+          provider: 'internal',
+          title: 'Tugas Penting',
+          startAt: '2026-11-05T09:00:00+07:00',
+          endAt: '2026-11-05T10:00:00+07:00',
+          category: 'focus',
+          syncStatus: 'pending',
+          isEditable: true,
+        },
+      ];
+
+      let localState = [...initialLocalEvents];
+      let pageCount = 0;
+      global.fetch = async () => {
+        pageCount++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            items: [{ id: `gcal-${pageCount}`, summary: `Event ${pageCount}` }],
+            nextPageToken: `token-${pageCount + 1}`,
+          }),
+        } as any;
+      };
+
+      try {
+        const fetchRes = await fetchGoogleCalendarEvents('mock-token');
+        localState = [...fetchRes.events]; // jika sukses, menimpa
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'PAGINATION_LIMIT_EXCEEDED');
+        // Saat error, localState TIDAK diubah
+      }
+
+      assert.strictEqual(localState.length, 1);
+      assert.strictEqual(localState[0].id, 'task-local-1', 'Data lokal harus tetap utuh');
+
+      // 2. Abort saat batch create mempertahankan sesi unpushed
+      const abortCtrl = new AbortController();
+      let createdCalls = 0;
+      global.fetch = async () => {
+        createdCalls++;
+        if (createdCalls === 1) {
+          abortCtrl.abort();
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: `gcal-created-${createdCalls}` }),
+        } as any;
+      };
+
+      const batchItems = [
+        { id: 'sess-1', title: 'Sesi 1', startAt: '2026-11-05T09:00:00+07:00', endAt: '2026-11-05T10:00:00+07:00' },
+        { id: 'sess-2', title: 'Sesi 2', startAt: '2026-11-05T10:30:00+07:00', endAt: '2026-11-05T11:30:00+07:00' },
+        { id: 'sess-3', title: 'Sesi 3', startAt: '2026-11-05T13:00:00+07:00', endAt: '2026-11-05T14:00:00+07:00' },
+      ];
+
+      const batchResult = await batchCreateGoogleCalendarEvents('mock-token', batchItems, 1, abortCtrl.signal);
+      const unpushed = batchResult.results.filter((r) => !r.googleCalendarEventId);
+      assert.ok(unpushed.length >= 2, 'Sesi yang belum terkirim harus tercatat agar status lokal tetap pending');
+
+      // 3. Pencegahan duplikasi event: item dengan googleCalendarEventId tidak dipanggil ulang
+      let duplicateCallCount = 0;
+      global.fetch = async () => {
+        duplicateCallCount++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 'new-gcal-id' }),
+        } as any;
+      };
+
+      const retryItems = [
+        {
+          id: 'sess-1',
+          title: 'Sesi 1 (Sudah Ada di Google)',
+          startAt: '2026-11-05T09:00:00+07:00',
+          endAt: '2026-11-05T10:00:00+07:00',
+          googleCalendarEventId: 'existing-gcal-123',
+          syncStatus: 'synced',
+        },
+        {
+          id: 'sess-2',
+          title: 'Sesi 2 (Baru)',
+          startAt: '2026-11-05T10:30:00+07:00',
+          endAt: '2026-11-05T11:30:00+07:00',
+        },
+      ];
+
+      const retryBatch = await batchCreateGoogleCalendarEvents('mock-token', retryItems);
+      assert.strictEqual(duplicateCallCount, 1, 'Hanya sesi baru (sess-2) yang boleh memanggil API Google Calendar');
+      assert.strictEqual(retryBatch.results[0].googleCalendarEventId, 'existing-gcal-123');
+
+      console.log('  ✅ [PASS] Test 29: Integritas data lokal terjaga, sesi unpushed terpelihara, dan pencegahan duplikasi terbukti bekerja.');
     }
 
     console.log('\n================================================================');
