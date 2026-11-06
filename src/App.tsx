@@ -53,14 +53,11 @@ import {
 } from './lib/firebase';
 import {
   fetchGoogleCalendarEvents,
-  createGoogleCalendarEvent,
-  deleteGoogleCalendarEvent,
   GoogleCalendarApiError,
   classifyGoogleCalendarError,
   sanitizeSensitiveText,
 } from './lib/googleCalendar';
 import { CalendarOperationGuard } from './lib/calendarOperationGuard';
-import { persistScheduledTask } from './lib/taskPersistence';
 import { executeSchedulePush } from './lib/calendarPushService';
 import {
   getInitialKeepNotes,

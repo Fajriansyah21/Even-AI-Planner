@@ -12,6 +12,10 @@ export interface GoogleEventResponse {
   attendees?: { email: string; displayName?: string }[];
   status?: string;
   recurrence?: string[];
+  extendedProperties?: {
+    private?: Record<string, string>;
+    shared?: Record<string, string>;
+  };
 }
 
 export type ConnectionStatusType =
@@ -593,6 +597,7 @@ export async function fetchGoogleCalendarEvents(
           isRecurring: Boolean(item.recurrence && item.recurrence.length > 0),
           syncStatus: 'synced',
           category: 'meeting',
+          extendedProperties: item.extendedProperties,
         };
       });
 
