@@ -53,6 +53,7 @@ export type GoogleCalendarErrorCode =
   | 'ABORTED'                 // Request aborted by controller
   | 'INVALID_RESPONSE'        // Non-JSON or missing required event ID
   | 'PAGINATION_LIMIT_EXCEEDED' // Max pages reached with pageToken remaining
+  | 'NEEDS_RECONCILIATION'    // Marked as synced but missing remote ID; needs reconciliation
   | 'UNKNOWN_ERROR';          // Other unexpected errors
 
 export interface GoogleCalendarErrorClassification {
@@ -1021,11 +1022,36 @@ export async function batchCreateGoogleCalendarEvents(
           classification: classifyGoogleCalendarError(0, '', { name: 'AbortError' }),
         };
       }
-      if (ev.googleCalendarEventId || ev.syncStatus === 'synced') {
-        // Event already created in Google Calendar; prevent duplicate creation on retry
+      const hasValidRemoteId =
+        typeof ev.googleCalendarEventId === 'string' && ev.googleCalendarEventId.trim().length > 0;
+
+      // 1. Idempotency: Event is confirmed created in Google Calendar; prevent duplicate creation on retry
+      if (hasValidRemoteId) {
         return {
           localId: ev.id,
-          googleCalendarEventId: ev.googleCalendarEventId,
+          googleCalendarEventId: ev.googleCalendarEventId!.trim(),
+        };
+      }
+
+      // 2. Anomaly: Marked as 'synced' but missing Google Calendar Event ID.
+      // Do NOT claim false success or blindly create a duplicate; require reconciliation.
+      // Catatan Arsitektur: Google Calendar v3 API tidak menyediakan native client Idempotency-Key.
+      // Jika respons terputus setelah server membuat event, verifikasi remote diperlukan sebelum pembuatan ulang.
+      if (ev.syncStatus === 'synced' && !hasValidRemoteId) {
+        return {
+          localId: ev.id,
+          error: 'Status agenda tercatat tersinkronkan namun tidak memiliki ID Google Calendar valid. Memerlukan rekonsiliasi data.',
+          classification: {
+            code: 'NEEDS_RECONCILIATION' as const,
+            status: 409,
+            isAuthError: false,
+            isPermissionError: false,
+            isRateLimitError: false,
+            isTransient: false,
+            shouldReauth: false,
+            message: 'Status agenda tercatat tersinkronkan namun tidak memiliki ID Google Calendar valid. Memerlukan rekonsiliasi data.',
+            userAction: 'Lakukan rekonsiliasi kalender atau periksa agenda Google Calendar.',
+          },
         };
       }
       try {

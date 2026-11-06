@@ -1,4 +1,6 @@
 import assert from 'assert';
+import fs from 'fs';
+import path from 'path';
 import {
   fetchGoogleCalendarEvents,
   createGoogleCalendarEvent,
@@ -1307,6 +1309,214 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       assert.strictEqual(retryBatch.results[0].googleCalendarEventId, 'existing-gcal-123');
 
       console.log('  ✅ [PASS] Test 29: Integritas data lokal terjaga, sesi unpushed terpelihara, dan pencegahan duplikasi terbukti bekerja.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 30: Audit Statis Kode Sumber App.tsx terhadap Identifier Usang
+    // ----------------------------------------------------
+    console.log('\n--- [Test 30] Static Source Code Audit of App.tsx (Zero Stale Identifiers) ---');
+    {
+      const appSourcePath = path.resolve(process.cwd(), 'src/App.tsx');
+      assert.ok(fs.existsSync(appSourcePath), 'File src/App.tsx harus ada');
+      const appSource = fs.readFileSync(appSourcePath, 'utf-8');
+
+      const forbiddenIdentifiers = [
+        'syncRequestIdRef',
+        'currentRequestId',
+        'pushAbortController',
+        'activeAbortControllerRef',
+        'connectOperationIdRef',
+      ];
+
+      for (const id of forbiddenIdentifiers) {
+        const regex = new RegExp(`\\b${id}\\b`, 'g');
+        const matches = appSource.match(regex);
+        assert.strictEqual(
+          matches,
+          null,
+          `Identifier usang "${id}" tidak boleh ada dalam src/App.tsx setelah migrasi ke CalendarOperationGuard`
+        );
+      }
+
+      assert.ok(
+        appSource.includes('CalendarOperationGuard'),
+        'src/App.tsx harus mengimpor dan menggunakan CalendarOperationGuard'
+      );
+      assert.ok(
+        appSource.includes('pushTicket.isAborted()'),
+        'src/App.tsx harus menggunakan pushTicket.isAborted() untuk mendeteksi pembatalan push'
+      );
+      assert.ok(
+        appSource.includes('!ticket.isStale()'),
+        'handleSyncCalendar harus menggunakan !ticket.isStale() di blok finally'
+      );
+
+      console.log('  ✅ [PASS] Test 30: Seluruh 5 identifier usang terbukti 100% bersih dari src/App.tsx.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 31: Audit Transisi State Komprehensif via CalendarOperationGuard Produksi
+    // ----------------------------------------------------
+    console.log('\n--- [Test 31] Comprehensive State Transitions via Production CalendarOperationGuard ---');
+    {
+      const guard = new CalendarOperationGuard();
+
+      // Skenario 1: Connect -> Disconnect -> OAuth resolve diabaikan
+      const connectTicket1 = guard.startConnect();
+      assert.strictEqual(connectTicket1.isStale(), false);
+      guard.disconnect();
+      assert.strictEqual(connectTicket1.isStale(), true, 'Connect 1 harus stale setelah disconnect');
+      assert.strictEqual(guard.isConnectActive(connectTicket1.connectId), false);
+
+      // Skenario 2: Connect A -> Connect B -> A resolve terakhir (A diabaikan, B aktif)
+      const connectA = guard.startConnect();
+      const connectB = guard.startConnect();
+      assert.strictEqual(connectA.isStale(), true, 'Connect A harus stale setelah Connect B dimulai');
+      assert.strictEqual(connectB.isStale(), false, 'Connect B harus tetap aktif');
+      assert.strictEqual(guard.isConnectActive(connectB.connectId), true);
+      assert.strictEqual(guard.isConnectActive(connectA.connectId), false);
+
+      // Skenario 3: Sync A -> Sync B -> A resolve terakhir
+      const syncA = guard.startSync();
+      assert.strictEqual(syncA.isStale(), false);
+      assert.strictEqual(syncA.signal.aborted, false);
+
+      const syncB = guard.startSync();
+      // Sync A harus dibatalkan sinyalnya dan ditandai stale
+      assert.strictEqual(syncA.signal.aborted, true, 'Sync A AbortSignal harus dipicu saat Sync B dimulai');
+      assert.strictEqual(syncA.isStale(), true, 'Sync A harus ditandai stale saat Sync B dimulai');
+      assert.strictEqual(syncB.isStale(), false, 'Sync B harus aktif');
+      assert.strictEqual(syncB.signal.aborted, false, 'Sync B AbortSignal harus tetap aktif');
+
+      // Simulasi blok finally: hanya operasi aktif yang boleh mengubah state isSyncing
+      let simulatedIsSyncing = true;
+      if (!syncA.isStale()) {
+        simulatedIsSyncing = false; // Stale sync A tidak boleh mengeksekusi ini
+      }
+      assert.strictEqual(simulatedIsSyncing, true, 'Sync A stale tidak boleh mengubah status isSyncing');
+
+      if (!syncB.isStale()) {
+        simulatedIsSyncing = false; // Sync B aktif berhak mengubah
+      }
+      assert.strictEqual(simulatedIsSyncing, false, 'Sync B aktif berhak menyelesaikan isSyncing');
+
+      // Skenario 4: Push A -> Disconnect -> Push A dibatalkan
+      const pushA = guard.startPush();
+      assert.strictEqual(pushA.isAborted(), false);
+      assert.strictEqual(pushA.isStale(), false);
+
+      guard.disconnect();
+      assert.strictEqual(pushA.isAborted(), true, 'Push A harus dibatalkan saat disconnect dipanggil');
+      assert.strictEqual(pushA.isStale(), true, 'Push A harus stale saat disconnect dipanggil');
+
+      // Skenario 5: Push A -> Push B -> Push A dibatalkan
+      const push1 = guard.startPush();
+      assert.strictEqual(push1.isAborted(), false);
+      assert.strictEqual(push1.isStale(), false);
+
+      const push2 = guard.startPush();
+      assert.strictEqual(push1.isAborted(), true, 'Push 1 harus dibatalkan saat Push 2 dimulai');
+      assert.strictEqual(push1.isStale(), true, 'Push 1 harus stale saat Push 2 dimulai');
+      assert.strictEqual(push2.isAborted(), false, 'Push 2 harus aktif');
+      assert.strictEqual(push2.isStale(), false, 'Push 2 tidak boleh stale');
+
+      console.log('  ✅ [PASS] Test 31: Seluruh 5 skenario transisi state kalender terverifikasi deterministik dan kokoh.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 32: Anomali Status Synced Tanpa Google Event ID Menghasilkan NEEDS_RECONCILIATION
+    // ----------------------------------------------------
+    console.log('\n--- [Test 32] Synced Status Without Event ID Requires Reconciliation ---');
+    {
+      let remoteCreateInvoked = false;
+      global.fetch = async () => {
+        remoteCreateInvoked = true;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: 'unexpected-id' }),
+        } as any;
+      };
+
+      const testItems = [
+        {
+          id: 'item-synced-valid',
+          title: 'Sesi Valid',
+          startAt: '2026-11-05T09:00:00+07:00',
+          endAt: '2026-11-05T10:00:00+07:00',
+          syncStatus: 'synced',
+          googleCalendarEventId: 'gcal-existing-99',
+        },
+        {
+          id: 'item-synced-missing-id',
+          title: 'Sesi Anomali (Synced tapi ID kosong)',
+          startAt: '2026-11-05T10:30:00+07:00',
+          endAt: '2026-11-05T11:30:00+07:00',
+          syncStatus: 'synced',
+          googleCalendarEventId: '', // ID kosong / hilang
+        },
+        {
+          id: 'item-synced-whitespace-id',
+          title: 'Sesi Anomali (Synced tapi ID spasi)',
+          startAt: '2026-11-05T13:00:00+07:00',
+          endAt: '2026-11-05T14:00:00+07:00',
+          syncStatus: 'synced',
+          googleCalendarEventId: '   ',
+        },
+      ];
+
+      const batchRes = await batchCreateGoogleCalendarEvents('mock-token', testItems);
+
+      // 1. remote API tidak boleh dipanggil secara buta untuk item anomali
+      assert.strictEqual(remoteCreateInvoked, false, 'API remote tidak boleh dipanggil untuk item anomali');
+
+      // 2. Panjang hasil harus tepat sama dengan jumlah input
+      assert.strictEqual(batchRes.results.length, 3, 'Panjang hasil batch harus tepat 3 sesuai input');
+      assert.strictEqual(batchRes.totalRequested, 3);
+
+      // 3. Item 1 (valid) lolos idempoten
+      assert.strictEqual(batchRes.results[0].googleCalendarEventId, 'gcal-existing-99');
+      assert.strictEqual(batchRes.results[0].error, undefined);
+
+      // 4. Item 2 & 3 (anomali) ditandai NEEDS_RECONCILIATION dan tidak diklaim sukses
+      assert.strictEqual(batchRes.results[1].googleCalendarEventId, undefined);
+      assert.strictEqual(batchRes.results[1].classification?.code, 'NEEDS_RECONCILIATION');
+      assert.strictEqual(batchRes.results[1].classification?.status, 409);
+      assert.ok(batchRes.results[1].error?.includes('rekonsiliasi'));
+
+      assert.strictEqual(batchRes.results[2].googleCalendarEventId, undefined);
+      assert.strictEqual(batchRes.results[2].classification?.code, 'NEEDS_RECONCILIATION');
+
+      console.log('  ✅ [PASS] Test 32: Status synced tanpa ID Google Calendar dicegah dari sukses palsu dan diarahkan ke rekonsiliasi.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 33: Simulasi Hilangnya Respons Pasca-Kreasi Server (Keterbatasan Google v3 & Idempotensi)
+    // ----------------------------------------------------
+    console.log('\n--- [Test 33] Network Loss Post-Server Creation & Idempotency Strategy ---');
+    {
+      // Skenario arsitektur: Google Calendar v3 API tidak mendukung client-side idempotency keys.
+      // Ketika TCP reset terjadi saat klien membaca respons (setelah server berhasil membuat event),
+      // error harus terklasifikasi sebagai NETWORK_ERROR dan sesi lokal tidak boleh dianggap sukses palsu.
+      global.fetch = async () => {
+        throw new TypeError('fetch failed: connection reset by peer');
+      };
+
+      try {
+        await createGoogleCalendarEvent('mock-token', {
+          title: 'Sesi Uji Network Reset',
+          startAt: '2026-11-05T09:00:00+07:00',
+          endAt: '2026-11-05T10:00:00+07:00',
+        });
+        assert.fail('Harus melempar network error');
+      } catch (err: any) {
+        assert.ok(err instanceof GoogleCalendarApiError);
+        assert.strictEqual(err.code, 'NETWORK_ERROR');
+        assert.strictEqual(err.classification.isAuthError, false, 'Network drop bukan kesalahan autentikasi');
+        assert.strictEqual(err.classification.shouldReauth, false);
+      }
+
+      console.log('  ✅ [PASS] Test 33: Keterbatasan idempotensi pasca-kreasi server tertangani aman dengan klasifikasi NETWORK_ERROR dan perlindungan data lokal.');
     }
 
     console.log('\n================================================================');

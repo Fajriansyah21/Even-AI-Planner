@@ -20,13 +20,16 @@ export interface SyncOperationTicket {
 }
 
 export interface PushOperationTicket {
+  pushId: number;
   signal: AbortSignal;
   isAborted: () => boolean;
+  isStale: () => boolean;
 }
 
 export class CalendarOperationGuard {
   private connectOpId = 0;
   private syncOpId = 0;
+  private pushOpId = 0;
   private activeSyncAbortController: AbortController | null = null;
   private activePushAbortController: AbortController | null = null;
 
@@ -37,8 +40,9 @@ export class CalendarOperationGuard {
   public startConnect(): ConnectOperationTicket {
     const connectId = ++this.connectOpId;
 
-    // Invalidate and abort ongoing syncs
+    // Invalidate and abort ongoing syncs and pushes
     this.syncOpId++;
+    this.pushOpId++;
     this.abortActiveSync();
     this.abortActivePush();
 
@@ -62,6 +66,7 @@ export class CalendarOperationGuard {
   public disconnect(): void {
     this.connectOpId++;
     this.syncOpId++;
+    this.pushOpId++;
     this.abortActiveSync();
     this.abortActivePush();
   }
@@ -98,11 +103,21 @@ export class CalendarOperationGuard {
     this.abortActivePush();
     const abortCtrl = new AbortController();
     this.activePushAbortController = abortCtrl;
+    const pushId = ++this.pushOpId;
 
     return {
+      pushId,
       signal: abortCtrl.signal,
       isAborted: () => abortCtrl.signal.aborted,
+      isStale: () => this.pushOpId !== pushId,
     };
+  }
+
+  /**
+   * Checks if a push operation is still active.
+   */
+  public isPushActive(pushId: number): boolean {
+    return this.pushOpId === pushId;
   }
 
   /**
@@ -132,6 +147,7 @@ export class CalendarOperationGuard {
     return {
       currentConnectId: this.connectOpId,
       currentSyncId: this.syncOpId,
+      currentPushId: this.pushOpId,
       hasActiveSyncController: Boolean(this.activeSyncAbortController),
       hasActivePushController: Boolean(this.activePushAbortController),
     };

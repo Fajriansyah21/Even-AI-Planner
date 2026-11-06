@@ -346,6 +346,7 @@ export default function App() {
     // Invalidate and abort any ongoing connect, sync, or calendar push operations
     calendarGuardRef.current.disconnect();
 
+    setIsSyncing(false);
     setCachedAccessToken(null);
     setHasGoogleAccessToken(false);
     setPreferences((prev) => ({
@@ -476,7 +477,7 @@ export default function App() {
 
       showToast(`Gagal menyinkronkan Google Calendar: ${classification.message}`, 'error');
     } finally {
-      if (syncRequestIdRef.current === currentRequestId) {
+      if (!ticket.isStale()) {
         setIsSyncing(false);
       }
     }
@@ -893,9 +894,23 @@ export default function App() {
         break;
       }
 
-      // Idempotency: If this session was already created in Google Calendar, do not recreate
-      if (sess.syncStatus === 'synced' && (sess as any).googleCalendarEventId) {
+      // Idempotency: Sesi hanya dianggap tersinkron jika syncStatus === 'synced' dan memiliki ID Google Calendar valid
+      const hasValidRemoteId =
+        typeof (sess as any).googleCalendarEventId === 'string' &&
+        (sess as any).googleCalendarEventId.trim().length > 0;
+
+      if (sess.syncStatus === 'synced' && hasValidRemoteId) {
         updatedSessions.push(sess);
+        continue;
+      }
+
+      // Anomali: status synced tapi ID kosong -> tidak klaim sukses palsu, tandai rekonsiliasi
+      if (sess.syncStatus === 'synced' && !hasValidRemoteId) {
+        unconfirmedCount++;
+        updatedSessions.push({
+          ...sess,
+          syncStatus: 'failed' as const,
+        });
         continue;
       }
 
@@ -939,7 +954,7 @@ export default function App() {
             : classifyGoogleCalendarError(0, err.message || '', err);
 
         // Aborted request: break immediately, preserve local data, NEVER mark as auth failure
-        if (pushAbortController.signal.aborted || classification.code === 'ABORTED') {
+        if (pushTicket.isAborted() || classification.code === 'ABORTED') {
           wasAborted = true;
           updatedSessions.push({
             ...sess,
@@ -975,6 +990,25 @@ export default function App() {
           syncStatus: 'pending' as const,
         });
       }
+    }
+
+    // Jika operasi disconnect atau push baru dijalankan, jangan timpa auth/diagnostic state
+    if (pushTicket.isStale()) {
+      setTasks((prev) =>
+        prev.map((t) => {
+          if (t.id === res.taskId) {
+            return {
+              ...t,
+              userId: userId || t.userId || 'user-default',
+              status: 'SCHEDULED',
+              scheduledSessions: updatedSessions,
+            };
+          }
+          return t;
+        })
+      );
+      setSingleScheduleResult(null);
+      return;
     }
 
     if (hasEncounteredAuthError) {
@@ -1148,9 +1182,23 @@ export default function App() {
         break;
       }
 
-      // Idempotency: If this session was already created in Google Calendar, do not recreate
-      if (sess.syncStatus === 'synced' && (sess as any).googleCalendarEventId) {
+      // Idempotency: Sesi hanya dianggap tersinkron jika syncStatus === 'synced' dan memiliki ID Google Calendar valid
+      const hasValidRemoteId =
+        typeof (sess as any).googleCalendarEventId === 'string' &&
+        (sess as any).googleCalendarEventId.trim().length > 0;
+
+      if (sess.syncStatus === 'synced' && hasValidRemoteId) {
         updatedSessions.push(sess);
+        continue;
+      }
+
+      // Anomali: status synced tapi ID kosong -> tidak klaim sukses palsu, tandai rekonsiliasi
+      if (sess.syncStatus === 'synced' && !hasValidRemoteId) {
+        unconfirmedCount++;
+        updatedSessions.push({
+          ...sess,
+          syncStatus: 'failed' as const,
+        });
         continue;
       }
 
@@ -1194,7 +1242,7 @@ export default function App() {
             : classifyGoogleCalendarError(0, err.message || '', err);
 
         // Aborted request: break immediately, preserve local data, NEVER mark as auth failure
-        if (pushAbortController.signal.aborted || classification.code === 'ABORTED') {
+        if (pushTicket.isAborted() || classification.code === 'ABORTED') {
           wasAborted = true;
           updatedSessions.push({
             ...sess,
@@ -1230,6 +1278,38 @@ export default function App() {
           syncStatus: 'pending' as const,
         });
       }
+    }
+
+    // Jika operasi disconnect atau push baru dijalankan, jangan timpa auth/diagnostic state
+    if (pushTicket.isStale()) {
+      const newTask: Task = {
+        id: taskId,
+        userId: userId || 'user-default',
+        title: plan.title,
+        description: plan.description,
+        estimatedDurationMinutes: plan.estimatedDurationMinutes,
+        deadlineAt: deadlineIso,
+        hasExplicitDeadline: Boolean(plan.hasExplicitDeadline || plan.deadlineAt),
+        targetDate: plan.targetDate,
+        targetDayOffset: plan.targetDayOffset,
+        priority: plan.priority,
+        status: scheduleResult.success ? 'SCHEDULED' : 'UNSCHEDULED',
+        allowSplit: plan.allowSplit,
+        minimumSessionMinutes: plan.minimumSessionMinutes || 30,
+        splitConfig: plan.splitConfig,
+        preferredTimeOfDay: plan.preferredTimeOfDay,
+        timeConstraintType: plan.timeConstraintType,
+        requestedStartAt: plan.requestedStartAt,
+        requestedEndAt: plan.requestedEndAt,
+        targetDays: plan.targetDays,
+        targetOccurrences: plan.targetOccurrences,
+        preferredWindow: plan.preferredWindow,
+        timezone: plan.timezone,
+        createdAt: new Date().toISOString(),
+        scheduledSessions: updatedSessions,
+      };
+      setTasks((prev) => [newTask, ...prev]);
+      return;
     }
 
     if (hasEncounteredAuthError) {
