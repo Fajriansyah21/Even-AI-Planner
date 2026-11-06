@@ -1033,10 +1033,16 @@ export async function batchCreateGoogleCalendarEvents(
         };
       }
 
-      // 2. Anomaly: Marked as 'synced' but missing Google Calendar Event ID.
-      // Do NOT claim false success or blindly create a duplicate; require reconciliation.
-      // Catatan Arsitektur: Google Calendar v3 API tidak menyediakan native client Idempotency-Key.
-      // Jika respons terputus setelah server membuat event, verifikasi remote diperlukan sebelum pembuatan ulang.
+      // 2. Anomali: Ditandai sebagai 'synced' namun ID Google Calendar kosong/hilang.
+      // DOKUMENTASI ARSITEKTUR REKONSILIASI:
+      // Google Calendar v3 REST API tidak menyediakan native client Idempotency-Key.
+      // Mekanisme rekonsiliasi otomatis berbasis pencocokan 'summary' (judul) dan rentang waktu semata
+      // TIDAK DIAKTIFKAN karena rawan false-positive (misal user memiliki agenda berulang atau agenda
+      // bernama serupa di jam yang sama tanpa penanda unik task ID).
+      // Oleh karena itu:
+      // a) Sistem TIDAK mengklaim sukses palsu.
+      // b) Sistem TIDAK membuat ulang agenda duplikat secara otomatis bila berstatus ambigu.
+      // c) Status diklasifikasikan sebagai NEEDS_RECONCILIATION (HTTP 409) agar transparan kepada pengguna.
       if (ev.syncStatus === 'synced' && !hasValidRemoteId) {
         return {
           localId: ev.id,

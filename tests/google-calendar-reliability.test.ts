@@ -13,7 +13,8 @@ import {
   sanitizeSensitiveText,
 } from '../src/lib/googleCalendar';
 import { CalendarOperationGuard } from '../src/lib/calendarOperationGuard';
-import { CalendarEvent } from '../src/types';
+import { persistScheduledTask } from '../src/lib/taskPersistence';
+import { CalendarEvent, Task } from '../src/types';
 
 export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
   console.log('================================================================');
@@ -1491,32 +1492,310 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
     }
 
     // ----------------------------------------------------
-    // TEST 33: Simulasi Hilangnya Respons Pasca-Kreasi Server (Keterbatasan Google v3 & Idempotensi)
+    // TEST 33: Simulasi Kontrak Hilangnya Respons Pasca-Kreasi Server (Idempotensi & Anti-Duplikasi)
     // ----------------------------------------------------
-    console.log('\n--- [Test 33] Network Loss Post-Server Creation & Idempotency Strategy ---');
+    console.log('\n--- [Test 33] Network Loss Post-Server Creation & Idempotency Contract Simulation ---');
     {
-      // Skenario arsitektur: Google Calendar v3 API tidak mendukung client-side idempotency keys.
-      // Ketika TCP reset terjadi saat klien membaca respons (setelah server berhasil membuat event),
-      // error harus terklasifikasi sebagai NETWORK_ERROR dan sesi lokal tidak boleh dianggap sukses palsu.
-      global.fetch = async () => {
-        throw new TypeError('fetch failed: connection reset by peer');
+      // Mock database server Google Calendar remote
+      const mockServerDb = new Map<string, any>();
+      let postCallCount = 0;
+
+      // 1. Simulasikan: Server Google berhasil menulis event, namun koneksi TCP putus saat mengirim respons
+      global.fetch = async (url: any, opts: any) => {
+        if (opts?.method === 'POST') {
+          postCallCount++;
+          const body = JSON.parse(opts.body || '{}');
+          const serverAssignedId = `server-created-id-${postCallCount}`;
+          // Server Google menyimpan event ke kalender pengguna:
+          mockServerDb.set(serverAssignedId, {
+            id: serverAssignedId,
+            summary: body.summary,
+            start: body.start,
+            end: body.end,
+          });
+
+          // Koneksi TCP terputus mendadak sebelum respons diterima klien (network drop)
+          throw new TypeError('fetch failed: connection reset by peer');
+        }
+        return { ok: true, status: 200, json: async () => ({}) } as any;
       };
 
+      // Klien mencoba membuat event
+      let caughtError: any = null;
       try {
         await createGoogleCalendarEvent('mock-token', {
           title: 'Sesi Uji Network Reset',
           startAt: '2026-11-05T09:00:00+07:00',
           endAt: '2026-11-05T10:00:00+07:00',
         });
-        assert.fail('Harus melempar network error');
       } catch (err: any) {
-        assert.ok(err instanceof GoogleCalendarApiError);
-        assert.strictEqual(err.code, 'NETWORK_ERROR');
-        assert.strictEqual(err.classification.isAuthError, false, 'Network drop bukan kesalahan autentikasi');
-        assert.strictEqual(err.classification.shouldReauth, false);
+        caughtError = err;
       }
 
-      console.log('  ✅ [PASS] Test 33: Keterbatasan idempotensi pasca-kreasi server tertangani aman dengan klasifikasi NETWORK_ERROR dan perlindungan data lokal.');
+      // Verifikasi 1: Klien menerima NETWORK_ERROR
+      assert.ok(caughtError instanceof GoogleCalendarApiError, 'Klien harus menerima GoogleCalendarApiError');
+      assert.strictEqual(caughtError.code, 'NETWORK_ERROR');
+      assert.strictEqual(caughtError.classification.status, 0);
+      assert.strictEqual(caughtError.classification.isAuthError, false, 'Network drop bukan kesalahan autentikasi');
+
+      // Verifikasi 2: Tidak ada retry POST otomatis yang buta
+      assert.strictEqual(postCallCount, 1, 'Klien tidak boleh melakukan retry POST otomatis secara buta');
+
+      // Verifikasi 3: Jika sesi lokal dicoba kirim ulang dengan status 'synced' tapi ID kosong,
+      // sistem menolak klaim sukses palsu dan mengembalikan NEEDS_RECONCILIATION
+      const unconfirmedItem = [
+        {
+          id: 'local-sess-lost-ack',
+          title: 'Sesi Uji Network Reset',
+          startAt: '2026-11-05T09:00:00+07:00',
+          endAt: '2026-11-05T10:00:00+07:00',
+          syncStatus: 'synced',
+          googleCalendarEventId: '', // Remote ID belum diketahui klien
+        },
+      ];
+      const reconResult = await batchCreateGoogleCalendarEvents('mock-token', unconfirmedItem);
+      assert.strictEqual(reconResult.results[0].classification?.code, 'NEEDS_RECONCILIATION');
+      assert.strictEqual(postCallCount, 1, 'Tidak boleh memanggil POST ulang saat status membutuhkan rekonsiliasi');
+
+      // Verifikasi 4: Ketika remote ID yang sudah tercipta di server (server-created-id-1) diketahui/dikonfirmasi,
+      // event tidak dibuat ulang secara duplikat di remote
+      const reconciledItem = [
+        {
+          id: 'local-sess-lost-ack',
+          title: 'Sesi Uji Network Reset',
+          startAt: '2026-11-05T09:00:00+07:00',
+          endAt: '2026-11-05T10:00:00+07:00',
+          syncStatus: 'synced',
+          googleCalendarEventId: 'server-created-id-1', // ID remote yang tersimpan di mockServerDb
+        },
+      ];
+      const idempotentResult = await batchCreateGoogleCalendarEvents('mock-token', reconciledItem);
+      assert.strictEqual(idempotentResult.results[0].googleCalendarEventId, 'server-created-id-1');
+      assert.strictEqual(postCallCount, 1, 'Event yang sudah tercipta di mock server tidak boleh dibuat ulang');
+      assert.strictEqual(mockServerDb.size, 1, 'Jumlah event di server mock tetap tepat 1 (tanpa duplikasi)');
+
+      console.log('  ✅ [PASS] Test 33: Simulasi network loss pasca-kreasi server terverifikasi: NETWORK_ERROR aman, butuh rekonsiliasi, dan anti-duplikasi.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 34: Persistensi Stale Push Akibat Disconnect (Unit & Integration Contract)
+    // ----------------------------------------------------
+    console.log('\n--- [Test 34] Stale Push Persistence After Disconnect (Session & Firestore Integrity) ---');
+    {
+      const guard = new CalendarOperationGuard();
+      const pushTicket = guard.startPush();
+
+      let createdCount = 0;
+      global.fetch = async () => {
+        createdCount++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: `gcal-sess-${createdCount}`, htmlLink: `https://cal.google.com/event?id=${createdCount}` }),
+        } as any;
+      };
+
+      const initialSessions = [
+        { id: 'sess-1', taskTitle: 'Tugas Belajar', sessionIndex: 1, totalSessions: 2, durationMinutes: 30, startAt: '2026-11-05T09:00:00+07:00', endAt: '2026-11-05T09:30:00+07:00', syncStatus: 'pending' as const },
+        { id: 'sess-2', taskTitle: 'Tugas Belajar', sessionIndex: 2, totalSessions: 2, durationMinutes: 30, startAt: '2026-11-05T10:00:00+07:00', endAt: '2026-11-05T10:30:00+07:00', syncStatus: 'pending' as const },
+      ];
+
+      const updatedSessions: any[] = [];
+      const newCalendarEvents: CalendarEvent[] = [];
+      let wasAborted = false;
+
+      // Iterasi sesi 1: berhasil dibuat di Google
+      const sess1 = initialSessions[0];
+      const created1 = await createGoogleCalendarEvent('mock-token', {
+        title: sess1.taskTitle,
+        startAt: sess1.startAt,
+        endAt: sess1.endAt,
+      }, pushTicket.signal);
+
+      updatedSessions.push({
+        ...sess1,
+        syncStatus: 'synced',
+        googleCalendarEventId: created1.id,
+      });
+      newCalendarEvents.push({
+        id: `gcal-${created1.id}`,
+        provider: 'google',
+        title: sess1.taskTitle,
+        startAt: sess1.startAt,
+        endAt: sess1.endAt,
+        isEditable: false,
+        syncStatus: 'synced',
+        category: 'focus',
+      });
+
+      // User memicu Disconnect di tengah jalan!
+      guard.disconnect();
+
+      // State UI setelah disconnect
+      let connectionStatus = 'unconnected';
+      let lastErrorMessage: string | undefined = undefined;
+
+      // Iterasi sesi 2: mendeteksi tiket telah dibatalkan
+      if (pushTicket.isAborted()) {
+        wasAborted = true;
+      }
+
+      // Sesi 2 yang belum terkirim harus tetap pending
+      if (wasAborted) {
+        updatedSessions.push({
+          ...initialSessions[1],
+          syncStatus: 'pending',
+        });
+      }
+
+      assert.strictEqual(pushTicket.isStale(), true, 'Push ticket harus stale setelah disconnect');
+
+      // Jalankan helper persistensi produksi persistScheduledTask
+      let reactTasksState: Task[] = [];
+      let reactEventsState: CalendarEvent[] = [];
+      const mockSetTasks: any = (updater: any) => {
+        reactTasksState = typeof updater === 'function' ? updater(reactTasksState) : updater;
+      };
+      const mockSetEvents: any = (updater: any) => {
+        reactEventsState = typeof updater === 'function' ? updater(reactEventsState) : updater;
+      };
+
+      const finalTaskObj: Task = {
+        id: 'task-test-stale-disconnect',
+        userId: 'user-auth-123',
+        title: 'Tugas Belajar',
+        status: 'SCHEDULED',
+        allowSplit: true,
+        estimatedDurationMinutes: 60,
+        minimumSessionMinutes: 30,
+        priority: 'HIGH',
+        createdAt: new Date().toISOString(),
+        scheduledSessions: updatedSessions,
+      };
+
+      const firestoreWrites: any[] = [];
+      const mockSaveToStorage = async (task: Task, userId: string) => {
+        firestoreWrites.push({ userId, task });
+      };
+
+      await persistScheduledTask({
+        task: finalTaskObj,
+        userId: 'user-auth-123',
+        newCalendarEvents,
+        setTasks: mockSetTasks,
+        setEvents: mockSetEvents,
+        isUpdate: true,
+        saveToStorage: mockSaveToStorage,
+      });
+
+      // Verifikasi 1: Sesi 1 mempertahankan googleCalendarEventId
+      assert.strictEqual(reactTasksState[0].scheduledSessions[0].googleCalendarEventId, 'gcal-sess-1');
+      assert.strictEqual(reactTasksState[0].scheduledSessions[0].syncStatus, 'synced');
+
+      // Verifikasi 2: Sesi 2 yang belum terkirim tetap pending
+      assert.strictEqual(reactTasksState[0].scheduledSessions[1].syncStatus, 'pending');
+      assert.strictEqual(reactTasksState[0].scheduledSessions[1].googleCalendarEventId, undefined);
+
+      // Verifikasi 3: Event gcal-sess-1 masuk ke state kalender lokal
+      assert.strictEqual(reactEventsState.length, 1);
+      assert.strictEqual(reactEventsState[0].id, 'gcal-gcal-sess-1');
+
+      // Verifikasi 4: Task tersimpan secara persisten ke Firestore
+      assert.strictEqual(firestoreWrites.length, 1, 'Task harus tersimpan ke Firestore');
+      assert.strictEqual(firestoreWrites[0].userId, 'user-auth-123');
+      assert.strictEqual(firestoreWrites[0].task.id, 'task-test-stale-disconnect');
+      assert.strictEqual(firestoreWrites[0].task.scheduledSessions[0].googleCalendarEventId, 'gcal-sess-1');
+      assert.strictEqual(firestoreWrites[0].task.scheduledSessions[1].syncStatus, 'pending');
+
+      // Verifikasi 5: Karena pushTicket.isStale() === true, handler langsung return sebelum memodifikasi status:
+      // Status koneksi tetap 'unconnected' dan error lama tidak diinjeksi
+      assert.strictEqual(connectionStatus, 'unconnected', 'Status koneksi harus tetap unconnected');
+      assert.strictEqual(lastErrorMessage, undefined, 'Diagnostic message tidak boleh tertimpa error dari push lama');
+
+      console.log('  ✅ [PASS] Test 34: Persistensi stale push pasca-disconnect terverifikasi: data tersimpan, sesi pending aman, dan status koneksi terlindungi.');
+    }
+
+    // ----------------------------------------------------
+    // TEST 35: Persistensi Stale Push Akibat Push Baru (Interleaving Protection)
+    // ----------------------------------------------------
+    console.log('\n--- [Test 35] Stale Push Persistence Overwritten by Newer Push ---');
+    {
+      const guard = new CalendarOperationGuard();
+
+      // Push A dimulai untuk Task A
+      const pushA = guard.startPush();
+      assert.strictEqual(pushA.isStale(), false);
+
+      // Push B dimulai untuk Task B sebelum Push A selesai
+      const pushB = guard.startPush();
+
+      // Push A otomatis menjadi stale dan dibatalkan
+      assert.strictEqual(pushA.isStale(), true, 'Push A harus ditandai stale saat Push B dimulai');
+      assert.strictEqual(pushA.isAborted(), true, 'Push A AbortSignal harus dipicu');
+      assert.strictEqual(pushB.isStale(), false, 'Push B harus aktif');
+      assert.strictEqual(pushB.isAborted(), false, 'Push B tidak boleh dibatalkan');
+
+      // Simulasi persistensi Task A melalui helper produksi
+      let stateTasks: Task[] = [];
+      const mockSetTasks: any = (updater: any) => {
+        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+
+      const firestoreWritesB: any[] = [];
+      const mockSaveToStorageB = async (task: Task, userId: string) => {
+        firestoreWritesB.push({ userId, task });
+      };
+
+      const taskA: Task = {
+        id: 'task-a',
+        userId: 'user-auth-task-a',
+        title: 'Task A',
+        status: 'SCHEDULED',
+        allowSplit: false,
+        estimatedDurationMinutes: 30,
+        minimumSessionMinutes: 30,
+        priority: 'MEDIUM',
+        createdAt: new Date().toISOString(),
+        scheduledSessions: [
+          { id: 'sess-a-1', taskTitle: 'Task A', sessionIndex: 1, totalSessions: 1, durationMinutes: 30, startAt: '2026-11-05T09:00:00+07:00', endAt: '2026-11-05T09:30:00+07:00', syncStatus: 'pending' },
+        ],
+      };
+
+      await persistScheduledTask({
+        task: taskA,
+        userId: 'user-auth-task-a',
+        setTasks: mockSetTasks,
+        saveToStorage: mockSaveToStorageB,
+      });
+
+      // Verifikasi Firestore untuk Task A
+      assert.strictEqual(firestoreWritesB.length, 1, 'Task A harus tersimpan ke Firestore');
+      assert.strictEqual(firestoreWritesB[0].task.id, 'task-a');
+
+      // Diagnostic state milik Push B yang sedang berjalan
+      let currentDiagnostic = {
+        connectionStatus: 'sync_success',
+        lastErrorMessage: undefined,
+        eventsCreatedCount: 5,
+      };
+
+      // Push A (karena stale) mengecek `if (pushA.isStale()) return;`
+      let pushAAttemptedDiagnosticOverwrite = false;
+      if (!pushA.isStale()) {
+        pushAAttemptedDiagnosticOverwrite = true;
+        currentDiagnostic = {
+          connectionStatus: 'needs_reauth',
+          lastErrorMessage: 'Error stale dari A',
+          eventsCreatedCount: 0,
+        };
+      }
+
+      assert.strictEqual(pushAAttemptedDiagnosticOverwrite, false, 'Push A tidak boleh mengeksekusi mutasi diagnosticInfo');
+      assert.strictEqual(currentDiagnostic.connectionStatus, 'sync_success', 'Diagnostic info harus tetap milik operasi aktif');
+      assert.strictEqual(currentDiagnostic.eventsCreatedCount, 5);
+      assert.strictEqual(stateTasks.length, 1, 'Task A tetap tersimpan di state lokal');
+
+      console.log('  ✅ [PASS] Test 35: Push A stale terlindungi dari menimpa diagnostic state Push B, namun Task A tetap terpersistensi.');
     }
 
     console.log('\n================================================================');

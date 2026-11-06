@@ -60,6 +60,7 @@ import {
   sanitizeSensitiveText,
 } from './lib/googleCalendar';
 import { CalendarOperationGuard } from './lib/calendarOperationGuard';
+import { persistScheduledTask } from './lib/taskPersistence';
 import {
   getInitialKeepNotes,
   convertKeepNoteToTask,
@@ -992,25 +993,50 @@ export default function App() {
       }
     }
 
-    // Jika operasi disconnect atau push baru dijalankan, jangan timpa auth/diagnostic state
+    // 1. Siapkan finalTaskObj dengan seluruh updatedSessions (baik yang berhasil dibuat dengan ID maupun pending)
+    let finalTaskObj: Task | null = null;
+    const existingTask = tasks.find((t) => t.id === res.taskId);
+    if (existingTask) {
+      finalTaskObj = {
+        ...existingTask,
+        userId: userId || existingTask.userId || 'user-default',
+        status: 'SCHEDULED',
+        scheduledSessions: updatedSessions,
+      };
+    } else {
+      finalTaskObj = {
+        id: res.taskId,
+        userId: userId || 'user-default',
+        title: res.taskTitle,
+        estimatedDurationMinutes: initialSessions.reduce((acc, s) => acc + s.durationMinutes, 0),
+        priority: 'MEDIUM',
+        status: 'SCHEDULED',
+        allowSplit: initialSessions.length > 1,
+        minimumSessionMinutes: 30,
+        createdAt: new Date().toISOString(),
+        scheduledSessions: updatedSessions,
+      };
+    }
+
+    // 2. Persistensikan secara mutlak ke React state dan Firestore jika terautentikasi
+    await persistScheduledTask({
+      task: finalTaskObj,
+      userId,
+      newCalendarEvents,
+      setTasks,
+      setEvents,
+      isUpdate: true,
+    });
+
+    setSingleScheduleResult(null);
+
+    // 3. Jika operasi push telah menjadi stale (misal akibat disconnect atau push baru),
+    // BERHENTI DI SINI agar status koneksi atau diagnostik operasi baru tidak tertimpa!
     if (pushTicket.isStale()) {
-      setTasks((prev) =>
-        prev.map((t) => {
-          if (t.id === res.taskId) {
-            return {
-              ...t,
-              userId: userId || t.userId || 'user-default',
-              status: 'SCHEDULED',
-              scheduledSessions: updatedSessions,
-            };
-          }
-          return t;
-        })
-      );
-      setSingleScheduleResult(null);
       return;
     }
 
+    // 4. Operasi push aktif: lanjutkan pemutakhiran preferensi & diagnostik
     if (hasEncounteredAuthError) {
       setCachedAccessToken(null);
       setHasGoogleAccessToken(false);
@@ -1031,34 +1057,6 @@ export default function App() {
       eventsFailedCount: prev.eventsFailedCount + failCount,
       eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
     }));
-
-    let finalTaskObj: Task | null = null;
-    setTasks((prev) =>
-      prev.map((t) => {
-        if (t.id === res.taskId) {
-          finalTaskObj = {
-            ...t,
-            userId: userId || t.userId || 'user-default',
-            status: 'SCHEDULED',
-            scheduledSessions: updatedSessions,
-          };
-          return finalTaskObj;
-        }
-        return t;
-      })
-    );
-
-    if (finalTaskObj && userId && userId !== 'user-default') {
-      try {
-        await setDoc(doc(db, 'users', userId, 'tasks', res.taskId), sanitizeForFirestore(finalTaskObj));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.UPDATE, `users/${userId}/tasks/${res.taskId}`);
-      }
-    }
-
-    if (newCalendarEvents.length > 0) {
-      setEvents((prev) => [...prev, ...newCalendarEvents]);
-    }
 
     if (wasAborted) {
       if (successCount > 0) {
@@ -1280,59 +1278,6 @@ export default function App() {
       }
     }
 
-    // Jika operasi disconnect atau push baru dijalankan, jangan timpa auth/diagnostic state
-    if (pushTicket.isStale()) {
-      const newTask: Task = {
-        id: taskId,
-        userId: userId || 'user-default',
-        title: plan.title,
-        description: plan.description,
-        estimatedDurationMinutes: plan.estimatedDurationMinutes,
-        deadlineAt: deadlineIso,
-        hasExplicitDeadline: Boolean(plan.hasExplicitDeadline || plan.deadlineAt),
-        targetDate: plan.targetDate,
-        targetDayOffset: plan.targetDayOffset,
-        priority: plan.priority,
-        status: scheduleResult.success ? 'SCHEDULED' : 'UNSCHEDULED',
-        allowSplit: plan.allowSplit,
-        minimumSessionMinutes: plan.minimumSessionMinutes || 30,
-        splitConfig: plan.splitConfig,
-        preferredTimeOfDay: plan.preferredTimeOfDay,
-        timeConstraintType: plan.timeConstraintType,
-        requestedStartAt: plan.requestedStartAt,
-        requestedEndAt: plan.requestedEndAt,
-        targetDays: plan.targetDays,
-        targetOccurrences: plan.targetOccurrences,
-        preferredWindow: plan.preferredWindow,
-        timezone: plan.timezone,
-        createdAt: new Date().toISOString(),
-        scheduledSessions: updatedSessions,
-      };
-      setTasks((prev) => [newTask, ...prev]);
-      return;
-    }
-
-    if (hasEncounteredAuthError) {
-      setCachedAccessToken(null);
-      setHasGoogleAccessToken(false);
-      setPreferences((prev) => ({
-        ...prev,
-        googleCalendarConnected: false,
-        calendarSyncStatus: 'failed',
-      }));
-    }
-
-    setDiagnosticInfo((prev) => ({
-      ...prev,
-      connectionStatus: hasEncounteredAuthError ? 'needs_reauth' : prev.connectionStatus,
-      lastErrorMessage: hasEncounteredAuthError
-        ? 'Token Google Calendar kedaluwarsa saat menyimpan sesi. Silakan hubungkan ulang di Pengaturan.'
-        : prev.lastErrorMessage,
-      eventsCreatedCount: prev.eventsCreatedCount + successCount,
-      eventsFailedCount: prev.eventsFailedCount + failCount,
-      eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
-    }));
-
     const newTask: Task = {
       id: taskId,
       userId: userId || 'user-default',
@@ -1360,20 +1305,43 @@ export default function App() {
       scheduledSessions: updatedSessions,
     };
 
-    setTasks((prev) => [newTask, ...prev]);
+    // 1. Persistensikan secara mutlak ke React state dan Firestore jika terautentikasi
+    await persistScheduledTask({
+      task: newTask,
+      userId,
+      newCalendarEvents,
+      setTasks,
+      setEvents,
+      isUpdate: false,
+    });
 
-    // Persist to Firestore if user is authenticated
-    if (userId && userId !== 'user-default') {
-      try {
-        await setDoc(doc(db, 'users', userId, 'tasks', taskId), sanitizeForFirestore(newTask));
-      } catch (err) {
-        handleFirestoreError(err, OperationType.CREATE, `users/${userId}/tasks/${taskId}`);
-      }
+    // 2. Jika operasi push telah menjadi stale (misal akibat disconnect atau push baru),
+    // BERHENTI DI SINI agar status koneksi atau diagnostik operasi baru tidak tertimpa!
+    if (pushTicket.isStale()) {
+      return;
     }
 
-    if (newCalendarEvents.length > 0) {
-      setEvents((prev) => [...prev, ...newCalendarEvents]);
+    // 3. Operasi push aktif: lanjutkan pemutakhiran preferensi & diagnostik
+    if (hasEncounteredAuthError) {
+      setCachedAccessToken(null);
+      setHasGoogleAccessToken(false);
+      setPreferences((prev) => ({
+        ...prev,
+        googleCalendarConnected: false,
+        calendarSyncStatus: 'failed',
+      }));
     }
+
+    setDiagnosticInfo((prev) => ({
+      ...prev,
+      connectionStatus: hasEncounteredAuthError ? 'needs_reauth' : prev.connectionStatus,
+      lastErrorMessage: hasEncounteredAuthError
+        ? 'Token Google Calendar kedaluwarsa saat menyimpan sesi. Silakan hubungkan ulang di Pengaturan.'
+        : prev.lastErrorMessage,
+      eventsCreatedCount: prev.eventsCreatedCount + successCount,
+      eventsFailedCount: prev.eventsFailedCount + failCount,
+      eventsUnconfirmedCount: prev.eventsUnconfirmedCount + unconfirmedCount,
+    }));
 
     if (wasAborted) {
       if (successCount > 0) {
