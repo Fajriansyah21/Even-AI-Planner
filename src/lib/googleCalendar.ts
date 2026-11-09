@@ -54,7 +54,9 @@ export type GoogleCalendarErrorCode =
   | 'RATE_LIMIT_EXCEEDED'     // HTTP 429 atau 403: API quota or rate limit exceeded
   | 'SERVICE_UNAVAILABLE'     // HTTP 500-599: Google service temporary failure
   | 'NETWORK_ERROR'           // Fetch / TCP connection dropped
-  | 'ABORTED'                 // Request aborted by controller
+  | 'ABORTED'                 // Generic request aborted by controller
+  | 'PRE_DISPATCH_ABORTED'    // Aborted strictly before network dispatch; safe to stay pending
+  | 'POST_DISPATCH_ABORTED'   // Aborted after request was sent to network; ambiguous server state
   | 'INVALID_RESPONSE'        // Non-JSON or missing required event ID
   | 'PAGINATION_LIMIT_EXCEEDED' // Max pages reached with pageToken remaining
   | 'NEEDS_RECONCILIATION'    // Marked as synced but missing remote ID; needs reconciliation
@@ -70,6 +72,8 @@ export interface GoogleCalendarErrorClassification {
   shouldReauth: boolean;
   message: string;
   userAction: string;
+  isPostAmbiguous?: boolean;
+  phase?: 'pre_dispatch' | 'in_flight' | 'response_reading' | 'response_body' | 'server_error';
 }
 
 /**
@@ -659,8 +663,16 @@ export async function createGoogleCalendarEvent(
   }
 
   if (signal?.aborted) {
-    const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError', message: 'Permintaan ke Google Calendar dibatalkan oleh pengguna.' });
-    throw new GoogleCalendarApiError(classification);
+    const classification = classifyGoogleCalendarError(0, '', {
+      name: 'AbortError',
+      message: 'Permintaan ke Google Calendar dibatalkan oleh pengguna sebelum dikirim.',
+    });
+    throw new GoogleCalendarApiError({
+      ...classification,
+      code: 'ABORTED',
+      isPostAmbiguous: false,
+      phase: 'pre_dispatch',
+    });
   }
 
   if (!event.title || !event.title.trim()) {
@@ -714,13 +726,34 @@ export async function createGoogleCalendarEvent(
       signal,
     });
   } catch (netErr: any) {
-    const classification = classifyGoogleCalendarError(0, '', netErr);
-    if (classification.code === 'ABORTED') {
-      throw new GoogleCalendarApiError(classification);
+    const isAbort =
+      signal?.aborted ||
+      netErr?.name === 'AbortError' ||
+      String(netErr?.message).toLowerCase().includes('abort');
+
+    if (isAbort) {
+      throw new GoogleCalendarApiError({
+        code: 'ABORTED',
+        status: 0,
+        isAuthError: false,
+        isPermissionError: false,
+        isRateLimitError: false,
+        isTransient: false,
+        shouldReauth: false,
+        isPostAmbiguous: true,
+        phase: 'in_flight',
+        message: 'Permintaan POST ke Google Calendar dibatalkan saat sedang berlangsung di jaringan. Agenda mungkin telah dibuat di server Google dan memerlukan rekonsiliasi.',
+        userAction: 'Lakukan rekonsiliasi kalender untuk memverifikasi apakah agenda telah dibuat di server Google.',
+      });
     }
+
+    const classification = classifyGoogleCalendarError(0, '', netErr);
     throw new GoogleCalendarApiError({
       ...classification,
-      message: `Koneksi jaringan gagal saat mengirim agenda ke Google Calendar: ${sanitizeSensitiveText(netErr.message || 'Server tidak dapat dijangkau')}`,
+      code: 'NETWORK_ERROR',
+      isPostAmbiguous: true,
+      phase: 'in_flight',
+      message: `Koneksi jaringan terputus saat mengirim agenda ke Google Calendar: ${sanitizeSensitiveText(netErr.message || 'Server tidak dapat dijangkau')}. Status agenda di Google Calendar memerlukan rekonsiliasi.`,
     });
   }
 
@@ -730,16 +763,51 @@ export async function createGoogleCalendarEvent(
       errText = await res.text();
     } catch (readErr: any) {
       if (signal?.aborted || readErr?.name === 'AbortError' || String(readErr?.message).toLowerCase().includes('abort')) {
-        const classification = classifyGoogleCalendarError(0, '', readErr || { name: 'AbortError' });
-        throw new GoogleCalendarApiError(classification);
+        throw new GoogleCalendarApiError({
+          code: 'ABORTED',
+          status: res.status,
+          isAuthError: false,
+          isPermissionError: false,
+          isRateLimitError: false,
+          isTransient: false,
+          shouldReauth: false,
+          isPostAmbiguous: true,
+          phase: 'response_reading',
+          message: 'Permintaan dibatalkan saat membaca status error dari Google Calendar.',
+          userAction: 'Lakukan rekonsiliasi kalender.',
+        });
       }
     }
     if (signal?.aborted) {
-      const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
-      throw new GoogleCalendarApiError(classification);
+      throw new GoogleCalendarApiError({
+        code: 'ABORTED',
+        status: res.status,
+        isAuthError: false,
+        isPermissionError: false,
+        isRateLimitError: false,
+        isTransient: false,
+        shouldReauth: false,
+        isPostAmbiguous: true,
+        phase: 'response_reading',
+        message: 'Permintaan dibatalkan setelah menerima respons error dari Google Calendar.',
+        userAction: 'Lakukan rekonsiliasi kalender.',
+      });
     }
+
     const classification = classifyGoogleCalendarError(res.status, errText);
     console.error(`Google Calendar Event Write Error [${res.status}]:`, classification.message);
+
+    // Tugas 2: Jika server HTTP 500-599 pada POST, server Google mungkin telah memproses pembuatan agenda
+    // sebelum gateway/balancer error. Tandai isPostAmbiguous: true agar dipetakan ke needs_reconciliation.
+    if (res.status >= 500 && res.status <= 599) {
+      throw new GoogleCalendarApiError({
+        ...classification,
+        isPostAmbiguous: true,
+        phase: 'server_error',
+        message: `Layanan Google Calendar mengembalikan status HTTP ${res.status} saat membuat agenda. Agenda mungkin telah dibuat di server Google dan memerlukan rekonsiliasi.`,
+      });
+    }
+
     throw new GoogleCalendarApiError(classification);
   }
 
@@ -748,26 +816,53 @@ export async function createGoogleCalendarEvent(
     created = await res.json();
   } catch (parseErr: any) {
     if (signal?.aborted || parseErr?.name === 'AbortError' || String(parseErr?.message).toLowerCase().includes('abort')) {
-      const classification = classifyGoogleCalendarError(0, '', parseErr || { name: 'AbortError' });
-      throw new GoogleCalendarApiError(classification);
+      throw new GoogleCalendarApiError({
+        code: 'ABORTED',
+        status: 200,
+        isAuthError: false,
+        isPermissionError: false,
+        isRateLimitError: false,
+        isTransient: false,
+        shouldReauth: false,
+        isPostAmbiguous: true,
+        phase: 'response_body',
+        message: 'Permintaan dibatalkan saat membaca isi respons dari Google Calendar. Agenda telah diproses di server Google dan memerlukan rekonsiliasi.',
+        userAction: 'Lakukan rekonsiliasi kalender untuk mengambil ID agenda.',
+      });
     }
     const classification = classifyGoogleCalendarError(200, 'Format JSON tidak valid');
     throw new GoogleCalendarApiError({
       ...classification,
       code: 'INVALID_RESPONSE',
-      message: 'Respons sukses diterima dari Google Calendar tetapi format JSON tidak valid.',
+      isPostAmbiguous: true,
+      phase: 'response_body',
+      message: 'Respons sukses diterima dari Google Calendar tetapi format JSON tidak valid. Status agenda memerlukan rekonsiliasi.',
     });
   }
 
   if (signal?.aborted) {
-    const classification = classifyGoogleCalendarError(0, '', { name: 'AbortError' });
-    throw new GoogleCalendarApiError(classification);
+    throw new GoogleCalendarApiError({
+      code: 'ABORTED',
+      status: 200,
+      isAuthError: false,
+      isPermissionError: false,
+      isRateLimitError: false,
+      isTransient: false,
+      shouldReauth: false,
+      isPostAmbiguous: true,
+      phase: 'response_body',
+      message: 'Permintaan dibatalkan sesaat setelah respons diterima dari Google Calendar. Status agenda memerlukan rekonsiliasi.',
+    });
   }
 
   // CRITICAL VALIDATION: Check for valid, non-empty event ID
   if (!created || typeof created.id !== 'string' || !created.id.trim()) {
     const classification = classifyGoogleCalendarError(200, 'tidak dapat dikonfirmasi - ID event kosong');
-    throw new GoogleCalendarApiError(classification);
+    throw new GoogleCalendarApiError({
+      ...classification,
+      isPostAmbiguous: true,
+      phase: 'response_body',
+    });
   }
 
   return {
@@ -1167,8 +1262,8 @@ export interface SessionReconciliationResult {
  * 3. Jika tidak ada event yang cocok -> status: 'not_found'.
  */
 export function reconcileSessionWithRemoteEvents(
-  session: { id: string; googleCalendarEventId?: string; title?: string },
-  remoteEvents: Array<{ id: string; htmlLink?: string; extendedProperties?: { private?: Record<string, string> } }>
+  session: { id: string; googleCalendarEventId?: string; title?: string; taskId?: string },
+  remoteEvents: Array<{ id: string; htmlLink?: string; extendedProperties?: { private?: Record<string, string>; shared?: Record<string, string> } }>
 ): SessionReconciliationResult {
   // 1. Cek kecocokan langsung berdasarkan ID remote yang sudah diketahui
   if (session.googleCalendarEventId) {
@@ -1185,10 +1280,17 @@ export function reconcileSessionWithRemoteEvents(
     }
   }
 
-  // 2. Cek berdasarkan identitas stabil session ID pada extendedProperties.private
-  const identityMatches = remoteEvents.filter(
-    (e) => e.extendedProperties?.private?.evenSessionId === session.id
-  );
+  // 2. Cek berdasarkan identitas stabil task ID dan session ID pada extendedProperties.private
+  const identityMatches = remoteEvents.filter((e) => {
+    const priv = e.extendedProperties?.private;
+    if (!priv) return false;
+    const sessionMatch = priv.evenSessionId === session.id;
+    if (!sessionMatch) return false;
+    if (session.taskId && priv.evenTaskId) {
+      return priv.evenTaskId === session.taskId;
+    }
+    return true;
+  });
 
   if (identityMatches.length === 1) {
     return {

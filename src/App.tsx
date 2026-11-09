@@ -58,7 +58,7 @@ import {
   sanitizeSensitiveText,
 } from './lib/googleCalendar';
 import { CalendarOperationGuard } from './lib/calendarOperationGuard';
-import { executeSchedulePush } from './lib/calendarPushService';
+import { executeSchedulePush, reconcileTaskSessionsWithRemote } from './lib/calendarPushService';
 import {
   getInitialKeepNotes,
   convertKeepNoteToTask,
@@ -434,6 +434,25 @@ export default function App() {
         showToast('Sinkronisasi selesai: 0 agenda ditemukan di rentang Google Calendar.', 'info');
       } else {
         showToast(`Sinkronisasi Google Calendar berhasil! Dimuat ${liveGoogleEvents.length} agenda.`);
+      }
+
+      // Alur Rekonsiliasi Produksi: otomatis rekonsiliasikan sesi yang memerlukan konfirmasi
+      const tasksWithAmbiguousSessions = tasks.filter((t) =>
+        t.scheduledSessions?.some((s) => s.syncStatus === 'needs_reconciliation')
+      );
+      if (tasksWithAmbiguousSessions.length > 0 && !ticket.isStale()) {
+        for (const t of tasksWithAmbiguousSessions) {
+          if (ticket.isStale()) break;
+          await reconcileTaskSessionsWithRemote({
+            token,
+            task: t,
+            userId,
+            ticket,
+            setTasks,
+            setEvents,
+            fetchEventsFn: async () => ({ events: liveGoogleEvents }),
+          });
+        }
       }
     } catch (err: any) {
       // Race-condition guard: ignore error if another request superceded this one
