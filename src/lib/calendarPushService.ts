@@ -1,6 +1,6 @@
 import type React from 'react';
 import { Task, TaskScheduleSession, CalendarEvent } from '../types';
-import { PushOperationTicket } from './calendarOperationGuard';
+import { PushOperationTicket, SyncOperationTicket } from './calendarOperationGuard';
 import {
   createGoogleCalendarEvent,
   fetchGoogleCalendarEvents,
@@ -289,7 +289,8 @@ export interface ReconcileTaskSessionsParams {
   task: Task;
   userId: string | null;
   timezone?: string;
-  ticket?: PushOperationTicket | { isStale: () => boolean; isAborted: () => boolean };
+  ticket?: PushOperationTicket | SyncOperationTicket | { isStale: () => boolean; isAborted?: () => boolean; signal?: AbortSignal };
+  signal?: AbortSignal;
   setTasks: React.Dispatch<React.SetStateAction<Task[]>>;
   setEvents?: React.Dispatch<React.SetStateAction<CalendarEvent[]>>;
   fetchEventsFn?: (
@@ -314,12 +315,13 @@ export interface ReconcileTaskSessionsResult {
  *
  * Prinsip Rekonsiliasi:
  * 1. Mengambil agenda remote dari Google Calendar dalam rentang sesi.
- * 2. Mencari berdasarkan identitas stabil extendedProperties.private (evenTaskId dan evenSessionId).
- * 3. Tepat satu kandidat -> status menjadi 'synced' dan ID remote tersimpan persisten.
- * 4. Lebih dari satu kandidat -> status tetap 'needs_reconciliation' (dilarang memilih otomatis).
- * 5. Nol kandidat -> status tetap 'needs_reconciliation' yang aman (dilarang langsung membuat POST baru).
- * 6. Hasil dipersistensikan ke React state dan Firestore.
- * 7. Operasi yang stale tidak boleh menimpa status koneksi atau diagnostik operasi lain.
+ * 2. Meneruskan AbortSignal ke remote fetch untuk membatalkan operasi saat sinyal aktif.
+ * 3. Mencari berdasarkan identitas stabil extendedProperties.private (evenTaskId dan evenSessionId).
+ * 4. Tepat satu kandidat -> status menjadi 'synced' dan ID remote tersimpan persisten.
+ * 5. Lebih dari satu kandidat -> status tetap 'needs_reconciliation' (dilarang memilih otomatis).
+ * 6. Nol kandidat -> status tetap 'needs_reconciliation' yang aman (dilarang langsung membuat POST baru).
+ * 7. Hasil dipersistensikan ke React state dan Firestore hanya jika operasi belum stale dan belum dibatalkan.
+ * 8. Operasi yang stale / dibatalkan tidak boleh mengubah status koneksi, React state, atau Firestore.
  */
 export async function reconcileTaskSessionsWithRemote(
   params: ReconcileTaskSessionsParams
@@ -335,7 +337,27 @@ export async function reconcileTaskSessionsWithRemote(
     saveToStorage,
   } = params;
 
-  if (ticket && (ticket.isStale() || ticket.isAborted())) {
+  const activeSignal = params.signal || (ticket && 'signal' in ticket ? (ticket as any).signal : undefined);
+
+  const checkIsAborted = (): boolean => {
+    if (activeSignal?.aborted) return true;
+    if (ticket) {
+      if ('isAborted' in ticket && typeof (ticket as any).isAborted === 'function') {
+        return (ticket as any).isAborted();
+      }
+      if ((ticket as any).signal?.aborted) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const checkIsStale = (): boolean => {
+    return Boolean(ticket?.isStale());
+  };
+
+  // 1. Abort atau stale sebelum fetch: DILARANG memulai request fetch
+  if (checkIsStale() || checkIsAborted()) {
     return {
       updatedTask: task,
       reconciledCount: 0,
@@ -355,7 +377,7 @@ export async function reconcileTaskSessionsWithRemote(
       reconciledCount: 0,
       stillAmbiguousCount: 0,
       notFoundCount: 0,
-      isStale: Boolean(ticket?.isStale()),
+      isStale: checkIsStale(),
     };
   }
 
@@ -369,20 +391,37 @@ export async function reconcileTaskSessionsWithRemote(
 
   let remoteEvents: CalendarEvent[] = [];
   try {
-    const fetchRes = await fetchEventsFn(token, minTime, maxTime);
+    const fetchRes = await fetchEventsFn(token, minTime, maxTime, activeSignal);
     remoteEvents = fetchRes.events || [];
-  } catch (err) {
+  } catch (err: any) {
+    const wasAborted =
+      checkIsStale() ||
+      checkIsAborted() ||
+      err?.name === 'AbortError' ||
+      String(err?.message || '').toLowerCase().includes('abort');
+
+    if (wasAborted) {
+      return {
+        updatedTask: task,
+        reconciledCount: 0,
+        stillAmbiguousCount: 0,
+        notFoundCount: 0,
+        isStale: true,
+      };
+    }
+
     console.error('Failed to fetch remote events during reconciliation:', err);
     return {
       updatedTask: task,
       reconciledCount: 0,
       stillAmbiguousCount: needsReconciliationSessions.length,
       notFoundCount: 0,
-      isStale: Boolean(ticket?.isStale()),
+      isStale: checkIsStale(),
     };
   }
 
-  if (ticket && (ticket.isStale() || ticket.isAborted())) {
+  // 2. Abort atau stale saat fetch berlangsung atau sebelum memproses hasil: DILARANG memproses hasil
+  if (checkIsStale() || checkIsAborted()) {
     return {
       updatedTask: task,
       reconciledCount: 0,
@@ -467,6 +506,17 @@ export async function reconcileTaskSessionsWithRemote(
     scheduledSessions: updatedSessions,
   };
 
+  // 3. Operasi stale / aborted DILARANG mengubah state atau Firestore
+  if (checkIsStale() || checkIsAborted()) {
+    return {
+      updatedTask: task,
+      reconciledCount: 0,
+      stillAmbiguousCount: 0,
+      notFoundCount: 0,
+      isStale: true,
+    };
+  }
+
   // Persistensikan secara mutlak ke React state dan Firestore
   await persistScheduledTask({
     task: updatedTask,
@@ -483,6 +533,6 @@ export async function reconcileTaskSessionsWithRemote(
     reconciledCount,
     stillAmbiguousCount,
     notFoundCount,
-    isStale: Boolean(ticket?.isStale()),
+    isStale: checkIsStale(),
   };
 }

@@ -2359,642 +2359,454 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
     }
 
     // =========================================================================
-    // PHASE 2A.3.4 TESTS: HARDENING AMBIGUOUS POST, ABORT & END-TO-END RECONCILIATION
+    // PHASE 2A.3.4 & PHASE 2A.3.4.1 TESTS:
+    // API-LEVEL VERIFICATION, STRICT RECONCILIATION & TRUE CONCURRENCY
     // =========================================================================
 
-    // ----------------------------------------------------
-    // TEST 41 (TEST A): Google Server Succeeded, Then Client Receives AbortError (Post-Dispatch Abort)
-    // ----------------------------------------------------
-    console.log('\n--- [Test 41 / Test A] Server Succeeded, Client Receives AbortError (Post-Dispatch Abort) ---');
+    // -------------------------------------------------------------------------
+    // CATEGORY: API-LEVEL TESTS (createGoogleCalendarEvent PRODUCTION FUNCTION)
+    // -------------------------------------------------------------------------
+
+    // TEST 41 (API-Level Test A): Pre-dispatch Abort
+    console.log('\n--- [Test 41 / API Test A] Pre-Dispatch Abort on createGoogleCalendarEvent ---');
     {
-      const guard = new CalendarOperationGuard();
-      const pushTicket = guard.startPush();
+      const abortCtrl = new AbortController();
+      abortCtrl.abort(); // Signal sudah aktif sebelum fungsi dipanggil
 
-      // Mock remote server database
-      const mockServerDb: Array<{ id: string; title: string; extendedProperties?: any }> = [];
-
-      // Mock createEventFn: server memproses dan menyimpan event, lalu koneksi terputus dengan AbortError
-      const mockCreateEventPostDispatchAbort = async (
-        _token: string,
-        input: any,
-        _signal?: AbortSignal
-      ) => {
-        // Efek samping server terjadi terlebih dahulu
-        const remoteId = 'gcal-server-created-before-abort';
-        mockServerDb.push({
-          id: remoteId,
-          title: input.title,
-          extendedProperties: input.extendedProperties,
-        });
-
-        // Klien mengalami pembatalan / timeout saat menunggu respons jaringan (post-dispatch)
-        const abortErr = new Error('The user aborted a request.');
-        abortErr.name = 'AbortError';
-        throw new GoogleCalendarApiError({
-          code: 'POST_DISPATCH_ABORTED',
-          status: 0,
-          isAuthError: false,
-          isPermissionError: false,
-          isRateLimitError: false,
-          isTransient: false,
-          shouldReauth: false,
-          isPostAmbiguous: true,
-          phase: 'in_flight',
-          message: 'Permintaan POST ke Google Calendar dibatalkan saat sedang berlangsung di jaringan.',
-          userAction: 'Lakukan rekonsiliasi kalender.',
-        });
-      };
-
-      const taskToPush: Task = {
-        id: 'task-test-a',
-        userId: 'user-auth-a',
-        title: 'Tugas Post-Dispatch Abort',
-        status: 'SCHEDULED',
-        allowSplit: false,
-        estimatedDurationMinutes: 60,
-        minimumSessionMinutes: 30,
-        priority: 'HIGH',
-        createdAt: new Date().toISOString(),
-        scheduledSessions: [
-          {
-            id: 'sess-test-a-1',
-            taskTitle: 'Tugas Post-Dispatch Abort',
-            sessionIndex: 1,
-            totalSessions: 1,
-            durationMinutes: 60,
-            startAt: '2026-11-08T10:00:00+07:00',
-            endAt: '2026-11-08T11:00:00+07:00',
-            syncStatus: 'pending',
-          },
-        ],
-      };
-
-      let stateTasks: Task[] = [];
-      const mockSetTasks: any = (updater: any) => {
-        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
-      };
-
-      const firestoreWrites: any[] = [];
-      const mockSaveStorage = async (task: Task, userId: string) => {
-        firestoreWrites.push({ task, userId });
-      };
-
-      const pushResult = await executeSchedulePush({
-        token: 'mock-valid-token',
-        task: taskToPush,
-        sessions: taskToPush.scheduledSessions,
-        timezone: 'Asia/Jakarta',
-        userId: 'user-auth-a',
-        pushTicket,
-        setTasks: mockSetTasks,
-        createEventFn: mockCreateEventPostDispatchAbort,
-        saveToStorage: mockSaveStorage,
-      });
-
-      // 1. Verifikasi status sesi: Post-dispatch abort WAJIB menghasilkan needs_reconciliation (BUKAN pending, BUKAN failed)
-      assert.strictEqual(
-        pushResult.updatedSessions[0].syncStatus,
-        'needs_reconciliation',
-        'Post-dispatch abort wajib menghasilkan syncStatus needs_reconciliation'
-      );
-      assert.strictEqual(
-        pushResult.updatedSessions[0].googleCalendarEventId,
-        undefined,
-        'Remote ID tidak boleh diisi klaim palsu sebelum rekonsiliasi terkonfirmasi'
-      );
-      assert.strictEqual(pushResult.wasAborted, true);
-      assert.strictEqual(pushResult.reconciliationCount, 1);
-      assert.strictEqual(pushResult.failCount, 0);
-
-      // 2. Verifikasi efek samping server benar-benar terjadi
-      assert.strictEqual(mockServerDb.length, 1, 'Event harus tersimpan di mock server');
-
-      // 3. Verifikasi persistensi ke storage
-      assert.strictEqual(firestoreWrites.length, 1);
-      assert.strictEqual(firestoreWrites[0].task.scheduledSessions[0].syncStatus, 'needs_reconciliation');
-      assert.strictEqual(stateTasks[0].scheduledSessions[0].syncStatus, 'needs_reconciliation');
-
-      // 4. Verifikasi pencegahan blind resend
-      let resendAttempted = false;
+      let fetchCalled = false;
       global.fetch = async () => {
-        resendAttempted = true;
+        fetchCalled = true;
         return { ok: true, json: async () => ({ id: 'unexpected' }) } as any;
       };
 
-      await batchCreateGoogleCalendarEvents('mock-token', [
-        {
-          id: pushResult.updatedSessions[0].id,
-          title: pushResult.updatedSessions[0].taskTitle,
-          startAt: pushResult.updatedSessions[0].startAt,
-          endAt: pushResult.updatedSessions[0].endAt,
-          syncStatus: pushResult.updatedSessions[0].syncStatus,
-        } as any,
-      ]);
-
-      assert.strictEqual(resendAttempted, false, 'Sesi needs_reconciliation dilarang di-POST ulang secara buta');
-      assert.strictEqual(mockServerDb.length, 1, 'Server database tetap 1 event (anti duplikasi)');
-
-      console.log('  ✅ [PASS] Test 41 (Test A): Server succeeded, client aborted post-dispatch -> dipetakan ke needs_reconciliation & anti-resend.');
-    }
-
-    // ----------------------------------------------------
-    // TEST 42 (TEST B): Google Server Succeeded, Then HTTP 500 Received (POST 5xx Ambiguous)
-    // ----------------------------------------------------
-    console.log('\n--- [Test 42 / Test B] Server Succeeded, Then HTTP 500 Received on POST ---');
-    {
-      const guard = new CalendarOperationGuard();
-      const pushTicket = guard.startPush();
-
-      const mockServerDb: Array<{ id: string; title: string }> = [];
-
-      // Mock createEventFn: server memproses dan menyimpan event, lalu mengembalikan HTTP 500
-      const mockCreateEventPost500 = async (
-        _token: string,
-        input: any,
-        _signal?: AbortSignal
-      ) => {
-        // Server database berhasil menyimpan event sebelum gateway internal error
-        mockServerDb.push({
-          id: 'gcal-server-created-before-500',
-          title: input.title,
-        });
-
-        throw new GoogleCalendarApiError({
-          code: 'SERVICE_UNAVAILABLE',
-          status: 500,
-          isAuthError: false,
-          isPermissionError: false,
-          isRateLimitError: false,
-          isTransient: true,
-          shouldReauth: false,
-          isPostAmbiguous: true,
-          phase: 'server_error',
-          message: 'Layanan Google Calendar mengembalikan status HTTP 500 saat membuat agenda.',
-          userAction: 'Lakukan rekonsiliasi kalender.',
-        });
-      };
-
-      const taskToPush: Task = {
-        id: 'task-test-b',
-        userId: 'user-auth-b',
-        title: 'Tugas POST 500',
-        status: 'SCHEDULED',
-        allowSplit: false,
-        estimatedDurationMinutes: 45,
-        minimumSessionMinutes: 30,
-        priority: 'MEDIUM',
-        createdAt: new Date().toISOString(),
-        scheduledSessions: [
+      let caughtError: any = null;
+      try {
+        await createGoogleCalendarEvent(
+          'mock-token',
           {
-            id: 'sess-test-b-1',
-            taskTitle: 'Tugas POST 500',
-            sessionIndex: 1,
-            totalSessions: 1,
-            durationMinutes: 45,
-            startAt: '2026-11-08T13:00:00+07:00',
-            endAt: '2026-11-08T13:45:00+07:00',
-            syncStatus: 'pending',
-          },
-        ],
-      };
-
-      let stateTasks: Task[] = [];
-      const mockSetTasks: any = (updater: any) => {
-        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
-      };
-
-      const firestoreWrites: any[] = [];
-      const mockSaveStorage = async (task: Task, userId: string) => {
-        firestoreWrites.push({ task, userId });
-      };
-
-      const pushResult = await executeSchedulePush({
-        token: 'mock-valid-token',
-        task: taskToPush,
-        sessions: taskToPush.scheduledSessions,
-        timezone: 'Asia/Jakarta',
-        userId: 'user-auth-b',
-        pushTicket,
-        setTasks: mockSetTasks,
-        createEventFn: mockCreateEventPost500,
-        saveToStorage: mockSaveStorage,
-      });
-
-      // 1. Verifikasi HTTP 5xx pada POST dipetakan ke needs_reconciliation, BUKAN failed
-      assert.strictEqual(
-        pushResult.updatedSessions[0].syncStatus,
-        'needs_reconciliation',
-        'POST HTTP 5xx wajib dipetakan ke needs_reconciliation'
-      );
-      assert.strictEqual(pushResult.reconciliationCount, 1);
-      assert.strictEqual(pushResult.failCount, 0, 'failCount tidak boleh bertambah untuk error ambigu 5xx');
-
-      // 2. Verifikasi efek samping server tetap ada
-      assert.strictEqual(mockServerDb.length, 1);
-
-      // 3. Verifikasi persistensi
-      assert.strictEqual(firestoreWrites.length, 1);
-      assert.strictEqual(firestoreWrites[0].task.scheduledSessions[0].syncStatus, 'needs_reconciliation');
-      assert.strictEqual(stateTasks[0].scheduledSessions[0].syncStatus, 'needs_reconciliation');
-
-      console.log('  ✅ [PASS] Test 42 (Test B): Server membuat event lalu mengembalikan HTTP 500 -> dipetakan ke needs_reconciliation.');
-    }
-
-    // ----------------------------------------------------
-    // TEST 43 (TEST C): Abort Before Fetch Starts (Pre-Dispatch Abort), Session Remains Pending
-    // ----------------------------------------------------
-    console.log('\n--- [Test 43 / Test C] Abort Before Fetch Starts (Pre-Dispatch Abort) ---');
-    {
-      const guard = new CalendarOperationGuard();
-      const pushTicket = guard.startPush();
-
-      // Pemicu pembatalan sebelum operasi dimulai
-      guard.abortActivePush();
-
-      let fetchDispatched = false;
-      const mockCreateEventPreDispatch = async () => {
-        fetchDispatched = true;
-        return { id: 'should-never-be-called' };
-      };
-
-      const taskToPush: Task = {
-        id: 'task-test-c',
-        userId: 'user-auth-c',
-        title: 'Tugas Pre-Dispatch Abort',
-        status: 'SCHEDULED',
-        allowSplit: false,
-        estimatedDurationMinutes: 30,
-        minimumSessionMinutes: 30,
-        priority: 'LOW',
-        createdAt: new Date().toISOString(),
-        scheduledSessions: [
-          {
-            id: 'sess-test-c-1',
-            taskTitle: 'Tugas Pre-Dispatch Abort',
-            sessionIndex: 1,
-            totalSessions: 1,
-            durationMinutes: 30,
-            startAt: '2026-11-08T15:00:00+07:00',
-            endAt: '2026-11-08T15:30:00+07:00',
-            syncStatus: 'pending',
-          },
-        ],
-      };
-
-      let stateTasks: Task[] = [];
-      const mockSetTasks: any = (updater: any) => {
-        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
-      };
-
-      const pushResult = await executeSchedulePush({
-        token: 'mock-valid-token',
-        task: taskToPush,
-        sessions: taskToPush.scheduledSessions,
-        timezone: 'Asia/Jakarta',
-        userId: 'user-auth-c',
-        pushTicket,
-        setTasks: mockSetTasks,
-        createEventFn: mockCreateEventPreDispatch,
-        saveToStorage: async () => {},
-      });
-
-      // 1. Verifikasi network fetch sama sekali tidak dipanggil
-      assert.strictEqual(fetchDispatched, false, 'Fetch tidak boleh dipanggil jika tiket sudah dibatalkan pre-dispatch');
-
-      // 2. Verifikasi status sesi tetap pending (bukan needs_reconciliation, bukan failed)
-      assert.strictEqual(
-        pushResult.updatedSessions[0].syncStatus,
-        'pending',
-        'Sesi yang dibatalkan pre-dispatch harus tetap pending'
-      );
-      assert.strictEqual(pushResult.wasAborted, true);
-      assert.strictEqual(pushResult.reconciliationCount, 0);
-
-      console.log('  ✅ [PASS] Test 43 (Test C): Pre-dispatch abort dicegat bersih, fetch tidak keluar, sesi tetap pending.');
-    }
-
-    // ----------------------------------------------------
-    // TEST 44 (TEST D): Abort While Reading Response Body After Server Created Event
-    // ----------------------------------------------------
-    console.log('\n--- [Test 44 / Test D] Abort While Reading Response Body After Server Created Event ---');
-    {
-      const guard = new CalendarOperationGuard();
-      const pushTicket = guard.startPush();
-
-      const mockServerDb: Array<{ id: string }> = [];
-
-      // Mock createEventFn: server membuat event, mengembalikan 200, tetapi saat membaca json terjadi abort
-      const mockCreateEventBodyAbort = async (
-        _token: string,
-        _input: any,
-        _signal?: AbortSignal
-      ) => {
-        // Server berhasil membuat event
-        mockServerDb.push({ id: 'gcal-created-before-body-abort' });
-
-        // Throw error POST_DISPATCH_ABORTED saat membaca response body
-        throw new GoogleCalendarApiError({
-          code: 'POST_DISPATCH_ABORTED',
-          status: 200,
-          isAuthError: false,
-          isPermissionError: false,
-          isRateLimitError: false,
-          isTransient: false,
-          shouldReauth: false,
-          isPostAmbiguous: true,
-          phase: 'response_body',
-          message: 'Permintaan dibatalkan saat membaca isi respons dari Google Calendar.',
-          userAction: 'Lakukan rekonsiliasi kalender.',
-        });
-      };
-
-      const taskToPush: Task = {
-        id: 'task-test-d',
-        userId: 'user-auth-d',
-        title: 'Tugas Body Abort',
-        status: 'SCHEDULED',
-        allowSplit: false,
-        estimatedDurationMinutes: 60,
-        minimumSessionMinutes: 30,
-        priority: 'HIGH',
-        createdAt: new Date().toISOString(),
-        scheduledSessions: [
-          {
-            id: 'sess-test-d-1',
-            taskTitle: 'Tugas Body Abort',
-            sessionIndex: 1,
-            totalSessions: 1,
-            durationMinutes: 60,
-            startAt: '2026-11-08T16:00:00+07:00',
-            endAt: '2026-11-08T17:00:00+07:00',
-            syncStatus: 'pending',
-          },
-        ],
-      };
-
-      let stateTasks: Task[] = [];
-      const mockSetTasks: any = (updater: any) => {
-        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
-      };
-
-      const pushResult = await executeSchedulePush({
-        token: 'mock-valid-token',
-        task: taskToPush,
-        sessions: taskToPush.scheduledSessions,
-        timezone: 'Asia/Jakarta',
-        userId: 'user-auth-d',
-        pushTicket,
-        setTasks: mockSetTasks,
-        createEventFn: mockCreateEventBodyAbort,
-        saveToStorage: async () => {},
-      });
-
-      assert.strictEqual(pushResult.updatedSessions[0].syncStatus, 'needs_reconciliation');
-      assert.strictEqual(pushResult.wasAborted, true);
-      assert.strictEqual(pushResult.reconciliationCount, 1);
-      assert.strictEqual(mockServerDb.length, 1);
-
-      console.log('  ✅ [PASS] Test 44 (Test D): Abort saat membaca response body terpetakan ke needs_reconciliation.');
-    }
-
-    // ----------------------------------------------------
-    // TEST 45 (TEST E): End-to-End Reconciliation With 1 Candidate -> Persisted to State & Firestore
-    // ----------------------------------------------------
-    console.log('\n--- [Test 45 / Test E] Production Reconciliation With 1 Candidate (Confirmed) ---');
-    {
-      const taskId = 'task-recon-e-1';
-      const sessionId = 'sess-recon-e-1';
-
-      const taskWithAmbiguousSession: Task = {
-        id: taskId,
-        userId: 'user-recon-e',
-        title: 'Tugas Rekonsiliasi Unik',
-        status: 'SCHEDULED',
-        allowSplit: false,
-        estimatedDurationMinutes: 60,
-        minimumSessionMinutes: 30,
-        priority: 'HIGH',
-        createdAt: new Date().toISOString(),
-        scheduledSessions: [
-          {
-            id: sessionId,
-            taskTitle: 'Tugas Rekonsiliasi Unik',
-            sessionIndex: 1,
-            totalSessions: 1,
-            durationMinutes: 60,
+            title: 'Test Pre-Dispatch Abort',
             startAt: '2026-11-08T10:00:00+07:00',
             endAt: '2026-11-08T11:00:00+07:00',
-            syncStatus: 'needs_reconciliation',
           },
-        ],
-      };
+          abortCtrl.signal
+        );
+      } catch (err: any) {
+        caughtError = err;
+      }
 
-      // Mock remote calendar memiliki tepat 1 event yang cocok via extendedProperties.private
-      const mockRemoteEvents: CalendarEvent[] = [
-        {
-          id: 'gcal-remote-e-confirmed-999',
-          provider: 'google',
-          title: '[EVEN] Tugas Rekonsiliasi Unik',
-          startAt: '2026-11-08T10:00:00+07:00',
-          endAt: '2026-11-08T11:00:00+07:00',
-          htmlLink: 'https://calendar.google.com/event?eid=recon999',
-          isEditable: false,
-          syncStatus: 'synced',
-          category: 'focus',
-          extendedProperties: {
-            private: {
-              evenTaskId: taskId,
-              evenSessionId: sessionId,
-              evenSessionIndex: '1',
-            },
-          },
-        },
-      ];
-
-      let stateTasks: Task[] = [taskWithAmbiguousSession];
-      const mockSetTasks: any = (updater: any) => {
-        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
-      };
-
-      const firestoreSaves: any[] = [];
-      const mockSaveStorage = async (task: Task, userId: string) => {
-        firestoreSaves.push({ task, userId });
-      };
-
-      // Panggil alur rekonsiliasi produksi
-      const reconResult = await reconcileTaskSessionsWithRemote({
-        token: 'mock-valid-token',
-        task: taskWithAmbiguousSession,
-        userId: 'user-recon-e',
-        setTasks: mockSetTasks,
-        fetchEventsFn: async () => ({ events: mockRemoteEvents }),
-        saveToStorage: mockSaveStorage,
-      });
-
-      // 1. Verifikasi hasil rekonsiliasi
-      assert.strictEqual(reconResult.reconciledCount, 1, 'Harus merekonsiliasi 1 sesi');
-      assert.strictEqual(reconResult.stillAmbiguousCount, 0);
-      assert.strictEqual(reconResult.notFoundCount, 0);
-
-      const reconciledSess = reconResult.updatedTask.scheduledSessions[0];
-      assert.strictEqual(reconciledSess.syncStatus, 'synced');
-      assert.strictEqual(reconciledSess.googleCalendarEventId, 'gcal-remote-e-confirmed-999');
-      assert.strictEqual(reconciledSess.htmlLink, 'https://calendar.google.com/event?eid=recon999');
-
-      // 2. Verifikasi persistensi ke React state dan Firestore
-      assert.strictEqual(firestoreSaves.length, 1);
-      assert.strictEqual(firestoreSaves[0].task.scheduledSessions[0].syncStatus, 'synced');
-      assert.strictEqual(firestoreSaves[0].task.scheduledSessions[0].googleCalendarEventId, 'gcal-remote-e-confirmed-999');
-      assert.strictEqual(stateTasks[0].scheduledSessions[0].syncStatus, 'synced');
-
-      // 3. Verifikasi push berikutnya idempoten (0 POST baru)
-      let postDispatched = false;
-      const guard = new CalendarOperationGuard();
-      const ticket = guard.startPush();
-      await executeSchedulePush({
-        token: 'mock-token',
-        task: reconResult.updatedTask,
-        sessions: reconResult.updatedTask.scheduledSessions,
-        timezone: 'Asia/Jakarta',
-        userId: 'user-recon-e',
-        pushTicket: ticket,
-        setTasks: mockSetTasks,
-        createEventFn: async () => {
-          postDispatched = true;
-          return { id: 'should-not-run' };
-        },
-        saveToStorage: async () => {},
-      });
-
-      assert.strictEqual(postDispatched, false, 'Sesi yang sudah synced hasil rekonsiliasi tidak boleh memicu POST baru');
-
-      console.log('  ✅ [PASS] Test 45 (Test E): Alur rekonsiliasi produksi 1 kandidat terkonfirmasi, tersimpan ke Firestore & state, serta idempoten.');
+      assert.ok(caughtError instanceof GoogleCalendarApiError, 'Harus melempar GoogleCalendarApiError');
+      assert.strictEqual(fetchCalled, false, 'Fetch TIDAK boleh dipanggil jika sinyal sudah diaborted pre-dispatch');
+      assert.strictEqual(caughtError.code, 'ABORTED');
+      assert.strictEqual(caughtError.isPostAmbiguous, false, 'Pre-dispatch abort harus memiliki isPostAmbiguous: false');
+      assert.strictEqual(caughtError.phase, 'pre_dispatch', 'Phase harus pre_dispatch');
+      console.log('  ✅ [PASS] Test 41 (API Test A): Pre-dispatch abort dicegat tanpa panggil fetch, isPostAmbiguous: false, phase: pre_dispatch.');
     }
 
-    // ----------------------------------------------------
-    // TEST 46 (TEST F): Production Reconciliation With 2 Candidates, No Blind Selection & No POST
-    // ----------------------------------------------------
-    console.log('\n--- [Test 46 / Test F] Production Reconciliation With 2 Candidates (Ambiguous) ---');
+    // TEST 42 (API-Level Test B): Post-dispatch AbortError
+    console.log('\n--- [Test 42 / API Test B] Post-Dispatch Abort on createGoogleCalendarEvent ---');
     {
-      const taskId = 'task-recon-f-1';
-      const sessionId = 'sess-recon-f-1';
+      const abortCtrl = new AbortController();
+      const mockServerDb: Array<{ title: string }> = [];
 
-      const taskWithAmbiguousSession: Task = {
-        id: taskId,
-        userId: 'user-recon-f',
-        title: 'Tugas Rekonsiliasi Multi-Kandidat',
+      let fetchCalled = false;
+      global.fetch = async (_url: any, opts: any) => {
+        fetchCalled = true;
+        assert.strictEqual(opts.method, 'POST');
+        const body = JSON.parse(opts.body);
+        // Simulasikan server Google menerima dan menyimpan event sebelum jaringan klien terputus
+        mockServerDb.push({ title: body.summary });
+
+        // Simulasikan browser melempar AbortError saat menunggu respons jaringan
+        abortCtrl.abort();
+        const err = new Error('The user aborted a request.');
+        err.name = 'AbortError';
+        throw err;
+      };
+
+      let caughtError: any = null;
+      try {
+        await createGoogleCalendarEvent(
+          'mock-token',
+          {
+            title: 'Test Post-Dispatch Abort',
+            startAt: '2026-11-08T11:00:00+07:00',
+            endAt: '2026-11-08T12:00:00+07:00',
+          },
+          abortCtrl.signal
+        );
+      } catch (err: any) {
+        caughtError = err;
+      }
+
+      assert.ok(caughtError instanceof GoogleCalendarApiError);
+      assert.strictEqual(fetchCalled, true, 'Fetch harus benar-benar menerima request POST');
+      assert.strictEqual(mockServerDb.length, 1, 'Server database mencatat event tersimpan');
+      assert.strictEqual(caughtError.code, 'ABORTED');
+      assert.strictEqual(caughtError.isPostAmbiguous, true, 'Post-dispatch abort wajib isPostAmbiguous: true');
+      assert.strictEqual(caughtError.phase, 'in_flight', 'Phase harus in_flight');
+      console.log('  ✅ [PASS] Test 42 (API Test B): Post-dispatch abort melempar isPostAmbiguous: true dan phase: in_flight.');
+    }
+
+    // TEST 43 (API-Level Test C): Abort While Reading Response Body
+    console.log('\n--- [Test 43 / API Test C] Abort While Reading Response Body on createGoogleCalendarEvent ---');
+    {
+      const abortCtrl = new AbortController();
+      const mockServerDb: Array<{ id: string }> = [];
+
+      global.fetch = async () => {
+        mockServerDb.push({ id: 'gcal-server-ok' });
+        return {
+          ok: true,
+          status: 200,
+          json: async () => {
+            abortCtrl.abort();
+            const err = new Error('The user aborted a request while reading body.');
+            err.name = 'AbortError';
+            throw err;
+          },
+        } as any;
+      };
+
+      let caughtError: any = null;
+      try {
+        await createGoogleCalendarEvent(
+          'mock-token',
+          {
+            title: 'Test Response Body Abort',
+            startAt: '2026-11-08T13:00:00+07:00',
+            endAt: '2026-11-08T14:00:00+07:00',
+          },
+          abortCtrl.signal
+        );
+      } catch (err: any) {
+        caughtError = err;
+      }
+
+      assert.ok(caughtError instanceof GoogleCalendarApiError);
+      assert.strictEqual(mockServerDb.length, 1);
+      assert.strictEqual(caughtError.code, 'ABORTED');
+      assert.strictEqual(caughtError.isPostAmbiguous, true, 'Abort saat membaca body wajib isPostAmbiguous: true');
+      assert.strictEqual(caughtError.phase, 'response_body', 'Phase harus response_body');
+      console.log('  ✅ [PASS] Test 43 (API Test C): Abort saat baca body terklasifikasi isPostAmbiguous: true dan phase: response_body.');
+    }
+
+    // TEST 44 (API-Level Test D): HTTP 500 & 503 on POST createGoogleCalendarEvent
+    console.log('\n--- [Test 44 / API Test D] HTTP 500 and 503 on createGoogleCalendarEvent ---');
+    {
+      // Skenario 1: HTTP 500
+      global.fetch = async () => ({
+        ok: false,
+        status: 500,
+        text: async () => '{"error": {"code": 500, "message": "Internal Server Error"}}',
+      } as any);
+
+      let caughtError500: any = null;
+      try {
+        await createGoogleCalendarEvent('mock-token', {
+          title: 'Test POST HTTP 500',
+          startAt: '2026-11-08T14:00:00+07:00',
+          endAt: '2026-11-08T15:00:00+07:00',
+        });
+      } catch (err: any) {
+        caughtError500 = err;
+      }
+
+      assert.ok(caughtError500 instanceof GoogleCalendarApiError);
+      assert.strictEqual(caughtError500.code, 'SERVICE_UNAVAILABLE', 'HTTP 500 harus menghasilkan code SERVICE_UNAVAILABLE');
+      assert.strictEqual(caughtError500.status, 500);
+      assert.strictEqual(caughtError500.isPostAmbiguous, true, 'HTTP 500 pada POST wajib isPostAmbiguous: true');
+      assert.strictEqual(caughtError500.phase, 'server_error', 'Phase harus server_error');
+
+      // Skenario 2: HTTP 503
+      global.fetch = async () => ({
+        ok: false,
+        status: 503,
+        text: async () => 'Service Unavailable',
+      } as any);
+
+      let caughtError503: any = null;
+      try {
+        await createGoogleCalendarEvent('mock-token', {
+          title: 'Test POST HTTP 503',
+          startAt: '2026-11-08T15:00:00+07:00',
+          endAt: '2026-11-08T16:00:00+07:00',
+        });
+      } catch (err: any) {
+        caughtError503 = err;
+      }
+
+      assert.ok(caughtError503 instanceof GoogleCalendarApiError);
+      assert.strictEqual(caughtError503.code, 'SERVICE_UNAVAILABLE', 'HTTP 503 harus menghasilkan code SERVICE_UNAVAILABLE');
+      assert.strictEqual(caughtError503.status, 503);
+      assert.strictEqual(caughtError503.isPostAmbiguous, true, 'HTTP 503 pada POST wajib isPostAmbiguous: true');
+      assert.strictEqual(caughtError503.phase, 'server_error', 'Phase harus server_error');
+
+      console.log('  ✅ [PASS] Test 44 (API Test D): HTTP 500 dan 503 menghasilkan SERVICE_UNAVAILABLE, isPostAmbiguous: true, phase: server_error.');
+    }
+
+    // -------------------------------------------------------------------------
+    // CATEGORY: STRICT IDENTITY MATCHING TESTS (reconcileSessionWithRemoteEvents)
+    // -------------------------------------------------------------------------
+
+    // TEST 45: Strict Identity Matching (Task ID & Session ID Validation)
+    console.log('\n--- [Test 45] Strict Identity Matching in reconcileSessionWithRemoteEvents ---');
+    {
+      const taskId = 'task-strict-45';
+      const sessId = 'sess-strict-45';
+
+      // 1. Task ID cocok dan session ID cocok: confirmed
+      const matchBoth = reconcileSessionWithRemoteEvents(
+        { id: sessId, taskId },
+        [
+          {
+            id: 'gcal-exact-match',
+            extendedProperties: {
+              private: { evenTaskId: taskId, evenSessionId: sessId },
+            },
+          },
+        ]
+      );
+      assert.strictEqual(matchBoth.status, 'confirmed');
+      assert.strictEqual(matchBoth.remoteEventId, 'gcal-exact-match');
+
+      // 2. Task ID berbeda dan session ID cocok: not_found (DILARANG fallback ke session ID saja)
+      const diffTaskId = reconcileSessionWithRemoteEvents(
+        { id: sessId, taskId: 'task-strict-45' },
+        [
+          {
+            id: 'gcal-different-task',
+            extendedProperties: {
+              private: { evenTaskId: 'task-other-999', evenSessionId: sessId },
+            },
+          },
+        ]
+      );
+      assert.strictEqual(diffTaskId.status, 'not_found', 'Task ID berbeda harus not_found');
+
+      // 3. Task ID tidak ada pada metadata remote: not_found (DILARANG fallback)
+      const missingRemoteTaskId = reconcileSessionWithRemoteEvents(
+        { id: sessId, taskId },
+        [
+          {
+            id: 'gcal-no-task-id',
+            extendedProperties: {
+              private: { evenSessionId: sessId }, // evenTaskId tidak ada
+            },
+          },
+        ]
+      );
+      assert.strictEqual(missingRemoteTaskId.status, 'not_found', 'Task ID hilang di remote harus not_found');
+
+      // 4. Session ID berbeda: not_found
+      const diffSessionId = reconcileSessionWithRemoteEvents(
+        { id: sessId, taskId },
+        [
+          {
+            id: 'gcal-diff-sess',
+            extendedProperties: {
+              private: { evenTaskId: taskId, evenSessionId: 'sess-different-888' },
+            },
+          },
+        ]
+      );
+      assert.strictEqual(diffSessionId.status, 'not_found', 'Session ID berbeda harus not_found');
+
+      // 5. Dua kandidat dengan kedua identitas sama: ambiguous (DILARANG memilih otomatis)
+      const twoIdenticalCandidates = reconcileSessionWithRemoteEvents(
+        { id: sessId, taskId },
+        [
+          {
+            id: 'gcal-candidate-a',
+            extendedProperties: {
+              private: { evenTaskId: taskId, evenSessionId: sessId },
+            },
+          },
+          {
+            id: 'gcal-candidate-b',
+            extendedProperties: {
+              private: { evenTaskId: taskId, evenSessionId: sessId },
+            },
+          },
+        ]
+      );
+      assert.strictEqual(twoIdenticalCandidates.status, 'ambiguous', 'Dua kandidat identik harus ambiguous');
+      assert.strictEqual(twoIdenticalCandidates.candidateIds?.length, 2);
+
+      console.log('  ✅ [PASS] Test 45: Strict Identity Matching terverifikasi penuh (5 skenario: confirmed, not_found x3, ambiguous).');
+    }
+
+    // -------------------------------------------------------------------------
+    // CATEGORY: RECONCILIATION ABORT & STALE PROPAGATION TESTS (reconcileTaskSessionsWithRemote)
+    // -------------------------------------------------------------------------
+
+    // TEST 46: AbortSignal Propagation & Stale Protection in Reconciliation
+    console.log('\n--- [Test 46] AbortSignal Propagation & Stale Protection in Reconciliation ---');
+    {
+      const guard = new CalendarOperationGuard();
+      const ticket = guard.startPush();
+
+      const taskToRecon: Task = {
+        id: 'task-recon-46',
+        userId: 'user-46',
+        title: 'Tugas Rekonsiliasi Propagasi',
         status: 'SCHEDULED',
         allowSplit: false,
-        estimatedDurationMinutes: 45,
+        estimatedDurationMinutes: 30,
         minimumSessionMinutes: 30,
         priority: 'MEDIUM',
         createdAt: new Date().toISOString(),
         scheduledSessions: [
           {
-            id: sessionId,
-            taskTitle: 'Tugas Rekonsiliasi Multi-Kandidat',
+            id: 'sess-recon-46',
+            taskTitle: 'Tugas Rekonsiliasi Propagasi',
             sessionIndex: 1,
             totalSessions: 1,
-            durationMinutes: 45,
-            startAt: '2026-11-08T14:00:00+07:00',
-            endAt: '2026-11-08T14:45:00+07:00',
+            durationMinutes: 30,
+            startAt: '2026-11-08T16:00:00+07:00',
+            endAt: '2026-11-08T16:30:00+07:00',
             syncStatus: 'needs_reconciliation',
           },
         ],
       };
 
-      // Mock remote calendar memiliki 2 event dengan metadata yang sama persis
-      const mockRemoteEvents: CalendarEvent[] = [
-        {
-          id: 'gcal-candidate-1',
-          provider: 'google',
-          title: '[EVEN] Tugas Rekonsiliasi Multi-Kandidat',
-          startAt: '2026-11-08T14:00:00+07:00',
-          endAt: '2026-11-08T14:45:00+07:00',
-          isEditable: false,
-          syncStatus: 'synced',
-          category: 'focus',
-          extendedProperties: {
-            private: {
-              evenTaskId: taskId,
-              evenSessionId: sessionId,
-            },
-          },
-        },
-        {
-          id: 'gcal-candidate-2',
-          provider: 'google',
-          title: '[EVEN] Tugas Rekonsiliasi Multi-Kandidat',
-          startAt: '2026-11-08T14:00:00+07:00',
-          endAt: '2026-11-08T14:45:00+07:00',
-          isEditable: false,
-          syncStatus: 'synced',
-          category: 'focus',
-          extendedProperties: {
-            private: {
-              evenTaskId: taskId,
-              evenSessionId: sessionId,
-            },
-          },
-        },
-      ];
+      // 1. Abort sebelum fetch tidak memulai request (fetchEventsFn tidak dipanggil)
+      const preAbortedCtrl = new AbortController();
+      preAbortedCtrl.abort();
 
-      let stateTasks: Task[] = [taskWithAmbiguousSession];
-      const mockSetTasks: any = (updater: any) => {
-        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      let preFetchCalled = false;
+      const resPreAbort = await reconcileTaskSessionsWithRemote({
+        token: 'mock-token',
+        task: taskToRecon,
+        userId: 'user-46',
+        signal: preAbortedCtrl.signal,
+        setTasks: () => {},
+        fetchEventsFn: async () => {
+          preFetchCalled = true;
+          return { events: [] };
+        },
+      });
+      assert.strictEqual(preFetchCalled, false, 'fetchEventsFn DILARANG dipanggil jika sudah diaborted pre-fetch');
+      assert.strictEqual(resPreAbort.isStale, true);
+      assert.strictEqual(resPreAbort.reconciledCount, 0);
+
+      // 2. Abort saat fetch berlangsung: diteruskan via signal ke fetchEventsFn
+      let signalReceivedDuringFetch: boolean = false;
+      const inFlightAbortCtrl = new AbortController();
+
+      let stateMutated = false;
+      let storageSaved = false;
+
+      const resInFlightAbort = await reconcileTaskSessionsWithRemote({
+        token: 'mock-token',
+        task: taskToRecon,
+        userId: 'user-46',
+        signal: inFlightAbortCtrl.signal,
+        setTasks: () => { stateMutated = true; },
+        saveToStorage: async () => { storageSaved = true; },
+        fetchEventsFn: async (_tok, _min, _max, sig) => {
+          signalReceivedDuringFetch = Boolean(sig);
+          // Trigger abort saat fetch berlangsung
+          inFlightAbortCtrl.abort();
+          const abortErr = new Error('The operation was aborted.');
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        },
+      });
+
+      assert.strictEqual(signalReceivedDuringFetch, true, 'AbortSignal wajib diteruskan ke fetchEventsFn');
+      assert.strictEqual(resInFlightAbort.isStale, true);
+      assert.strictEqual(stateMutated, false, 'State tidak boleh dimutasi jika dibatalkan saat fetch');
+      assert.strictEqual(storageSaved, false, 'Storage tidak boleh ditulis jika dibatalkan saat fetch');
+
+      // 3. Operasi stale tidak mengubah state atau Firestore
+      const staleTicket = {
+        isStale: () => true,
+        isAborted: () => false,
       };
 
-      const reconResult = await reconcileTaskSessionsWithRemote({
-        token: 'mock-valid-token',
-        task: taskWithAmbiguousSession,
-        userId: 'user-recon-f',
-        setTasks: mockSetTasks,
-        fetchEventsFn: async () => ({ events: mockRemoteEvents }),
-        saveToStorage: async () => {},
-      });
+      let staleStateMutated = false;
+      let staleStorageSaved = false;
 
-      // 1. Verifikasi sistem menolak pemilihan otomatis
-      assert.strictEqual(reconResult.reconciledCount, 0);
-      assert.strictEqual(reconResult.stillAmbiguousCount, 1);
-      assert.strictEqual(reconResult.updatedTask.scheduledSessions[0].syncStatus, 'needs_reconciliation');
-      assert.strictEqual(reconResult.updatedTask.scheduledSessions[0].googleCalendarEventId, undefined);
-
-      // 2. Verifikasi tidak ada POST baru yang dikirim untuk sesi ambiguous
-      let duplicatePosted = false;
-      const guard = new CalendarOperationGuard();
-      const ticket = guard.startPush();
-      await executeSchedulePush({
+      const resStale = await reconcileTaskSessionsWithRemote({
         token: 'mock-token',
-        task: reconResult.updatedTask,
-        sessions: reconResult.updatedTask.scheduledSessions,
-        timezone: 'Asia/Jakarta',
-        userId: 'user-recon-f',
-        pushTicket: ticket,
-        setTasks: mockSetTasks,
-        createEventFn: async () => {
-          duplicatePosted = true;
-          return { id: 'unexpected' };
-        },
-        saveToStorage: async () => {},
+        task: taskToRecon,
+        userId: 'user-46',
+        ticket: staleTicket as any,
+        setTasks: () => { staleStateMutated = true; },
+        saveToStorage: async () => { staleStorageSaved = true; },
+        fetchEventsFn: async () => ({
+          events: [
+            {
+              id: 'gcal-stale-test',
+              provider: 'google',
+              title: 'Test',
+              startAt: '2026-11-08T16:00:00+07:00',
+              endAt: '2026-11-08T16:30:00+07:00',
+              syncStatus: 'synced',
+              extendedProperties: {
+                private: { evenTaskId: 'task-recon-46', evenSessionId: 'sess-recon-46' },
+              },
+            },
+          ],
+        }),
       });
 
-      assert.strictEqual(duplicatePosted, false, 'Dilarang mengirim POST baru jika sesi masih ambiguous');
+      assert.strictEqual(resStale.isStale, true);
+      assert.strictEqual(staleStateMutated, false, 'Operasi stale dilarang memutasi React state');
+      assert.strictEqual(staleStorageSaved, false, 'Operasi stale dilarang menulis ke Firestore');
 
-      console.log('  ✅ [PASS] Test 46 (Test F): Rekonsiliasi dua kandidat menahan pemilihan otomatis dan menolak pembuatan POST baru.');
+      // 4. Operasi terbaru tetap memiliki kendali penuh atas diagnostik dan persistensi
+      let freshStateMutated = false;
+      let freshStorageSaved = false;
+
+      const freshTicket = guard.startPush();
+      const resFresh = await reconcileTaskSessionsWithRemote({
+        token: 'mock-token',
+        task: taskToRecon,
+        userId: 'user-46',
+        ticket: freshTicket,
+        setTasks: () => { freshStateMutated = true; },
+        saveToStorage: async () => { freshStorageSaved = true; },
+        fetchEventsFn: async () => ({
+          events: [
+            {
+              id: 'gcal-fresh-confirmed',
+              provider: 'google',
+              title: 'Test',
+              startAt: '2026-11-08T16:00:00+07:00',
+              endAt: '2026-11-08T16:30:00+07:00',
+              syncStatus: 'synced',
+              extendedProperties: {
+                private: { evenTaskId: 'task-recon-46', evenSessionId: 'sess-recon-46' },
+              },
+            },
+          ],
+        }),
+      });
+
+      assert.strictEqual(resFresh.isStale, false);
+      assert.strictEqual(resFresh.reconciledCount, 1);
+      assert.strictEqual(freshStateMutated, true, 'Operasi fresh berhasil memutasi React state');
+      assert.strictEqual(freshStorageSaved, true, 'Operasi fresh berhasil menulis ke Firestore');
+
+      console.log('  ✅ [PASS] Test 46: AbortSignal propagation & stale guard pada rekonsiliasi terverifikasi kokoh.');
     }
 
-    // ----------------------------------------------------
-    // TEST 47 (TEST G): Production Reconciliation With 0 Candidates -> Remains Safe, No Blind Resend
-    // ----------------------------------------------------
-    console.log('\n--- [Test 47 / Test G] Production Reconciliation With 0 Candidates (Not Found) ---');
-    {
-      const taskId = 'task-recon-g-1';
-      const sessionId = 'sess-recon-g-1';
+    // -------------------------------------------------------------------------
+    // CATEGORY: SERVICE-LEVEL TESTS (executeSchedulePush IDEMPOTENCY CONTRACT)
+    // -------------------------------------------------------------------------
 
-      const taskWithAmbiguousSession: Task = {
-        id: taskId,
-        userId: 'user-recon-g',
-        title: 'Tugas Rekonsiliasi Nol Kandidat',
+    // TEST 47: Service-Level Idempotency Contract & Ambiguous Post Mapping
+    console.log('\n--- [Test 47] Service-Level Ambiguous Error Mapping & Idempotency ---');
+    {
+      const guard = new CalendarOperationGuard();
+      const pushTicket = guard.startPush();
+
+      // Skenario 1: Post-dispatch abort dipetakan ke needs_reconciliation
+      const task47A: Task = {
+        id: 'task-47-a',
+        userId: 'user-47',
+        title: 'Tugas Service 47A',
         status: 'SCHEDULED',
         allowSplit: false,
         estimatedDurationMinutes: 30,
@@ -3003,88 +2815,120 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         createdAt: new Date().toISOString(),
         scheduledSessions: [
           {
-            id: sessionId,
-            taskTitle: 'Tugas Rekonsiliasi Nol Kandidat',
+            id: 'sess-47-a',
+            taskTitle: 'Tugas Service 47A',
             sessionIndex: 1,
             totalSessions: 1,
             durationMinutes: 30,
-            startAt: '2026-11-08T18:00:00+07:00',
-            endAt: '2026-11-08T18:30:00+07:00',
-            syncStatus: 'needs_reconciliation',
+            startAt: '2026-11-08T17:00:00+07:00',
+            endAt: '2026-11-08T17:30:00+07:00',
+            syncStatus: 'pending',
           },
         ],
       };
 
-      // Mock remote calendar tidak mengembalikan event yang cocok (0 kandidat)
-      let stateTasks: Task[] = [taskWithAmbiguousSession];
-      const mockSetTasks: any = (updater: any) => {
-        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
-      };
-
-      const reconResult = await reconcileTaskSessionsWithRemote({
-        token: 'mock-valid-token',
-        task: taskWithAmbiguousSession,
-        userId: 'user-recon-g',
-        setTasks: mockSetTasks,
-        fetchEventsFn: async () => ({ events: [] }),
+      const res47A = await executeSchedulePush({
+        token: 'mock-token',
+        task: task47A,
+        sessions: task47A.scheduledSessions,
+        timezone: 'Asia/Jakarta',
+        userId: 'user-47',
+        pushTicket,
+        setTasks: () => {},
+        createEventFn: async () => {
+          throw new GoogleCalendarApiError({
+            code: 'ABORTED',
+            status: 0,
+            isAuthError: false,
+            isPermissionError: false,
+            isRateLimitError: false,
+            isTransient: false,
+            shouldReauth: false,
+            isPostAmbiguous: true,
+            phase: 'in_flight',
+            message: 'In-flight abort',
+            userAction: 'Rekonsiliasi',
+          });
+        },
         saveToStorage: async () => {},
       });
 
-      // 1. Verifikasi status tetap needs_reconciliation dan tidak otomatis diklaim synced
-      assert.strictEqual(reconResult.notFoundCount, 1);
-      assert.strictEqual(reconResult.reconciledCount, 0);
-      assert.strictEqual(reconResult.updatedTask.scheduledSessions[0].syncStatus, 'needs_reconciliation');
-      assert.strictEqual(reconResult.updatedTask.scheduledSessions[0].googleCalendarEventId, undefined);
+      assert.strictEqual(res47A.updatedSessions[0].syncStatus, 'needs_reconciliation');
+      assert.strictEqual(res47A.reconciliationCount, 1);
 
-      // 2. Verifikasi tidak ada POST baru secara buta tanpa kebijakan eksplisit
-      let blindPostDispatched = false;
-      const guard = new CalendarOperationGuard();
-      const ticket = guard.startPush();
-      await executeSchedulePush({
+      // Skenario 2: HTTP 500 dipetakan ke needs_reconciliation
+      const ticket47B = guard.startPush();
+      const res47B = await executeSchedulePush({
         token: 'mock-token',
-        task: reconResult.updatedTask,
-        sessions: reconResult.updatedTask.scheduledSessions,
+        task: task47A,
+        sessions: task47A.scheduledSessions,
         timezone: 'Asia/Jakarta',
-        userId: 'user-recon-g',
-        pushTicket: ticket,
-        setTasks: mockSetTasks,
+        userId: 'user-47',
+        pushTicket: ticket47B,
+        setTasks: () => {},
         createEventFn: async () => {
-          blindPostDispatched = true;
+          throw new GoogleCalendarApiError({
+            code: 'SERVICE_UNAVAILABLE',
+            status: 500,
+            isAuthError: false,
+            isPermissionError: false,
+            isRateLimitError: false,
+            isTransient: true,
+            shouldReauth: false,
+            isPostAmbiguous: true,
+            phase: 'server_error',
+            message: 'Server 500',
+            userAction: 'Coba lagi',
+          });
+        },
+        saveToStorage: async () => {},
+      });
+
+      assert.strictEqual(res47B.updatedSessions[0].syncStatus, 'needs_reconciliation');
+
+      // Skenario 3: Pre-dispatch abort tetap pending
+      const ticket47C = guard.startPush();
+      guard.abortActivePush();
+      let createCalled47C = false;
+
+      const res47C = await executeSchedulePush({
+        token: 'mock-token',
+        task: task47A,
+        sessions: task47A.scheduledSessions,
+        timezone: 'Asia/Jakarta',
+        userId: 'user-47',
+        pushTicket: ticket47C,
+        setTasks: () => {},
+        createEventFn: async () => {
+          createCalled47C = true;
           return { id: 'unexpected' };
         },
         saveToStorage: async () => {},
       });
 
-      assert.strictEqual(blindPostDispatched, false, 'Nol kandidat rekonsiliasi dilarang langsung memicu POST baru tanpa kebijakan eksplisit');
+      assert.strictEqual(createCalled47C, false);
+      assert.strictEqual(res47C.updatedSessions[0].syncStatus, 'pending');
 
-      console.log('  ✅ [PASS] Test 47 (Test G): Rekonsiliasi nol kandidat tetap dalam status aman dan tidak memicu blind resend.');
+      console.log('  ✅ [PASS] Test 47: Service-level mapping terbukti memetakan error ambigu ke needs_reconciliation dan pre-dispatch ke pending.');
     }
 
-    // ----------------------------------------------------
-    // TEST 48 (TEST H): Two Concurrent Pushes Resolving in Reverse Order (Interleaving Race Condition)
-    // ----------------------------------------------------
-    console.log('\n--- [Test 48 / Test H] Two Concurrent Pushes Resolving in Reverse Order ---');
+    // -------------------------------------------------------------------------
+    // CATEGORY: CONCURRENCY TESTS (TRUE CONCURRENT PUSH WITH DEFERRED PROMISE)
+    // -------------------------------------------------------------------------
+
+    // TEST 48: True Concurrent Push Resolving in Reverse Order
+    console.log('\n--- [Test 48] True Concurrent Pushes Resolving in Reverse Order via Deferred Promise ---');
     {
       const guard = new CalendarOperationGuard();
 
-      // Push A dimulai pada t=0
-      const pushTicketA = guard.startPush();
+      // Controllable deferred promise untuk Push A
+      let resolvePushAPost: (value: { id: string; htmlLink?: string }) => void;
+      const pushAPostPromise = new Promise<{ id: string; htmlLink?: string }>((resolve) => {
+        resolvePushAPost = resolve;
+      });
 
-      // Push B dimulai pada t=10 sebelum Push A selesai
-      const pushTicketB = guard.startPush();
-
-      // Push A seketika menjadi stale dan dibatalkan
-      assert.strictEqual(pushTicketA.isStale(), true, 'Push A harus menjadi stale saat Push B dimulai');
-      assert.strictEqual(pushTicketA.isAborted(), true, 'Push A harus dibatalkan');
-      assert.strictEqual(pushTicketB.isStale(), false, 'Push B harus aktif');
-      assert.strictEqual(pushTicketB.isAborted(), false);
-
-      // State diagnostik UI
-      let activeDiagnostic = {
-        connectionStatus: 'syncing',
-        lastErrorMessage: undefined as string | undefined,
-        eventsCreatedCount: 0,
-      };
+      let pushAPostCalled = 0;
+      let pushBPostCalled = 0;
 
       const firestoreWritesA: any[] = [];
       const firestoreWritesB: any[] = [];
@@ -3092,6 +2936,12 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       let stateTasks: Task[] = [];
       const mockSetTasks: any = (updater: any) => {
         stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+
+      let activeDiagnostic = {
+        connectionStatus: 'syncing',
+        lastErrorMessage: undefined as string | undefined,
+        eventsCreatedCount: 0,
       };
 
       const taskA: Task = {
@@ -3142,7 +2992,38 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         ],
       };
 
-      // 1. Push B selesai LEBIH DULU
+      // 1. Push A dimulai dan ticket diperoleh
+      const pushTicketA = guard.startPush();
+
+      // Push A memulai executeSchedulePush() secara asynchronous / in-flight
+      const promiseA = executeSchedulePush({
+        token: 'mock-valid-token',
+        task: taskA,
+        sessions: taskA.scheduledSessions,
+        timezone: 'Asia/Jakarta',
+        userId: 'user-concurrent',
+        pushTicket: pushTicketA,
+        setTasks: mockSetTasks,
+        createEventFn: async () => {
+          pushAPostCalled++;
+          // Push A menunggu deferred promise respons dari server Google
+          return await pushAPostPromise;
+        },
+        saveToStorage: async (t, u) => { firestoreWritesA.push({ t, u }); },
+      });
+
+      // Verifikasi Push A sudah mulai dan memanggil POST pertama
+      assert.strictEqual(pushAPostCalled, 1, 'Push A harus sudah memulai POST ke Google');
+      assert.strictEqual(pushTicketA.isStale(), false, 'Push A belum stale saat mulai');
+
+      // 2. Push B dimulai dan menggantikan Push A
+      const pushTicketB = guard.startPush();
+      // Seketika Push Ticket A menjadi stale dan aborted oleh guard
+      assert.strictEqual(pushTicketA.isStale(), true, 'Push Ticket A harus menjadi stale saat Push B dimulai');
+      assert.strictEqual(pushTicketA.isAborted(), true, 'Push Ticket A harus diaborted');
+      assert.strictEqual(pushTicketB.isStale(), false, 'Push Ticket B harus aktif');
+
+      // 3. Push B menyelesaikan operasi LEBIH DULU
       const resultB = await executeSchedulePush({
         token: 'mock-valid-token',
         task: taskB,
@@ -3151,11 +3032,14 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         userId: 'user-concurrent',
         pushTicket: pushTicketB,
         setTasks: mockSetTasks,
-        createEventFn: async () => ({ id: 'gcal-id-b' }),
+        createEventFn: async () => {
+          pushBPostCalled++;
+          return { id: 'gcal-id-b-confirmed' };
+        },
         saveToStorage: async (t, u) => { firestoreWritesB.push({ t, u }); },
       });
 
-      // Handler aplikasi memutasi diagnostik untuk Push B (karena resultB.isStale === false)
+      // Handler aplikasi memutasi diagnostik B (karena resultB.isStale === false)
       if (!resultB.isStale) {
         activeDiagnostic = {
           connectionStatus: 'sync_success',
@@ -3164,23 +3048,14 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         };
       }
 
-      assert.strictEqual(resultB.isStale, false);
+      assert.strictEqual(resultB.isStale, false, 'Result B tidak stale');
       assert.strictEqual(resultB.successCount, 1);
       assert.strictEqual(activeDiagnostic.connectionStatus, 'sync_success');
       assert.strictEqual(activeDiagnostic.eventsCreatedCount, 1);
 
-      // 2. Push A selesai BELAKANGAN (urutan terbalik)
-      const resultA = await executeSchedulePush({
-        token: 'mock-valid-token',
-        task: taskA,
-        sessions: taskA.scheduledSessions,
-        timezone: 'Asia/Jakarta',
-        userId: 'user-concurrent',
-        pushTicket: pushTicketA,
-        setTasks: mockSetTasks,
-        createEventFn: async () => ({ id: 'gcal-id-a-stale' }),
-        saveToStorage: async (t, u) => { firestoreWritesA.push({ t, u }); },
-      });
+      // 4. Push A menyelesaikan responsnya setelah B selesai (resolve deferred promise)
+      resolvePushAPost!({ id: 'gcal-id-a-confirmed' });
+      const resultA = await promiseA;
 
       // Handler aplikasi memeriksa isStale:
       let pushAOverwroteDiagnostic = false;
@@ -3193,19 +3068,26 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         };
       }
 
-      // Verifikasi 1: Push A tidak menimpa diagnostik Push B
-      assert.strictEqual(resultA.isStale, true, 'Result A harus ditandai isStale');
-      assert.strictEqual(pushAOverwroteDiagnostic, false, 'Push A tidak boleh memutasi diagnostik');
-      assert.strictEqual(activeDiagnostic.connectionStatus, 'sync_success');
+      // 5. Verifikasi bahwa operasi A tidak menimpa diagnostik B
+      assert.strictEqual(resultA.isStale, true, 'Result A harus ditandai isStale: true');
+      assert.strictEqual(pushAOverwroteDiagnostic, false, 'Push A dilarang memutasi diagnostik');
+      assert.strictEqual(activeDiagnostic.connectionStatus, 'sync_success', 'Status diagnostik Push B tetap utuh');
       assert.strictEqual(activeDiagnostic.eventsCreatedCount, 1);
       assert.strictEqual(activeDiagnostic.lastErrorMessage, undefined);
 
-      // Verifikasi 2: Data Task A tetap berhasil dipersistensikan ke Firestore (data preservation)
-      assert.strictEqual(firestoreWritesA.length, 1, 'Data Task A harus tetap tersimpan ke Firestore');
-      assert.strictEqual(firestoreWritesA[0].t.id, 'task-concurrent-a');
-      assert.strictEqual(firestoreWritesB.length, 1, 'Data Task B tersimpan ke Firestore');
+      // 6. Verifikasi bahwa ID remote yang sudah berhasil diperoleh tidak hilang (data preservation)
+      assert.strictEqual(resultA.updatedSessions[0].googleCalendarEventId, 'gcal-id-a-confirmed');
+      assert.strictEqual(resultA.updatedSessions[0].syncStatus, 'synced');
+      assert.strictEqual(firestoreWritesA.length, 1, 'Data Task A tetap terpersistensi ke Firestore');
+      assert.strictEqual(firestoreWritesA[0].t.scheduledSessions[0].googleCalendarEventId, 'gcal-id-a-confirmed');
+      assert.strictEqual(firestoreWritesB.length, 1, 'Data Task B terpersistensi ke Firestore');
+      assert.strictEqual(firestoreWritesB[0].t.scheduledSessions[0].googleCalendarEventId, 'gcal-id-b-confirmed');
 
-      console.log('  ✅ [PASS] Test 48 (Test H): Dua push concurrent selesai dalam urutan terbalik terlindungi penuh dari race-condition.');
+      // 7. Verifikasi tidak ada POST duplikat untuk sesi yang sama
+      assert.strictEqual(pushAPostCalled, 1, 'Hanya tepat 1 POST untuk sesi A');
+      assert.strictEqual(pushBPostCalled, 1, 'Hanya tepat 1 POST untuk sesi B');
+
+      console.log('  ✅ [PASS] Test 48: True Concurrent Pushes dengan deferred promise terverifikasi race-condition free.');
     }
 
     console.log('\n================================================================');

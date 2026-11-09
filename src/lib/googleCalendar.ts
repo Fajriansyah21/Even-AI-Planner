@@ -116,6 +116,14 @@ export class GoogleCalendarApiError extends Error {
   get shouldReauth(): boolean {
     return this.classification.shouldReauth;
   }
+
+  get isPostAmbiguous(): boolean {
+    return Boolean(this.classification.isPostAmbiguous);
+  }
+
+  get phase(): 'pre_dispatch' | 'in_flight' | 'response_reading' | 'response_body' | 'server_error' | undefined {
+    return this.classification.phase;
+  }
 }
 
 /**
@@ -1286,7 +1294,9 @@ export function reconcileSessionWithRemoteEvents(
     if (!priv) return false;
     const sessionMatch = priv.evenSessionId === session.id;
     if (!sessionMatch) return false;
-    if (session.taskId && priv.evenTaskId) {
+    // Strict Identity Matching: Jika session.taskId tersedia, kandidat remote WAJIB memiliki evenTaskId yang cocok
+    // DILARANG melakukan fallback ke pencocokan session ID saja ketika task ID tersedia.
+    if (session.taskId) {
       return priv.evenTaskId === session.taskId;
     }
     return true;
