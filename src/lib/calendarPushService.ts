@@ -1,6 +1,6 @@
 import type React from 'react';
 import { Task, TaskScheduleSession, CalendarEvent } from '../types';
-import { PushOperationTicket, SyncOperationTicket } from './calendarOperationGuard';
+import { PushOperationTicket, SyncOperationTicket, CalendarOperationGuard } from './calendarOperationGuard';
 import {
   createGoogleCalendarEvent,
   fetchGoogleCalendarEvents,
@@ -29,6 +29,7 @@ export interface ExecuteSchedulePushParams {
   saveToStorage?: (task: Task, userId: string) => Promise<void>;
   isTaskUpdate?: boolean;
   description?: string;
+  guard?: CalendarOperationGuard;
 }
 
 export interface SchedulePushResult {
@@ -72,7 +73,10 @@ export async function executeSchedulePush(
     saveToStorage,
     isTaskUpdate = true,
     description,
+    guard: explicitGuard,
   } = params;
+
+  const guard = explicitGuard || pushTicket.guard;
 
   let successCount = 0;
   let failCount = 0;
@@ -99,14 +103,78 @@ export async function executeSchedulePush(
       continue;
     }
 
-    // 2. Proteksi Status Ambigu: Sesi 'needs_reconciliation' DILARANG dikirim ulang via POST otomatis
+    // 2. Proteksi Concurrency Sesi yang Sama:
+    // Jika guard telah mencatat remote ID untuk sesi ini (dari operasi lain atau concurrent push)
+    const inFlightRecord = guard?.getInFlightSession(sess.id);
+    if (inFlightRecord?.remoteId) {
+      const syncedSess: TaskScheduleSession = {
+        ...sess,
+        syncStatus: 'synced',
+        googleCalendarEventId: inFlightRecord.remoteId,
+        htmlLink: inFlightRecord.htmlLink || sess.htmlLink,
+      };
+      updatedSessions.push(syncedSess);
+      newCalendarEvents.push({
+        id: `gcal-${inFlightRecord.remoteId}`,
+        provider: 'google',
+        title: `[EVEN] ${sess.taskTitle}`,
+        description:
+          description ||
+          `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
+        startAt: sess.startAt,
+        endAt: sess.endAt,
+        htmlLink: inFlightRecord.htmlLink,
+        isEditable: false,
+        syncStatus: 'synced',
+        category: 'focus',
+      });
+      successCount++;
+      continue;
+    }
+
+    // 3. Jika sesi ini sedang diproses secara aktif oleh push lain dan memiliki promise in-flight:
+    // Tunggu promise tersebut untuk mencegah pembuatan event ganda di server (Same-Session Concurrency Protection)
+    if (inFlightRecord?.promise && inFlightRecord.pushId !== pushTicket.pushId) {
+      try {
+        const remoteResult = await inFlightRecord.promise;
+        if (remoteResult && remoteResult.id) {
+          const syncedSess: TaskScheduleSession = {
+            ...sess,
+            syncStatus: 'synced',
+            googleCalendarEventId: remoteResult.id,
+            htmlLink: remoteResult.htmlLink || sess.htmlLink,
+          };
+          updatedSessions.push(syncedSess);
+          newCalendarEvents.push({
+            id: `gcal-${remoteResult.id}`,
+            provider: 'google',
+            title: `[EVEN] ${sess.taskTitle}`,
+            description:
+              description ||
+              `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`,
+            startAt: sess.startAt,
+            endAt: sess.endAt,
+            htmlLink: remoteResult.htmlLink,
+            isEditable: false,
+            syncStatus: 'synced',
+            category: 'focus',
+          });
+          successCount++;
+          continue;
+        }
+      } catch {
+        // Jika push lain gagal atau dibatalkan, lanjutkan penanganan lokal jika belum dibatalkan
+      }
+    }
+
+    // 4. Proteksi Status Ambigu: Sesi 'needs_reconciliation' DILARANG dikirim ulang via POST otomatis
     if (sess.syncStatus === 'needs_reconciliation' && !hasValidRemoteId) {
       reconciliationCount++;
       updatedSessions.push(sess);
       continue;
     }
 
-    // 3. Anomali: Tercatat synced tapi tidak memiliki ID Google Calendar valid
+    // 5. Anomali: Tercatat synced tapi tidak memiliki ID Google Calendar valid
     if (sess.syncStatus === 'synced' && !hasValidRemoteId) {
       unconfirmedCount++;
       reconciliationCount++;
@@ -122,7 +190,7 @@ export async function executeSchedulePush(
         description ||
         `Sesi ${sess.sessionIndex} dari ${sess.totalSessions} (${sess.durationMinutes} menit). Dijadwalkan otomatis oleh EVEN.`;
 
-      const created = await createEventFn(
+      const dispatchPromise = createEventFn(
         token,
         {
           title: `[EVEN] ${sess.taskTitle}`,
@@ -140,6 +208,12 @@ export async function executeSchedulePush(
         },
         pushTicket.signal
       );
+
+      // Daftarkan sesi in-flight ke guard untuk koordinasi antar-push konkuren
+      guard?.registerInFlightSession(sess.id, task.id, pushTicket.pushId, dispatchPromise);
+
+      const created = await dispatchPromise;
+      guard?.recordSessionSuccess(sess.id, created.id, created.htmlLink);
 
       const syncedSess: TaskScheduleSession = {
         ...sess,
@@ -170,6 +244,7 @@ export async function executeSchedulePush(
       });
       successCount++;
     } catch (err: any) {
+      guard?.recordSessionFailure(sess.id);
       const classification =
         err instanceof GoogleCalendarApiError
           ? err.classification
@@ -259,8 +334,8 @@ export async function executeSchedulePush(
     scheduledSessions: updatedSessions,
   };
 
-  // Persistensi data secara mutlak ke React state dan Firestore
-  await persistScheduledTask({
+  // Persistensi data secara mutlak ke React state dan Firestore menggunakan safe merge
+  const mergedPersistedTask = await persistScheduledTask({
     task: finalTask,
     userId,
     newCalendarEvents,
@@ -271,8 +346,8 @@ export async function executeSchedulePush(
   });
 
   return {
-    finalTask,
-    updatedSessions,
+    finalTask: mergedPersistedTask,
+    updatedSessions: mergedPersistedTask.scheduledSessions || updatedSessions,
     newCalendarEvents,
     successCount,
     failCount,

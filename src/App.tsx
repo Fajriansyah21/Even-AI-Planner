@@ -924,6 +924,7 @@ export default function App() {
       setTasks,
       setEvents,
       isTaskUpdate: true,
+      guard: calendarGuardRef.current,
     });
 
     setSingleScheduleResult(null);
@@ -1105,6 +1106,7 @@ export default function App() {
       setEvents,
       isTaskUpdate: false,
       description: plan.description,
+      guard: calendarGuardRef.current,
     });
 
     // 1. Jika operasi push telah menjadi stale, BERHENTI DI SINI

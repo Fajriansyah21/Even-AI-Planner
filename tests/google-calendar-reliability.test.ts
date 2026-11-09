@@ -14,7 +14,7 @@ import {
   reconcileSessionWithRemoteEvents,
 } from '../src/lib/googleCalendar';
 import { CalendarOperationGuard } from '../src/lib/calendarOperationGuard';
-import { persistScheduledTask } from '../src/lib/taskPersistence';
+import { persistScheduledTask, mergeTaskWithCurrent } from '../src/lib/taskPersistence';
 import {
   executeSchedulePush,
   reconcileTaskSessionsWithRemote,
@@ -2916,48 +2916,40 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
     // CATEGORY: CONCURRENCY TESTS (TRUE CONCURRENT PUSH WITH DEFERRED PROMISE)
     // -------------------------------------------------------------------------
 
-    // TEST 48: True Concurrent Push Resolving in Reverse Order
-    console.log('\n--- [Test 48] True Concurrent Pushes Resolving in Reverse Order via Deferred Promise ---');
+    // TEST 48: True Same-Session Concurrency & Duplicate Prevention Suite
+    console.log('\n--- [Test 48] True Same-Session Concurrency & Duplicate Prevention Suite ---');
+
+    // SCENARIO A: Two pushes target the same session
+    console.log('\n  [Test 48 - Scenario A] Two pushes target the same session (Duplicate Prevention)');
     {
       const guard = new CalendarOperationGuard();
+      const mockServerDb: Array<{ id: string; title: string }> = [];
 
-      // Controllable deferred promise untuk Push A
       let resolvePushAPost: (value: { id: string; htmlLink?: string }) => void;
       const pushAPostPromise = new Promise<{ id: string; htmlLink?: string }>((resolve) => {
         resolvePushAPost = resolve;
       });
 
-      let pushAPostCalled = 0;
-      let pushBPostCalled = 0;
+      let pushAPostCallCount = 0;
+      let pushBPostCallCount = 0;
 
-      const firestoreWritesA: any[] = [];
-      const firestoreWritesB: any[] = [];
+      const sameTaskId = 'task-same-session-a';
+      const sameSessionId = 'sess-same-target-1';
 
-      let stateTasks: Task[] = [];
-      const mockSetTasks: any = (updater: any) => {
-        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
-      };
-
-      let activeDiagnostic = {
-        connectionStatus: 'syncing',
-        lastErrorMessage: undefined as string | undefined,
-        eventsCreatedCount: 0,
-      };
-
-      const taskA: Task = {
-        id: 'task-concurrent-a',
-        userId: 'user-concurrent',
-        title: 'Task A (Older)',
+      const taskToPush: Task = {
+        id: sameTaskId,
+        userId: 'user-scen-a',
+        title: 'Tugas Target Sesi Sama',
         status: 'SCHEDULED',
         allowSplit: false,
         estimatedDurationMinutes: 30,
         minimumSessionMinutes: 30,
-        priority: 'LOW',
+        priority: 'MEDIUM',
         createdAt: new Date().toISOString(),
         scheduledSessions: [
           {
-            id: 'sess-concurrent-a',
-            taskTitle: 'Task A (Older)',
+            id: sameSessionId,
+            taskTitle: 'Tugas Target Sesi Sama',
             sessionIndex: 1,
             totalSessions: 1,
             durationMinutes: 30,
@@ -2968,126 +2960,503 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         ],
       };
 
-      const taskB: Task = {
-        id: 'task-concurrent-b',
-        userId: 'user-concurrent',
-        title: 'Task B (Newer)',
+      let stateTasks: Task[] = [taskToPush];
+      const mockSetTasks: any = (updater: any) => {
+        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+      const firestoreWrites: any[] = [];
+
+      // 1. Push A dimulai dan memanggil POST
+      const pushTicketA = guard.startPush();
+
+      const promiseA = executeSchedulePush({
+        token: 'mock-token',
+        task: taskToPush,
+        sessions: taskToPush.scheduledSessions,
+        timezone: 'Asia/Jakarta',
+        userId: 'user-scen-a',
+        pushTicket: pushTicketA,
+        guard,
+        setTasks: mockSetTasks,
+        createEventFn: async (_tok, input, _signal) => {
+          pushAPostCallCount++;
+          // Server menerima POST dan menyimpannya di DB mock
+          mockServerDb.push({ id: 'gcal-remote-sess-1', title: input.title });
+          // Menunggu deferred promise
+          return await pushAPostPromise;
+        },
+        saveToStorage: async (t, u) => { firestoreWrites.push({ t, u }); },
+      });
+
+      // Verifikasi Push A sudah memanggil POST
+      assert.strictEqual(pushAPostCallCount, 1, 'Push A harus memulai POST ke mock server');
+      assert.strictEqual(mockServerDb.length, 1, 'Mock server menerima 1 POST');
+
+      // 2. Push B dimulai ketika Push A masih in-flight untuk sesi yang sama
+      const pushTicketB = guard.startPush();
+      assert.strictEqual(pushTicketA.isStale(), true, 'Ticket A menjadi stale saat Ticket B dibuat');
+
+      const promiseB = executeSchedulePush({
+        token: 'mock-token',
+        task: taskToPush,
+        sessions: taskToPush.scheduledSessions,
+        timezone: 'Asia/Jakarta',
+        userId: 'user-scen-a',
+        pushTicket: pushTicketB,
+        guard,
+        setTasks: mockSetTasks,
+        createEventFn: async () => {
+          pushBPostCallCount++;
+          mockServerDb.push({ id: 'gcal-duplicate-should-not-exist', title: 'DUPLICATE' });
+          return { id: 'unexpected' };
+        },
+        saveToStorage: async (t, u) => { firestoreWrites.push({ t, u }); },
+      });
+
+      // 3. Push A menyelesaikan responsnya
+      resolvePushAPost!({ id: 'gcal-remote-sess-1', htmlLink: 'https://calendar.google.com/event?eid=sess1' });
+
+      const [resultA, resultB] = await Promise.all([promiseA, promiseB]);
+
+      // 4. Verifikasi Kebijakan Pencegahan Duplikasi:
+      // Server hanya boleh menerima TEPAT 1 POST untuk sesi yang sama
+      assert.strictEqual(mockServerDb.length, 1, 'Server database HARUS tetap memiliki tepat 1 event (anti duplikasi)');
+      assert.strictEqual(pushBPostCallCount, 0, 'Push B TIDAK boleh membuat POST kedua untuk sesi yang sedang in-flight');
+
+      // 5. Verifikasi bahwa remote ID tidak hilang pada kedua hasil
+      assert.strictEqual(resultA.updatedSessions[0].googleCalendarEventId, 'gcal-remote-sess-1');
+      assert.strictEqual(resultB.updatedSessions[0].googleCalendarEventId, 'gcal-remote-sess-1');
+      assert.strictEqual(resultB.updatedSessions[0].syncStatus, 'synced');
+      assert.strictEqual(resultA.isStale, true, 'Result A stale');
+      assert.strictEqual(resultB.isStale, false, 'Result B aktif');
+
+      console.log('    ✅ [PASS] Scenario A: Concurrency sesi yang sama dicegah dari duplikasi (1 POST server) dan remote ID terpelihara.');
+    }
+
+    // SCENARIO B: Older push resolves after newer push
+    console.log('\n  [Test 48 - Scenario B] Older push resolves after newer push (Safe Merge Metadata)');
+    {
+      const guard = new CalendarOperationGuard();
+
+      let resolvePushA: (res: any) => void;
+      const deferredA = new Promise<{ id: string; htmlLink?: string }>((resolve) => {
+        resolvePushA = resolve;
+      });
+
+      const taskId = 'task-scen-b';
+      const initialTask: Task = {
+        id: taskId,
+        userId: 'user-scen-b',
+        title: 'Judul Asli (Lama)',
         status: 'SCHEDULED',
         allowSplit: false,
-        estimatedDurationMinutes: 45,
+        estimatedDurationMinutes: 30,
         minimumSessionMinutes: 30,
-        priority: 'HIGH',
+        priority: 'LOW',
         createdAt: new Date().toISOString(),
         scheduledSessions: [
           {
-            id: 'sess-concurrent-b',
-            taskTitle: 'Task B (Newer)',
+            id: 'sess-b-1',
+            taskTitle: 'Judul Asli (Lama)',
             sessionIndex: 1,
             totalSessions: 1,
-            durationMinutes: 45,
+            durationMinutes: 30,
             startAt: '2026-11-08T10:00:00+07:00',
-            endAt: '2026-11-08T10:45:00+07:00',
+            endAt: '2026-11-08T10:30:00+07:00',
             syncStatus: 'pending',
           },
         ],
       };
 
-      // 1. Push A dimulai dan ticket diperoleh
-      const pushTicketA = guard.startPush();
+      let stateTasks: Task[] = [initialTask];
+      const mockSetTasks: any = (updater: any) => {
+        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+      const firestoreWrites: any[] = [];
 
-      // Push A memulai executeSchedulePush() secara asynchronous / in-flight
+      // 1. Push A mulai dengan snapshot lama
+      const ticketA = guard.startPush();
       const promiseA = executeSchedulePush({
-        token: 'mock-valid-token',
-        task: taskA,
-        sessions: taskA.scheduledSessions,
+        token: 'mock-token',
+        task: initialTask,
+        sessions: initialTask.scheduledSessions,
         timezone: 'Asia/Jakarta',
-        userId: 'user-concurrent',
-        pushTicket: pushTicketA,
+        userId: 'user-scen-b',
+        pushTicket: ticketA,
+        guard,
         setTasks: mockSetTasks,
-        createEventFn: async () => {
-          pushAPostCalled++;
-          // Push A menunggu deferred promise respons dari server Google
-          return await pushAPostPromise;
-        },
-        saveToStorage: async (t, u) => { firestoreWritesA.push({ t, u }); },
+        createEventFn: async () => await deferredA,
+        saveToStorage: async (t, u) => { firestoreWrites.push({ t, u }); },
       });
 
-      // Verifikasi Push A sudah mulai dan memanggil POST pertama
-      assert.strictEqual(pushAPostCalled, 1, 'Push A harus sudah memulai POST ke Google');
-      assert.strictEqual(pushTicketA.isStale(), false, 'Push A belum stale saat mulai');
+      // 2. Pengguna memperbarui judul, prioritas, dan sesi task di UI sementara Push A masih in-flight
+      const updatedTaskByUser: Task = {
+        ...initialTask,
+        title: 'Judul Baru yang Diperbarui Pengguna',
+        priority: 'HIGH',
+        scheduledSessions: [
+          {
+            id: 'sess-b-2',
+            taskTitle: 'Judul Baru yang Diperbarui Pengguna',
+            sessionIndex: 1,
+            totalSessions: 1,
+            durationMinutes: 30,
+            startAt: '2026-11-08T14:00:00+07:00',
+            endAt: '2026-11-08T14:30:00+07:00',
+            syncStatus: 'pending',
+          },
+        ],
+      };
+      stateTasks = [updatedTaskByUser];
 
-      // 2. Push B dimulai dan menggantikan Push A
-      const pushTicketB = guard.startPush();
-      // Seketika Push Ticket A menjadi stale dan aborted oleh guard
-      assert.strictEqual(pushTicketA.isStale(), true, 'Push Ticket A harus menjadi stale saat Push B dimulai');
-      assert.strictEqual(pushTicketA.isAborted(), true, 'Push Ticket A harus diaborted');
-      assert.strictEqual(pushTicketB.isStale(), false, 'Push Ticket B harus aktif');
-
-      // 3. Push B menyelesaikan operasi LEBIH DULU
+      // 3. Push B mulai dengan task yang telah diperbarui pengguna, dan selesai terlebih dahulu
+      const ticketB = guard.startPush();
       const resultB = await executeSchedulePush({
-        token: 'mock-valid-token',
-        task: taskB,
-        sessions: taskB.scheduledSessions,
+        token: 'mock-token',
+        task: updatedTaskByUser,
+        sessions: updatedTaskByUser.scheduledSessions,
         timezone: 'Asia/Jakarta',
-        userId: 'user-concurrent',
-        pushTicket: pushTicketB,
+        userId: 'user-scen-b',
+        pushTicket: ticketB,
+        guard,
         setTasks: mockSetTasks,
-        createEventFn: async () => {
-          pushBPostCalled++;
-          return { id: 'gcal-id-b-confirmed' };
-        },
-        saveToStorage: async (t, u) => { firestoreWritesB.push({ t, u }); },
+        createEventFn: async () => ({ id: 'gcal-sess-b-newer' }),
+        saveToStorage: async (t, u) => { firestoreWrites.push({ t, u }); },
       });
 
-      // Handler aplikasi memutasi diagnostik B (karena resultB.isStale === false)
-      if (!resultB.isStale) {
-        activeDiagnostic = {
-          connectionStatus: 'sync_success',
-          lastErrorMessage: undefined,
-          eventsCreatedCount: activeDiagnostic.eventsCreatedCount + resultB.successCount,
-        };
-      }
+      assert.strictEqual(resultB.isStale, false);
+      assert.strictEqual(stateTasks[0].title, 'Judul Baru yang Diperbarui Pengguna');
+      assert.strictEqual(stateTasks[0].priority, 'HIGH');
 
-      assert.strictEqual(resultB.isStale, false, 'Result B tidak stale');
-      assert.strictEqual(resultB.successCount, 1);
-      assert.strictEqual(activeDiagnostic.connectionStatus, 'sync_success');
-      assert.strictEqual(activeDiagnostic.eventsCreatedCount, 1);
-
-      // 4. Push A menyelesaikan responsnya setelah B selesai (resolve deferred promise)
-      resolvePushAPost!({ id: 'gcal-id-a-confirmed' });
+      // 4. Push A menyelesaikan respons belakangan (urutan terbalik)
+      resolvePushA!({ id: 'gcal-sess-b-older' });
       const resultA = await promiseA;
 
-      // Handler aplikasi memeriksa isStale:
-      let pushAOverwroteDiagnostic = false;
-      if (!resultA.isStale) {
-        pushAOverwroteDiagnostic = true;
-        activeDiagnostic = {
-          connectionStatus: 'needs_reauth',
-          lastErrorMessage: 'Error usang dari Push A',
-          eventsCreatedCount: 999,
-        };
+      assert.strictEqual(resultA.isStale, true);
+
+      // 5. Verifikasi bahwa judul dan prioritas terbaru TIDAK tertimpa oleh snapshot lama Push A!
+      assert.strictEqual(stateTasks[0].title, 'Judul Baru yang Diperbarui Pengguna', 'Judul terbaru dilarang tertimpa snapshot lama');
+      assert.strictEqual(stateTasks[0].priority, 'HIGH', 'Prioritas terbaru dilarang tertimpa snapshot lama');
+      const latestFirestoreWrite = firestoreWrites[firestoreWrites.length - 1];
+      assert.strictEqual(latestFirestoreWrite.t.title, 'Judul Baru yang Diperbarui Pengguna', 'Firestore harus menyimpan judul terbaru');
+      
+      const sessB2 = stateTasks[0].scheduledSessions.find((s) => s.id === 'sess-b-2');
+      const sessB1 = stateTasks[0].scheduledSessions.find((s) => s.id === 'sess-b-1');
+      assert.ok(sessB2, 'Sesi terbaru sess-b-2 harus tetap ada');
+      assert.strictEqual(sessB2?.googleCalendarEventId, 'gcal-sess-b-newer');
+      assert.ok(sessB1, 'Sesi lama sess-b-1 harus dipertahankan karena memperoleh remote ID');
+      assert.strictEqual(sessB1?.googleCalendarEventId, 'gcal-sess-b-older');
+
+      console.log('    ✅ [PASS] Scenario B: Operasi lama yang selesai belakangan tidak menimpa data/metadata task yang lebih baru.');
+    }
+
+    // SCENARIO C: Same task, different sessions
+    console.log('\n  [Test 48 - Scenario C] Same task, different sessions (Cross-Session Preservation)');
+    {
+      const guard = new CalendarOperationGuard();
+      const taskId = 'task-scen-c';
+
+      const taskWithTwoSessions: Task = {
+        id: taskId,
+        userId: 'user-scen-c',
+        title: 'Tugas Dua Sesi Konkuren',
+        status: 'SCHEDULED',
+        allowSplit: true,
+        estimatedDurationMinutes: 60,
+        minimumSessionMinutes: 30,
+        priority: 'MEDIUM',
+        createdAt: new Date().toISOString(),
+        scheduledSessions: [
+          {
+            id: 'sess-c-1',
+            taskTitle: 'Tugas Dua Sesi Konkuren',
+            sessionIndex: 1,
+            totalSessions: 2,
+            durationMinutes: 30,
+            startAt: '2026-11-08T11:00:00+07:00',
+            endAt: '2026-11-08T11:30:00+07:00',
+            syncStatus: 'pending',
+          },
+          {
+            id: 'sess-c-2',
+            taskTitle: 'Tugas Dua Sesi Konkuren',
+            sessionIndex: 2,
+            totalSessions: 2,
+            durationMinutes: 30,
+            startAt: '2026-11-08T14:00:00+07:00',
+            endAt: '2026-11-08T14:30:00+07:00',
+            syncStatus: 'pending',
+          },
+        ],
+      };
+
+      let stateTasks: Task[] = [taskWithTwoSessions];
+      const mockSetTasks: any = (updater: any) => {
+        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+      const firestoreWrites: any[] = [];
+
+      // 1. Push 1 memproses Sesi 1
+      const ticket1 = guard.startPush();
+      await executeSchedulePush({
+        token: 'mock-token',
+        task: taskWithTwoSessions,
+        sessions: [taskWithTwoSessions.scheduledSessions[0]],
+        timezone: 'Asia/Jakarta',
+        userId: 'user-scen-c',
+        pushTicket: ticket1,
+        guard,
+        setTasks: mockSetTasks,
+        createEventFn: async () => ({ id: 'gcal-remote-c1' }),
+        saveToStorage: async (t, u) => { firestoreWrites.push({ t, u }); },
+      });
+
+      assert.strictEqual(stateTasks[0].scheduledSessions[0].googleCalendarEventId, 'gcal-remote-c1');
+
+      // 2. Push 2 memproses Sesi 2
+      const ticket2 = guard.startPush();
+      await executeSchedulePush({
+        token: 'mock-token',
+        task: stateTasks[0],
+        sessions: [stateTasks[0].scheduledSessions[1]],
+        timezone: 'Asia/Jakarta',
+        userId: 'user-scen-c',
+        pushTicket: ticket2,
+        guard,
+        setTasks: mockSetTasks,
+        createEventFn: async () => ({ id: 'gcal-remote-c2' }),
+        saveToStorage: async (t, u) => { firestoreWrites.push({ t, u }); },
+      });
+
+      // 3. Verifikasi kedua sesi mempertahankan remote ID masing-masing
+      const finalSessions = stateTasks[0].scheduledSessions;
+      assert.strictEqual(finalSessions.length, 2);
+      assert.strictEqual(finalSessions[0].googleCalendarEventId, 'gcal-remote-c1', 'Sesi 1 tetap memiliki remote ID');
+      assert.strictEqual(finalSessions[1].googleCalendarEventId, 'gcal-remote-c2', 'Sesi 2 berhasil memperoleh remote ID');
+      assert.strictEqual(finalSessions[0].syncStatus, 'synced');
+      assert.strictEqual(finalSessions[1].syncStatus, 'synced');
+
+      console.log('    ✅ [PASS] Scenario C: Dua operasi pada sesi berbeda dari task yang sama mempertahankan hasil kedua sesi secara konsisten.');
+    }
+
+    // SCENARIO D: Stale push after successful remote creation
+    console.log('\n  [Test 48 - Scenario D] Stale push after successful remote creation (Preserve Remote ID)');
+    {
+      const guard = new CalendarOperationGuard();
+      const taskId = 'task-scen-d';
+
+      const taskToPush: Task = {
+        id: taskId,
+        userId: 'user-scen-d',
+        title: 'Tugas Stale Tapi Berhasil',
+        status: 'SCHEDULED',
+        allowSplit: false,
+        estimatedDurationMinutes: 30,
+        minimumSessionMinutes: 30,
+        priority: 'LOW',
+        createdAt: new Date().toISOString(),
+        scheduledSessions: [
+          {
+            id: 'sess-d-1',
+            taskTitle: 'Tugas Stale Tapi Berhasil',
+            sessionIndex: 1,
+            totalSessions: 1,
+            durationMinutes: 30,
+            startAt: '2026-11-08T15:00:00+07:00',
+            endAt: '2026-11-08T15:30:00+07:00',
+            syncStatus: 'pending',
+          },
+        ],
+      };
+
+      let stateTasks: Task[] = [taskToPush];
+      const mockSetTasks: any = (updater: any) => {
+        stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+      };
+      const firestoreWrites: any[] = [];
+
+      let activeDiagnostic = {
+        connectionStatus: 'connected',
+        eventsCreatedCount: 5,
+      };
+
+      const ticket = guard.startPush();
+
+      // Buat tiket menjadi stale di tengah proses setelah event dibuat di remote
+      const pushResult = await executeSchedulePush({
+        token: 'mock-token',
+        task: taskToPush,
+        sessions: taskToPush.scheduledSessions,
+        timezone: 'Asia/Jakarta',
+        userId: 'user-scen-d',
+        pushTicket: ticket,
+        guard,
+        setTasks: mockSetTasks,
+        createEventFn: async () => {
+          // Buat pushTicket menjadi stale sebelum return
+          guard.startPush();
+          return { id: 'gcal-stale-recovered-d' };
+        },
+        saveToStorage: async (t, u) => { firestoreWrites.push({ t, u }); },
+      });
+
+      // Handler aplikasi memeriksa isStale
+      if (!pushResult.isStale) {
+        activeDiagnostic.eventsCreatedCount += pushResult.successCount;
       }
 
-      // 5. Verifikasi bahwa operasi A tidak menimpa diagnostik B
-      assert.strictEqual(resultA.isStale, true, 'Result A harus ditandai isStale: true');
-      assert.strictEqual(pushAOverwroteDiagnostic, false, 'Push A dilarang memutasi diagnostik');
-      assert.strictEqual(activeDiagnostic.connectionStatus, 'sync_success', 'Status diagnostik Push B tetap utuh');
-      assert.strictEqual(activeDiagnostic.eventsCreatedCount, 1);
-      assert.strictEqual(activeDiagnostic.lastErrorMessage, undefined);
+      // 1. Verifikasi operasi stale terdeteksi
+      assert.strictEqual(pushResult.isStale, true);
 
-      // 6. Verifikasi bahwa ID remote yang sudah berhasil diperoleh tidak hilang (data preservation)
-      assert.strictEqual(resultA.updatedSessions[0].googleCalendarEventId, 'gcal-id-a-confirmed');
-      assert.strictEqual(resultA.updatedSessions[0].syncStatus, 'synced');
-      assert.strictEqual(firestoreWritesA.length, 1, 'Data Task A tetap terpersistensi ke Firestore');
-      assert.strictEqual(firestoreWritesA[0].t.scheduledSessions[0].googleCalendarEventId, 'gcal-id-a-confirmed');
-      assert.strictEqual(firestoreWritesB.length, 1, 'Data Task B terpersistensi ke Firestore');
-      assert.strictEqual(firestoreWritesB[0].t.scheduledSessions[0].googleCalendarEventId, 'gcal-id-b-confirmed');
+      // 2. Verifikasi remote ID tetap dipulihkan dan tersimpan ke state dan Firestore
+      assert.strictEqual(stateTasks[0].scheduledSessions[0].googleCalendarEventId, 'gcal-stale-recovered-d');
+      assert.strictEqual(stateTasks[0].scheduledSessions[0].syncStatus, 'synced');
+      assert.strictEqual(firestoreWrites.length, 1);
+      assert.strictEqual(firestoreWrites[0].t.scheduledSessions[0].googleCalendarEventId, 'gcal-stale-recovered-d');
 
-      // 7. Verifikasi tidak ada POST duplikat untuk sesi yang sama
-      assert.strictEqual(pushAPostCalled, 1, 'Hanya tepat 1 POST untuk sesi A');
-      assert.strictEqual(pushBPostCalled, 1, 'Hanya tepat 1 POST untuk sesi B');
+      // 3. Verifikasi diagnostik UI operasi aktif tidak tertimpa
+      assert.strictEqual(activeDiagnostic.eventsCreatedCount, 5);
 
-      console.log('  ✅ [PASS] Test 48: True Concurrent Pushes dengan deferred promise terverifikasi race-condition free.');
+      console.log('    ✅ [PASS] Scenario D: Stale push pasca-kreasi remote berhasil mempertahankan remote ID tanpa merusak diagnostik.');
+    }
+
+    // -------------------------------------------------------------------------
+    // CATEGORY: PERSISTENCE MERGE TESTS (TEST 49)
+    // -------------------------------------------------------------------------
+
+    console.log('\n--- [Test 49] Safe Persistence Merge Comprehensive Test Suite ---');
+    {
+      const taskId = 'task-merge-49';
+
+      // 1. Merge task lama dengan task terbaru: menjaga perubahan judul, status, dan prioritas
+      const oldSnapshot: Task = {
+        id: taskId,
+        userId: 'user-49',
+        title: 'Judul Awal',
+        status: 'UNSCHEDULED',
+        priority: 'LOW',
+        createdAt: '2026-11-08T00:00:00Z',
+        scheduledSessions: [
+          {
+            id: 'sess-merge-1',
+            taskTitle: 'Judul Awal',
+            sessionIndex: 1,
+            totalSessions: 1,
+            durationMinutes: 30,
+            startAt: '2026-11-08T10:00:00+07:00',
+            endAt: '2026-11-08T10:30:00+07:00',
+            syncStatus: 'synced',
+            googleCalendarEventId: 'gcal-merge-1-acquired',
+          },
+        ],
+      };
+
+      const currentTaskNewer: Task = {
+        id: taskId,
+        userId: 'user-49',
+        title: 'Judul Baru oleh Pengguna',
+        status: 'SCHEDULED',
+        priority: 'HIGH',
+        deadline: '2026-11-10T18:00:00+07:00',
+        createdAt: '2026-11-08T00:00:00Z',
+        scheduledSessions: [
+          {
+            id: 'sess-merge-1',
+            taskTitle: 'Judul Baru oleh Pengguna',
+            sessionIndex: 1,
+            totalSessions: 1,
+            durationMinutes: 30,
+            startAt: '2026-11-08T10:00:00+07:00',
+            endAt: '2026-11-08T10:30:00+07:00',
+            syncStatus: 'pending',
+          },
+          {
+            id: 'sess-merge-2',
+            taskTitle: 'Judul Baru oleh Pengguna',
+            sessionIndex: 2,
+            totalSessions: 2,
+            durationMinutes: 30,
+            startAt: '2026-11-08T14:00:00+07:00',
+            endAt: '2026-11-08T14:30:00+07:00',
+            syncStatus: 'synced',
+            googleCalendarEventId: 'gcal-existing-session-2',
+          },
+        ],
+      };
+
+      const merged = mergeTaskWithCurrent(currentTaskNewer, oldSnapshot);
+
+      // Verifikasi 1: Metadata task terbaru tetap terjaga
+      assert.strictEqual(merged.title, 'Judul Baru oleh Pengguna');
+      assert.strictEqual(merged.priority, 'HIGH');
+      assert.strictEqual(merged.status, 'SCHEDULED');
+      assert.strictEqual(merged.deadline, '2026-11-10T18:00:00+07:00');
+
+      // Verifikasi 2: Remote ID yang baru diperoleh oldSnapshot disematkan ke sess-merge-1
+      const sess1 = merged.scheduledSessions.find((s) => s.id === 'sess-merge-1');
+      assert.strictEqual(sess1?.googleCalendarEventId, 'gcal-merge-1-acquired');
+      assert.strictEqual(sess1?.syncStatus, 'synced');
+
+      // Verifikasi 3: Sesi lain (sess-merge-2) yang tidak tersentuh push tetap utuh
+      const sess2 = merged.scheduledSessions.find((s) => s.id === 'sess-merge-2');
+      assert.strictEqual(sess2?.googleCalendarEventId, 'gcal-existing-session-2');
+      assert.strictEqual(sess2?.syncStatus, 'synced');
+
+      // Verifikasi 4: Jangan menimpa remote ID yang sudah ada pada currentTask
+      const taskWithExistingRemoteId: Task = {
+        ...currentTaskNewer,
+        scheduledSessions: [
+          {
+            ...currentTaskNewer.scheduledSessions[0],
+            googleCalendarEventId: 'gcal-current-confirmed-999',
+            syncStatus: 'synced',
+          },
+        ],
+      };
+      const mergedExisting = mergeTaskWithCurrent(taskWithExistingRemoteId, oldSnapshot);
+      assert.strictEqual(
+        mergedExisting.scheduledSessions[0].googleCalendarEventId,
+        'gcal-current-confirmed-999',
+        'Remote ID yang sudah terkonfirmasi di currentTask dilarang ditimpa'
+      );
+
+      // Verifikasi 5: Sesi yang dihapus saat push berlangsung namun telah memperoleh remote ID dipertahankan
+      const taskWithDeletedSession: Task = {
+        ...currentTaskNewer,
+        scheduledSessions: [currentTaskNewer.scheduledSessions[1]], // sess-merge-1 dihapus
+      };
+      const mergedDeleted = mergeTaskWithCurrent(taskWithDeletedSession, oldSnapshot);
+      const recoveredSess = mergedDeleted.scheduledSessions.find((s) => s.id === 'sess-merge-1');
+      assert.ok(recoveredSess, 'Sesi yang telanjur dibuat di Google harus dipertahankan agar tidak menjadi yatim');
+      assert.strictEqual(recoveredSess?.googleCalendarEventId, 'gcal-merge-1-acquired');
+
+      // Verifikasi 6: Konsistensi React state dan Firestore via persistScheduledTask produksi
+      let reactStateTasks: Task[] = [currentTaskNewer];
+      let firestoreStoredTask: Task | null = null;
+
+      await persistScheduledTask({
+        task: oldSnapshot,
+        userId: 'user-49',
+        setTasks: (updater: any) => {
+          reactStateTasks = typeof updater === 'function' ? updater(reactStateTasks) : updater;
+        },
+        saveToStorage: async (t) => {
+          firestoreStoredTask = t;
+        },
+      });
+
+      assert.strictEqual(reactStateTasks[0].title, 'Judul Baru oleh Pengguna');
+      assert.strictEqual(firestoreStoredTask?.title, 'Judul Baru oleh Pengguna');
+      assert.strictEqual(
+        reactStateTasks[0].scheduledSessions.find((s) => s.id === 'sess-merge-1')?.googleCalendarEventId,
+        'gcal-merge-1-acquired'
+      );
+      assert.strictEqual(
+        (firestoreStoredTask as any)?.scheduledSessions.find((s: any) => s.id === 'sess-merge-1')?.googleCalendarEventId,
+        'gcal-merge-1-acquired'
+      );
+
+      console.log('  ✅ [PASS] Test 49: Seluruh 6 skenario Safe Persistence Merge terverifikasi 100% konsisten.');
     }
 
     console.log('\n================================================================');
