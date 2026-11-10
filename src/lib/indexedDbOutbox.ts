@@ -3,7 +3,7 @@
  *
  * Implements offline-first durable local storage for deletion intents.
  * Acts as an outbox until deletion tombstones are authoritatively acknowledged by Firestore.
- * Conforms to Phase 2A.3.4.4 architectural requirements.
+ * Conforms to Phase 2A.3.4.4 architectural requirements and review hardening.
  */
 
 export type OutboxSyncStatus = 'pending_sync' | 'synced' | 'sync_failed';
@@ -33,9 +33,22 @@ export const DB_VERSION = 1;
 export const OUTBOX_STORE = 'deletion_outbox';
 export const LEGACY_STORAGE_KEY = 'even_deletion_tombstones_v1';
 
-// In-memory fallback store for Node.js / SSR / non-IndexedDB test environments
+// In-memory fallback store ONLY when explicitly allowed for SSR/testing
 const inMemoryStore = new Map<string, DurableDeletionIntent>();
-let isUsingMemoryFallback = false;
+let memoryFallbackExplicitlyAllowed = typeof window === 'undefined';
+let customIdbFactory: IDBFactory | null = null;
+
+export function setAllowMemoryFallback(allowed: boolean): void {
+  memoryFallbackExplicitlyAllowed = allowed;
+}
+
+export function isMemoryFallbackAllowed(): boolean {
+  return memoryFallbackExplicitlyAllowed;
+}
+
+export function setCustomIdbFactory(factory: IDBFactory | null): void {
+  customIdbFactory = factory;
+}
 
 /**
  * Builds deterministic composite key for outbox items
@@ -58,9 +71,12 @@ export function sanitizeIdForFirestore(rawId: string): string {
 }
 
 /**
- * Detects if native IndexedDB is available
+ * Detects if native or custom IndexedDB is available
  */
-function getIndexedDbInstance(): IDBFactory | null {
+export function getIndexedDbInstance(): IDBFactory | null {
+  if (customIdbFactory) {
+    return customIdbFactory;
+  }
   if (typeof globalThis !== 'undefined' && globalThis.indexedDB) {
     return globalThis.indexedDB;
   }
@@ -71,20 +87,30 @@ function getIndexedDbInstance(): IDBFactory | null {
 }
 
 /**
- * Opens connection to IndexedDB database with schema versioning
+ * Opens connection to IndexedDB database with schema versioning.
+ * Strictly throws if IndexedDB cannot be opened.
  */
 export function openOutboxDatabase(): Promise<IDBDatabase> {
   const idb = getIndexedDbInstance();
   if (!idb) {
-    isUsingMemoryFallback = true;
-    return Promise.reject(new Error('IndexedDB not supported in current environment'));
+    if (memoryFallbackExplicitlyAllowed) {
+      return Promise.reject(new Error('INDEXEDDB_UNAVAILABLE_USE_FALLBACK'));
+    }
+    return Promise.reject(
+      new Error('IndexedDB tidak tersedia pada runtime ini dan memory fallback dinonaktifkan')
+    );
   }
 
   return new Promise((resolve, reject) => {
-    const request = idb.open(DB_NAME, DB_VERSION);
+    let req: IDBOpenDBRequest;
+    try {
+      req = idb.open(DB_NAME, DB_VERSION);
+    } catch (err) {
+      return reject(err);
+    }
 
-    request.onupgradeneeded = (event) => {
-      const db = request.result;
+    req.onupgradeneeded = () => {
+      const db = req.result;
       if (!db.objectStoreNames.contains(OUTBOX_STORE)) {
         const store = db.createObjectStore(OUTBOX_STORE, { keyPath: 'id' });
         store.createIndex('by_userId', 'userId', { unique: false });
@@ -94,163 +120,225 @@ export function openOutboxDatabase(): Promise<IDBDatabase> {
       }
     };
 
-    request.onsuccess = () => {
-      resolve(request.result);
+    req.onsuccess = () => {
+      resolve(req.result);
     };
 
-    request.onerror = () => {
-      reject(request.error || new Error('Failed to open IndexedDB database'));
+    req.onerror = () => {
+      reject(req.error || new Error('Gagal membuka database IndexedDB'));
     };
 
-    request.onblocked = () => {
-      console.warn('IndexedDB database upgrade blocked by active connection');
+    req.onblocked = () => {
+      console.warn('IndexedDB database upgrade diblokir oleh koneksi aktif');
     };
   });
 }
 
 /**
  * Persists a deletion intent durably into IndexedDB Outbox.
- * Guarantees transaction completion before resolving.
+ * Guarantees transaction completion (tx.oncomplete) before resolving.
+ * If IndexedDB fails or transaction fails, it MUST REJECT so caller knows durable storage failed.
  */
 export async function saveToOutbox(intent: DurableDeletionIntent): Promise<void> {
-  try {
-    const db = await openOutboxDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(OUTBOX_STORE, 'readwrite');
-      const store = tx.objectStore(OUTBOX_STORE);
+  const idb = getIndexedDbInstance();
 
-      store.put(intent);
-
-      tx.oncomplete = () => {
-        // Also keep memory cache aligned
-        inMemoryStore.set(intent.id, intent);
-        db.close();
-        resolve();
-      };
-
-      tx.onerror = () => {
-        db.close();
-        reject(tx.error || new Error('Transaction failed in saveToOutbox'));
-      };
-
-      tx.onabort = () => {
-        db.close();
-        reject(new Error('Transaction aborted in saveToOutbox'));
-      };
-    });
-  } catch (err) {
-    // If IndexedDB unavailable, use in-memory fallback
-    inMemoryStore.set(intent.id, intent);
-    if (!isUsingMemoryFallback) {
-      console.warn('Fallback to in-memory store for saveToOutbox:', err);
+  if (!idb) {
+    if (memoryFallbackExplicitlyAllowed) {
+      inMemoryStore.set(intent.id, intent);
+      return;
     }
+    throw new Error('IndexedDB tidak tersedia di environment ini dan memory fallback tidak diizinkan');
   }
+
+  let db: IDBDatabase;
+  try {
+    db = await openOutboxDatabase();
+  } catch (err: any) {
+    // Retain in memory cache to avoid losing intent in current process, but throw error!
+    inMemoryStore.set(intent.id, intent);
+    throw new Error(`Gagal membuka IndexedDB untuk penyimpanan outbox: ${err?.message || String(err)}`);
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    let tx: IDBTransaction;
+    try {
+      tx = db.transaction(OUTBOX_STORE, 'readwrite');
+    } catch (err: any) {
+      db.close();
+      inMemoryStore.set(intent.id, intent);
+      return reject(new Error(`Gagal memulai transaksi IndexedDB: ${err?.message || String(err)}`));
+    }
+
+    const store = tx.objectStore(OUTBOX_STORE);
+    try {
+      store.put(intent);
+    } catch (err: any) {
+      db.close();
+      inMemoryStore.set(intent.id, intent);
+      return reject(err);
+    }
+
+    tx.oncomplete = () => {
+      // Keep memory cache aligned
+      inMemoryStore.set(intent.id, intent);
+      db.close();
+      resolve();
+    };
+
+    tx.onerror = () => {
+      const err = tx.error || new Error('Transaksi IndexedDB gagal disimpan');
+      db.close();
+      inMemoryStore.set(intent.id, intent);
+      reject(err);
+    };
+
+    tx.onabort = () => {
+      db.close();
+      inMemoryStore.set(intent.id, intent);
+      reject(new Error('Transaksi IndexedDB dibatalkan (aborted)'));
+    };
+  });
 }
 
 /**
- * Retrieves a single outbox item by its composite key
+ * Retrieves a single outbox item by its composite key.
  */
 export async function getOutboxItem(id: string): Promise<DurableDeletionIntent | undefined> {
-  try {
-    const db = await openOutboxDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(OUTBOX_STORE, 'readonly');
-      const store = tx.objectStore(OUTBOX_STORE);
-      const req = store.get(id);
-
-      req.onsuccess = () => {
-        db.close();
-        resolve(req.result || undefined);
-      };
-
-      req.onerror = () => {
-        db.close();
-        reject(req.error || new Error('Failed to get outbox item'));
-      };
-    });
-  } catch {
-    return inMemoryStore.get(id);
+  const idb = getIndexedDbInstance();
+  if (!idb) {
+    if (memoryFallbackExplicitlyAllowed) {
+      return inMemoryStore.get(id);
+    }
+    throw new Error('IndexedDB tidak tersedia di environment ini');
   }
+
+  const db = await openOutboxDatabase();
+  return new Promise((resolve, reject) => {
+    let tx: IDBTransaction;
+    try {
+      tx = db.transaction(OUTBOX_STORE, 'readonly');
+    } catch (err) {
+      db.close();
+      return reject(err);
+    }
+
+    const store = tx.objectStore(OUTBOX_STORE);
+    const req = store.get(id);
+
+    req.onsuccess = () => {
+      db.close();
+      resolve(req.result || undefined);
+    };
+
+    req.onerror = () => {
+      db.close();
+      reject(req.error || new Error('Gagal membaca item outbox'));
+    };
+  });
 }
 
 /**
- * Retrieves all deletion intents from the outbox, optionally filtered by user ID
+ * Retrieves all deletion intents from the outbox, optionally filtered by user ID.
  */
 export async function getAllOutboxItems(userId?: string): Promise<DurableDeletionIntent[]> {
-  try {
-    const db = await openOutboxDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(OUTBOX_STORE, 'readonly');
-      const store = tx.objectStore(OUTBOX_STORE);
-
-      let req: IDBRequest<any>;
-      if (userId) {
-        const index = store.index('by_userId');
-        req = index.getAll(userId);
-      } else {
-        req = store.getAll();
-      }
-
-      req.onsuccess = () => {
-        db.close();
-        resolve(req.result || []);
-      };
-
-      req.onerror = () => {
-        db.close();
-        reject(req.error || new Error('Failed to get all outbox items'));
-      };
-    });
-  } catch {
-    const all = Array.from(inMemoryStore.values());
-    if (userId) {
-      return all.filter((item) => item.userId === userId);
+  const idb = getIndexedDbInstance();
+  if (!idb) {
+    if (memoryFallbackExplicitlyAllowed) {
+      const all = Array.from(inMemoryStore.values());
+      return userId ? all.filter((item) => item.userId === userId) : all;
     }
-    return all;
+    throw new Error('IndexedDB tidak tersedia di environment ini');
   }
+
+  const db = await openOutboxDatabase();
+  return new Promise((resolve, reject) => {
+    let tx: IDBTransaction;
+    try {
+      tx = db.transaction(OUTBOX_STORE, 'readonly');
+    } catch (err) {
+      db.close();
+      return reject(err);
+    }
+
+    const store = tx.objectStore(OUTBOX_STORE);
+    let req: IDBRequest<any>;
+    if (userId) {
+      const index = store.index('by_userId');
+      req = index.getAll(userId);
+    } else {
+      req = store.getAll();
+    }
+
+    req.onsuccess = () => {
+      db.close();
+      resolve(req.result || []);
+    };
+
+    req.onerror = () => {
+      db.close();
+      reject(req.error || new Error('Gagal membaca seluruh item outbox'));
+    };
+  });
 }
 
 /**
- * Retrieves all outbox items that require synchronization to Firestore
+ * Retrieves all outbox items that require synchronization to Firestore.
  */
 export async function getPendingSyncOutboxItems(userId?: string): Promise<DurableDeletionIntent[]> {
-  try {
-    const db = await openOutboxDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(OUTBOX_STORE, 'readonly');
-      const store = tx.objectStore(OUTBOX_STORE);
+  const idb = getIndexedDbInstance();
+  if (!idb) {
+    if (memoryFallbackExplicitlyAllowed) {
+      return Array.from(inMemoryStore.values()).filter(
+        (item) => item.syncStatus === 'pending_sync' && (!userId || item.userId === userId)
+      );
+    }
+    throw new Error('IndexedDB tidak tersedia di environment ini');
+  }
 
-      let req: IDBRequest<any>;
-      if (userId) {
+  const db = await openOutboxDatabase();
+  return new Promise((resolve, reject) => {
+    let tx: IDBTransaction;
+    try {
+      tx = db.transaction(OUTBOX_STORE, 'readonly');
+    } catch (err) {
+      db.close();
+      return reject(err);
+    }
+
+    const store = tx.objectStore(OUTBOX_STORE);
+    let req: IDBRequest<any>;
+    if (userId) {
+      if (typeof IDBKeyRange !== 'undefined') {
         const index = store.index('by_user_syncStatus');
         req = index.getAll(IDBKeyRange.only([userId, 'pending_sync']));
       } else {
-        const index = store.index('by_syncStatus');
-        req = index.getAll('pending_sync');
+        const index = store.index('by_userId');
+        req = index.getAll(userId);
       }
+    } else {
+      const index = store.index('by_syncStatus');
+      req = index.getAll('pending_sync');
+    }
 
-      req.onsuccess = () => {
-        db.close();
-        const results: DurableDeletionIntent[] = req.result || [];
-        resolve(results);
-      };
+    req.onsuccess = () => {
+      db.close();
+      const list: DurableDeletionIntent[] = req.result || [];
+      if (userId && typeof IDBKeyRange === 'undefined') {
+        resolve(list.filter((i) => i.syncStatus === 'pending_sync'));
+      } else {
+        resolve(list);
+      }
+    };
 
-      req.onerror = () => {
-        db.close();
-        reject(req.error || new Error('Failed to get pending sync outbox items'));
-      };
-    });
-  } catch {
-    return Array.from(inMemoryStore.values()).filter(
-      (item) => item.syncStatus === 'pending_sync' && (!userId || item.userId === userId)
-    );
-  }
+    req.onerror = () => {
+      db.close();
+      reject(req.error || new Error('Gagal membaca pending sync outbox items'));
+    };
+  });
 }
 
 /**
  * Marks an outbox item as synchronized after Firestore confirmation.
- * Does NOT delete immediately so that local monotonic checks still find it,
- * but updates syncStatus to 'synced'.
  */
 export async function markOutboxItemSynced(id: string): Promise<void> {
   const existing = await getOutboxItem(id);
@@ -267,7 +355,7 @@ export async function markOutboxItemSynced(id: string): Promise<void> {
 }
 
 /**
- * Records synchronization failure for an outbox item
+ * Records synchronization failure for an outbox item.
  */
 export async function updateOutboxItemSyncFailure(id: string, error: string): Promise<void> {
   const existing = await getOutboxItem(id);
@@ -290,34 +378,49 @@ export async function updateOutboxItemSyncFailure(id: string, error: string): Pr
  * and remote cleanup is completed.
  */
 export async function removeConfirmedOutboxItem(id: string): Promise<void> {
-  try {
-    const db = await openOutboxDatabase();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(OUTBOX_STORE, 'readwrite');
-      const store = tx.objectStore(OUTBOX_STORE);
-
-      store.delete(id);
-
-      tx.oncomplete = () => {
-        inMemoryStore.delete(id);
-        db.close();
-        resolve();
-      };
-
-      tx.onerror = () => {
-        db.close();
-        reject(tx.error || new Error('Failed to delete outbox item'));
-      };
-    });
-  } catch {
-    inMemoryStore.delete(id);
+  const idb = getIndexedDbInstance();
+  if (!idb) {
+    if (memoryFallbackExplicitlyAllowed) {
+      inMemoryStore.delete(id);
+      return;
+    }
+    throw new Error('IndexedDB tidak tersedia di environment ini');
   }
+
+  const db = await openOutboxDatabase();
+  return new Promise((resolve, reject) => {
+    let tx: IDBTransaction;
+    try {
+      tx = db.transaction(OUTBOX_STORE, 'readwrite');
+    } catch (err) {
+      db.close();
+      return reject(err);
+    }
+
+    const store = tx.objectStore(OUTBOX_STORE);
+    store.delete(id);
+
+    tx.oncomplete = () => {
+      inMemoryStore.delete(id);
+      db.close();
+      resolve();
+    };
+
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error('Gagal menghapus item outbox'));
+    };
+
+    tx.onabort = () => {
+      db.close();
+      reject(new Error('Transaksi penghapusan outbox dibatalkan'));
+    };
+  });
 }
 
 /**
  * Migrates legacy localStorage tombstones to IndexedDB outbox.
  * Idempotent: Does not remove localStorage item until IndexedDB write is confirmed.
- * If migration fails midway, unconverted items remain intact in localStorage.
  */
 export async function migrateLocalStorageToIndexedDb(): Promise<{
   migratedCount: number;
@@ -340,7 +443,7 @@ export async function migrateLocalStorageToIndexedDb(): Promise<{
 
     const legacyList = JSON.parse(raw);
     if (!Array.isArray(legacyList)) {
-      return { migratedCount: 0, skippedCount: 0, errors: ['Invalid legacy storage format'] };
+      return { migratedCount: 0, skippedCount: 0, errors: ['Format legacy storage tidak valid'] };
     }
 
     const remainingLegacy: any[] = [];
@@ -369,7 +472,7 @@ export async function migrateLocalStorageToIndexedDb(): Promise<{
           googleCalendarEventId: legacy.googleCalendarEventId,
           deletedAt: legacy.deletedAt || new Date().toISOString(),
           status: legacy.status || 'cleaned',
-          syncStatus: 'pending_sync', // Queue for Firestore authoritative synchronization
+          syncStatus: 'pending_sync',
           syncAttempts: 0,
           retryCount: legacy.retryCount || 0,
           lastError: legacy.lastError,
@@ -380,36 +483,46 @@ export async function migrateLocalStorageToIndexedDb(): Promise<{
         await saveToOutbox(outboxIntent);
         migratedCount++;
       } catch (err: any) {
-        errors.push(`Failed to migrate tombstone ${legacy?.id}: ${err.message || String(err)}`);
+        errors.push(`Gagal memigrasikan tombstone ${legacy?.id}: ${err.message || String(err)}`);
         remainingLegacy.push(legacy);
       }
     }
 
-    // Only update localStorage if some items failed; otherwise keep as migration backup or clean up safely
     if (remainingLegacy.length === 0 && errors.length === 0) {
-      // Keep legacy key with migrated flag to prevent repeated work
       localStorage.setItem(`${LEGACY_STORAGE_KEY}_migrated_at`, new Date().toISOString());
     } else {
       localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(remainingLegacy));
     }
   } catch (err: any) {
-    errors.push(`Migration exception: ${err.message || String(err)}`);
+    errors.push(`Eksepsi migrasi: ${err.message || String(err)}`);
   }
 
   return { migratedCount, skippedCount, errors };
 }
 
 /**
- * Clears all outbox records (used for test suites and hard factory reset)
+ * Clears all outbox records (used for test suites and hard reset).
  */
 export async function clearIndexedDbOutbox(): Promise<void> {
   inMemoryStore.clear();
+  const idb = getIndexedDbInstance();
+  if (!idb) {
+    return;
+  }
+
   try {
     const db = await openOutboxDatabase();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction(OUTBOX_STORE, 'readwrite');
+      let tx: IDBTransaction;
+      try {
+        tx = db.transaction(OUTBOX_STORE, 'readwrite');
+      } catch (err) {
+        db.close();
+        return resolve();
+      }
+
       const store = tx.objectStore(OUTBOX_STORE);
-      const req = store.clear();
+      store.clear();
 
       tx.oncomplete = () => {
         db.close();
@@ -418,10 +531,10 @@ export async function clearIndexedDbOutbox(): Promise<void> {
 
       tx.onerror = () => {
         db.close();
-        reject(tx.error || new Error('Failed to clear outbox store'));
+        reject(tx.error || new Error('Gagal membersihkan store outbox'));
       };
     });
   } catch {
-    // Memory store cleared above
+    // If database cannot be opened, memory was already cleared
   }
 }

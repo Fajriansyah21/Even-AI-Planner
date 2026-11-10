@@ -83,11 +83,43 @@ service cloud.firestore {
       // Deletion Tombstones (Authoritative cross-device monotonic deletion records)
       match /deletion_tombstones/{tombstoneId} {
         allow get, list: if isOwner(userId);
-        allow create, update: if isOwner(userId) && isValidId(tombstoneId)
+
+        allow create: if isOwner(userId) && isValidId(tombstoneId)
           && incoming().userId == userId
-          && incoming().taskId is string && incoming().taskId.size() <= 128
-          && incoming().deletedAt is string
-          && incoming().status in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed'];
+          && incoming().taskId is string && incoming().taskId.size() > 0 && incoming().taskId.size() <= 256
+          && incoming().sessionId is string && incoming().sessionId.size() > 0 && incoming().sessionId.size() <= 256
+          && incoming().compositeKey is string && incoming().compositeKey.size() > 0 && incoming().compositeKey.size() <= 512
+          && incoming().entityType in ['task', 'session']
+          && incoming().deletedAt is string && incoming().deletedAt.size() <= 64
+          && incoming().status in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed']
+          && incoming().retryCount is number && incoming().retryCount >= 0
+          && incoming().updatedAt is string;
+
+        allow update: if isOwner(userId) && isValidId(tombstoneId)
+          && incoming().userId == userId
+          && incoming().taskId is string && incoming().taskId.size() > 0 && incoming().taskId.size() <= 256
+          && incoming().sessionId is string && incoming().sessionId.size() > 0 && incoming().sessionId.size() <= 256
+          && incoming().compositeKey is string && incoming().compositeKey.size() > 0 && incoming().compositeKey.size() <= 512
+          && incoming().entityType in ['task', 'session']
+          && incoming().deletedAt is string && incoming().deletedAt.size() <= 64
+          && incoming().status in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed']
+          && incoming().retryCount is number && incoming().retryCount >= 0
+          && incoming().updatedAt is string
+          // Immutability: identity and initial deletion timestamp cannot be changed or forged
+          && incoming().userId == existing().userId
+          && incoming().taskId == existing().taskId
+          && incoming().sessionId == existing().sessionId
+          && incoming().compositeKey == existing().compositeKey
+          && incoming().entityType == existing().entityType
+          && incoming().deletedAt == existing().deletedAt
+          // Monotonic status transitions:
+          // 'cleaned' cannot be downgraded to 'pending_cleanup' unless a new remote ID arrived
+          && (
+            existing().status != 'cleaned'
+            || incoming().status == 'cleaned'
+            || (incoming().googleCalendarEventId != null && incoming().googleCalendarEventId != existing().googleCalendarEventId)
+          );
+
         // Tombstones are monotonic and permanent to guarantee User Deletion Intent Wins
         allow delete: if false;
       }

@@ -60,7 +60,7 @@ import {
 } from './lib/googleCalendar';
 import { CalendarOperationGuard } from './lib/calendarOperationGuard';
 import { executeSchedulePush, reconcileTaskSessionsWithRemote } from './lib/calendarPushService';
-import { recordTaskDeletion, processPendingDeletionCleanups, initDurableTombstones } from './lib/deletionTombstone';
+import { recordTaskDeletion, recordTaskDeletionDurable, processPendingDeletionCleanups, initDurableTombstones } from './lib/deletionTombstone';
 import { syncOutboxToFirestore } from './lib/firestoreTombstoneRepo';
 import {
   getInitialKeepNotes,
@@ -601,12 +601,16 @@ export default function App() {
         showToast(`Kegiatan "${taskToDelete.title}" telah dihapus.`, 'info');
         setConfirmModal((prev) => ({ ...prev, isOpen: false }));
 
-        // 1. Rekam tombstone persisten untuk task dan seluruh sesinya
+        // 1. Rekam tombstone persisten secara durable ke outbox IndexedDB
         const sessionsWithEvents = taskToDelete.scheduledSessions?.map((s) => ({
           sessionId: s.id,
           googleCalendarEventId: s.googleCalendarEventId,
         }));
-        recordTaskDeletion(userId || 'user-default', taskId, sessionsWithEvents);
+        try {
+          await recordTaskDeletionDurable(userId || 'user-default', taskId, sessionsWithEvents);
+        } catch (err) {
+          console.error('Penyimpanan tombstone durable ke outbox gagal:', err);
+        }
 
         // 2. Kompensasikan penghapusan remote jika ada Google Calendar Event ID
         const cachedToken = getCachedAccessToken();

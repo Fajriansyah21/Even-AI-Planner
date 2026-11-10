@@ -183,7 +183,7 @@ export function recordSessionDeletion(
   inMemoryTombstones.set(key, tombstone);
   saveTombstonesToStorage();
 
-  // Asynchronously queue to durable IndexedDB outbox
+  // Asynchronously queue to durable IndexedDB outbox (synchronous caller does not await)
   const outboxIntent: DurableDeletionIntent = {
     id: key,
     userId: tombstone.userId,
@@ -205,7 +205,71 @@ export function recordSessionDeletion(
     if (firestoreSyncEnabled && currentUid && currentUid === tombstone.userId && currentUid !== 'user-default') {
       syncOutboxToFirestore({ userId: currentUid }).catch(() => {});
     }
-  }).catch(() => {});
+  }).catch((err) => {
+    console.warn('Asynchronous outbox queue notice (non-blocking call):', err);
+  });
+
+  return tombstone;
+}
+
+/**
+ * Records a deletion intent for an individual session and AWAITS durable persistence in IndexedDB outbox.
+ * Fails if IndexedDB outbox write fails, preventing false claims of durable persistence.
+ */
+export async function recordSessionDeletionDurable(
+  userId: string | null | undefined,
+  taskId: string,
+  sessionId: string,
+  googleCalendarEventId?: string
+): Promise<DeletionTombstone> {
+  const key = buildTombstoneKey(userId, taskId, sessionId);
+  const existing = inMemoryTombstones.get(key);
+
+  const finalRemoteId = googleCalendarEventId || existing?.googleCalendarEventId;
+  const status: TombstoneCleanupStatus = finalRemoteId ? 'pending_cleanup' : 'cleaned';
+
+  const tombstone: DeletionTombstone = {
+    id: key,
+    userId: userId && userId.trim() ? userId : 'user-default',
+    taskId,
+    sessionId,
+    googleCalendarEventId: finalRemoteId,
+    deletedAt: existing?.deletedAt || new Date().toISOString(),
+    status,
+    retryCount: existing?.retryCount || 0,
+    lastError: existing?.lastError,
+    lastAttemptAt: existing?.lastAttemptAt,
+  };
+
+  // 1. Immediately update in-memory cache so sync checks in render/scheduler see it
+  inMemoryTombstones.set(key, tombstone);
+  saveTombstonesToStorage();
+
+  // 2. Await durable storage in IndexedDB outbox
+  const outboxIntent: DurableDeletionIntent = {
+    id: key,
+    userId: tombstone.userId,
+    taskId: tombstone.taskId,
+    sessionId: tombstone.sessionId || 'all',
+    entityType: 'session',
+    googleCalendarEventId: tombstone.googleCalendarEventId,
+    deletedAt: tombstone.deletedAt,
+    status: tombstone.status,
+    syncStatus: 'pending_sync',
+    syncAttempts: 0,
+    retryCount: tombstone.retryCount,
+    lastError: tombstone.lastError,
+    lastAttemptAt: tombstone.lastAttemptAt,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await saveToOutbox(outboxIntent);
+
+  // 3. Trigger background Firestore sync if user is authenticated
+  const currentUid = auth?.currentUser?.uid;
+  if (firestoreSyncEnabled && currentUid && currentUid === tombstone.userId && currentUid !== 'user-default') {
+    syncOutboxToFirestore({ userId: currentUid }).catch(() => {});
+  }
 
   return tombstone;
 }
@@ -234,7 +298,7 @@ export function recordTaskDeletion(
   inMemoryTombstones.set(taskKey, taskTombstone);
   tombstones.push(taskTombstone);
 
-  // Queue task-level tombstone to durable outbox
+  // Queue task-level tombstone to durable outbox (non-blocking)
   const taskOutboxIntent: DurableDeletionIntent = {
     id: taskKey,
     userId: safeUser,
@@ -253,7 +317,9 @@ export function recordTaskDeletion(
     if (firestoreSyncEnabled && currentUid && currentUid === safeUser && currentUid !== 'user-default') {
       syncOutboxToFirestore({ userId: currentUid }).catch(() => {});
     }
-  }).catch(() => {});
+  }).catch((err) => {
+    console.warn('Asynchronous outbox queue notice (non-blocking call):', err);
+  });
 
   // 2. Session-level tombstones for any sessions with existing or potential remote IDs
   if (sessions && sessions.length > 0) {
@@ -269,6 +335,71 @@ export function recordTaskDeletion(
   }
 
   saveTombstonesToStorage();
+  return tombstones;
+}
+
+/**
+ * Records a deletion intent for a whole task (and all its sessions) and AWAITS durable persistence in IndexedDB outbox.
+ * Throws if durable outbox write fails.
+ */
+export async function recordTaskDeletionDurable(
+  userId: string | null | undefined,
+  taskId: string,
+  sessions?: { sessionId: string; googleCalendarEventId?: string }[]
+): Promise<DeletionTombstone[]> {
+  const safeUser = userId && userId.trim() ? userId : 'user-default';
+  const tombstones: DeletionTombstone[] = [];
+
+  // 1. Task-level tombstone
+  const taskKey = buildTombstoneKey(safeUser, taskId);
+  const taskTombstone: DeletionTombstone = {
+    id: taskKey,
+    userId: safeUser,
+    taskId,
+    deletedAt: new Date().toISOString(),
+    status: 'cleaned',
+    retryCount: 0,
+  };
+  inMemoryTombstones.set(taskKey, taskTombstone);
+  tombstones.push(taskTombstone);
+
+  // 2. Await task-level outbox write
+  const taskOutboxIntent: DurableDeletionIntent = {
+    id: taskKey,
+    userId: safeUser,
+    taskId,
+    sessionId: 'all',
+    entityType: 'task',
+    deletedAt: taskTombstone.deletedAt,
+    status: taskTombstone.status,
+    syncStatus: 'pending_sync',
+    syncAttempts: 0,
+    retryCount: 0,
+    updatedAt: new Date().toISOString(),
+  };
+  await saveToOutbox(taskOutboxIntent);
+
+  // 3. Await session-level tombstones
+  if (sessions && sessions.length > 0) {
+    for (const sess of sessions) {
+      const sessTombstone = await recordSessionDeletionDurable(
+        safeUser,
+        taskId,
+        sess.sessionId,
+        sess.googleCalendarEventId
+      );
+      tombstones.push(sessTombstone);
+    }
+  }
+
+  saveTombstonesToStorage();
+
+  // 4. Trigger background Firestore sync
+  const currentUid = auth?.currentUser?.uid;
+  if (firestoreSyncEnabled && currentUid && currentUid === safeUser && currentUid !== 'user-default') {
+    syncOutboxToFirestore({ userId: currentUid }).catch(() => {});
+  }
+
   return tombstones;
 }
 

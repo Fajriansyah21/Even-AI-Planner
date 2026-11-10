@@ -3,8 +3,8 @@
  *
  * Implements cross-device authoritative truth for deletion intents in Firestore.
  * Subcollection: /users/{userId}/deletion_tombstones/{tombstoneId}
- * Enforces ownership validation, monotonic tombstone merges, and idempotent outbox sync.
- * Conforms to Phase 2A.3.4.4 architectural requirements.
+ * Enforces ownership validation, transaction-based monotonic tombstone merges, and idempotent outbox sync.
+ * Conforms to Phase 2A.3.4.4 review hardening.
  */
 
 import {
@@ -13,9 +13,8 @@ import {
   setDoc,
   getDocs,
   collection,
-  query,
-  where,
-  serverTimestamp,
+  runTransaction,
+  Transaction,
 } from 'firebase/firestore';
 import { db, auth, sanitizeForFirestore, handleFirestoreError, OperationType } from './firebase';
 import {
@@ -27,9 +26,10 @@ import {
   buildOutboxKey,
   saveToOutbox,
 } from './indexedDbOutbox';
+import { sha256Hex } from './sha256';
 
 export interface FirestoreTombstoneDoc {
-  id: string; // Document ID: `${sanitizedTaskId}_${sanitizedSessionId}`
+  id: string; // Deterministic collision-resistant Document ID
   compositeKey: string; // Original composite key: `${userId}:${taskId}:${sessionId}`
   userId: string;
   taskId: string;
@@ -46,14 +46,20 @@ export interface FirestoreTombstoneDoc {
 }
 
 /**
- * Builds standard Firestore document ID conforming to isValidId rule: ^[a-zA-Z0-9_\-]+$
+ * Builds standard collision-resistant Firestore document ID conforming to isValidId rule: ^[a-zA-Z0-9_\-]+$
+ * Uses SHA-256 hash over canonical un-truncated (taskId\0sessionId) to prevent collisions.
+ * Max length is strictly guaranteed under 128 characters.
  */
 export function buildFirestoreTombstoneDocId(taskId: string, sessionId?: string): string {
-  const safeTask = sanitizeIdForFirestore(taskId);
-  const safeSession = sanitizeIdForFirestore(sessionId || 'all');
-  const docId = `tomb_${safeTask}_${safeSession}`;
-  // Enforce 128 character max size from firestore.rules
-  return docId.length > 128 ? docId.substring(0, 128) : docId;
+  const safeSession = sessionId && sessionId.trim() ? sessionId.trim() : 'all';
+  const canonicalKey = `${taskId}\0${safeSession}`;
+  const hash = sha256Hex(canonicalKey); // 64 hex characters
+
+  const safeTaskPrefix = sanitizeIdForFirestore(taskId).slice(0, 32);
+  const safeSessionPrefix = sanitizeIdForFirestore(safeSession).slice(0, 16);
+  // tomb_ (5) + task (<=32) + _ (1) + sess (<=16) + _ (1) + hash32 (32) = max 87 chars <= 128 chars
+  const docId = `tomb_${safeTaskPrefix}_${safeSessionPrefix}_${hash.slice(0, 32)}`;
+  return docId;
 }
 
 /**
@@ -72,13 +78,19 @@ export function validateUserOwnership(userId: string): void {
 }
 
 export interface SaveFirestoreTombstoneOptions {
-  customSetDoc?: typeof setDoc;
-  customGetDoc?: typeof getDoc;
+  customRunTransaction?: (
+    firestoreDb: typeof db,
+    updateFunction: (transaction: Transaction) => Promise<any>
+  ) => Promise<any>;
 }
 
 /**
- * Authoritatively saves or merges a deletion tombstone into Firestore.
- * Monotonic: Prevents older records from overwriting newer deletion decisions.
+ * Authoritatively saves or merges a deletion tombstone into Firestore using an atomic transaction.
+ * Monotonic:
+ * 1. Reads existing tombstone within transaction (fails immediately if read throws).
+ * 2. Preserves earliest valid deletedAt.
+ * 3. Never downgrades 'cleaned' to 'pending_cleanup' unless a new, uncleaned remote ID arrived.
+ * 4. Ensures concurrent writes resolve deterministically without lost updates.
  */
 export async function saveAuthoritativeTombstone(
   tombstone: DurableDeletionIntent,
@@ -90,65 +102,83 @@ export async function saveAuthoritativeTombstone(
   const docId = buildFirestoreTombstoneDocId(taskId, sessionId);
   const docRef = doc(db, 'users', userId, 'deletion_tombstones', docId);
 
-  const setFn = options?.customSetDoc || setDoc;
-  const getFn = options?.customGetDoc || getDoc;
-
-  // Check existing document to ensure monotonic merge
-  let existingData: FirestoreTombstoneDoc | undefined;
-  try {
-    const existingSnap = await getFn(docRef);
-    if (existingSnap.exists()) {
-      existingData = existingSnap.data() as FirestoreTombstoneDoc;
-    }
-  } catch (err) {
-    // If read fails (e.g. offline or new doc), proceed with fresh upsert
-  }
-
-  // Monotonic resolution:
-  // If existing record has newer or equal deletedAt, and is already cleaned, preserve cleaned status
-  let finalStatus = tombstone.status;
-  let finalRemoteId = tombstone.googleCalendarEventId || existingData?.googleCalendarEventId || null;
-  let finalDeletedAt = tombstone.deletedAt;
-
-  if (existingData) {
-    const existingTime = new Date(existingData.deletedAt).getTime();
-    const incomingTime = new Date(tombstone.deletedAt).getTime();
-
-    // Use earliest deletedAt to respect first deletion decision
-    if (!isNaN(existingTime) && !isNaN(incomingTime) && existingTime < incomingTime) {
-      finalDeletedAt = existingData.deletedAt;
-    }
-
-    // Never downgrade 'cleaned' to 'pending_cleanup' unless a new remote ID was introduced
-    if (existingData.status === 'cleaned' && (!finalRemoteId || finalRemoteId === existingData.googleCalendarEventId)) {
-      finalStatus = 'cleaned';
-    }
-  }
-
-  const firestoreData: FirestoreTombstoneDoc = {
-    id: docId,
-    compositeKey: tombstone.id || buildOutboxKey(userId, taskId, sessionId),
-    userId,
-    taskId,
-    sessionId: sessionId || 'all',
-    entityType: tombstone.entityType || (sessionId && sessionId !== 'all' ? 'session' : 'task'),
-    googleCalendarEventId: finalRemoteId,
-    deletedAt: finalDeletedAt,
-    status: finalStatus,
-    retryCount: tombstone.retryCount || 0,
-    lastError: tombstone.lastError || null,
-    lastAttemptAt: tombstone.lastAttemptAt || null,
-    syncedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
+  const txRunner = options?.customRunTransaction || runTransaction;
 
   try {
-    await setFn(docRef, sanitizeForFirestore(firestoreData));
-    return firestoreData;
+    const resultDoc = await txRunner(db, async (transaction) => {
+      // 1. Transactional read - if this throws (e.g. offline / permission), transaction aborts
+      const snap = await transaction.get(docRef);
+      const existingData = snap.exists() ? (snap.data() as FirestoreTombstoneDoc) : undefined;
+
+      // 2. Monotonic resolution rules
+      let finalDeletedAt = tombstone.deletedAt;
+      let finalRemoteId = tombstone.googleCalendarEventId || existingData?.googleCalendarEventId || null;
+      let finalStatus = tombstone.status;
+      let finalRetryCount = tombstone.retryCount || 0;
+      let finalLastError = tombstone.lastError || null;
+      let finalLastAttemptAt = tombstone.lastAttemptAt || null;
+
+      if (existingData) {
+        // Enforce earliest deletedAt
+        const existingTime = new Date(existingData.deletedAt).getTime();
+        const incomingTime = new Date(tombstone.deletedAt).getTime();
+        if (!isNaN(existingTime) && !isNaN(incomingTime) && existingTime < incomingTime) {
+          finalDeletedAt = existingData.deletedAt;
+        }
+
+        // Remote ID & Status Monotonicity:
+        const hasNewRemoteId =
+          Boolean(tombstone.googleCalendarEventId) &&
+          tombstone.googleCalendarEventId !== existingData.googleCalendarEventId;
+
+        if (hasNewRemoteId) {
+          // A delayed POST completed and created an event remotely: MUST transition to pending_cleanup for compensation
+          finalRemoteId = tombstone.googleCalendarEventId;
+          finalStatus = 'pending_cleanup';
+        } else {
+          // If already cleaned, retain cleaned status unless a new remote ID arrived
+          if (existingData.status === 'cleaned') {
+            finalStatus = 'cleaned';
+          } else if (existingData.status === 'cleaning' && tombstone.status === 'pending_cleanup') {
+            finalStatus = 'cleaning';
+          } else if (tombstone.status === 'cleaned') {
+            finalStatus = 'cleaned';
+          } else if (tombstone.status === 'cleanup_failed') {
+            finalStatus = 'cleanup_failed';
+            finalRetryCount = Math.max(tombstone.retryCount || 0, (existingData.retryCount || 0) + 1);
+            finalLastError = tombstone.lastError || existingData.lastError || null;
+            finalLastAttemptAt = tombstone.lastAttemptAt || new Date().toISOString();
+          }
+        }
+      }
+
+      const firestoreData: FirestoreTombstoneDoc = {
+        id: docId,
+        compositeKey: tombstone.id || buildOutboxKey(userId, taskId, sessionId),
+        userId,
+        taskId,
+        sessionId: sessionId || 'all',
+        entityType: tombstone.entityType || (sessionId && sessionId !== 'all' ? 'session' : 'task'),
+        googleCalendarEventId: finalRemoteId,
+        deletedAt: finalDeletedAt,
+        status: finalStatus,
+        retryCount: finalRetryCount,
+        lastError: finalLastError,
+        lastAttemptAt: finalLastAttemptAt,
+        syncedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      // 3. Transactional write
+      transaction.set(docRef, sanitizeForFirestore(firestoreData));
+      return firestoreData;
+    });
+
+    return resultDoc;
   } catch (err) {
     handleFirestoreError(
       err,
-      OperationType.CREATE,
+      OperationType.WRITE,
       `users/${userId}/deletion_tombstones/${docId}`
     );
     throw err;
@@ -161,7 +191,6 @@ export interface GetAuthoritativeTombstonesOptions {
 
 /**
  * Fetches all authoritative tombstones for an authenticated user from Firestore.
- * Used during application startup or cross-device reconciliation.
  */
 export async function getAuthoritativeTombstones(
   userId: string,
