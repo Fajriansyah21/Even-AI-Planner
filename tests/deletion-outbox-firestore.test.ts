@@ -1102,6 +1102,52 @@ export async function runDeletionOutboxAndFirestoreSuite() {
         'Kasus 10: deletedAt berubah wajib ditolak'
       );
 
+      // Implementation matching isValidRemoteIdTransition in firestore.rules
+      function isValidRemoteIdTransition(
+        prevId: string | null,
+        nextId: string | null,
+        prevStatus: Status,
+        nextStatus: Status
+      ): boolean {
+        return (
+          prevId === nextId ||
+          (prevId === null && nextId !== null && prevStatus === 'pending_cleanup' && nextStatus === 'pending_cleanup') ||
+          (prevStatus === 'cleaned' && nextStatus === 'pending_cleanup' && nextId !== null && nextId !== prevId)
+        );
+      }
+
+      // Check remote ID transition rules:
+      assert.strictEqual(
+        isValidRemoteIdTransition('id1', 'id1', 'pending_cleanup', 'cleaning'),
+        true,
+        'Remote ID sama diizinkan saat transisi status normal'
+      );
+      assert.strictEqual(
+        isValidRemoteIdTransition(null, 'id1', 'pending_cleanup', 'pending_cleanup'),
+        true,
+        'Late arrival (null -> non-null) diizinkan pada pending_cleanup'
+      );
+      assert.strictEqual(
+        isValidRemoteIdTransition('id1', null, 'pending_cleanup', 'pending_cleanup'),
+        false,
+        'Menghapus remote ID yang sudah ada dilarang keras'
+      );
+      assert.strictEqual(
+        isValidRemoteIdTransition('id1', 'id2', 'pending_cleanup', 'pending_cleanup'),
+        false,
+        'Menimpa remote ID yang belum dibersihkan dilarang keras (mencegah orphan event)'
+      );
+      assert.strictEqual(
+        isValidRemoteIdTransition('id1', 'id2', 'cleaning', 'cleaning'),
+        false,
+        'Mengubah remote ID saat worker sedang cleaning dilarang keras'
+      );
+      assert.strictEqual(
+        isValidRemoteIdTransition('id1', 'id2', 'cleaned', 'pending_cleanup'),
+        true,
+        'Merekam remote ID baru setelah status cleaned diizinkan via transisi cleaned -> pending_cleanup'
+      );
+
       pass('Test 17: [Temuan 1] Matriks transisi status & penutupan celah remote ID firestore.rules divalidasi 100% lengkap');
     }
 

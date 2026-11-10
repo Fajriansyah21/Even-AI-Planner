@@ -33,6 +33,14 @@ service cloud.firestore {
       return resource.data;
     }
 
+    function isValidRemoteIdTransition(prevId, nextId, prevStatus, nextStatus) {
+      return (prevId == nextId)
+        // Late arrival of first remote event ID (null -> non-null) in pending_cleanup:
+        || (prevId == null && nextId != null && prevStatus == 'pending_cleanup' && nextStatus == 'pending_cleanup')
+        // New remote event arrival after previous event was cleaned (cleaned -> pending_cleanup):
+        || (prevStatus == 'cleaned' && nextStatus == 'pending_cleanup' && nextId != null && nextId != prevId);
+    }
+
     function isValidTombstoneTransition(prevStatus, nextStatus, hasNewRemoteId) {
       return (prevStatus == 'cleaned' && nextStatus == 'cleaned' && !hasNewRemoteId)
         || (prevStatus == 'cleaned' && nextStatus == 'pending_cleanup' && hasNewRemoteId)
@@ -120,10 +128,15 @@ service cloud.firestore {
           && incoming().compositeKey == existing().compositeKey
           && incoming().entityType == existing().entityType
           && incoming().deletedAt == existing().deletedAt
-          // Existing remote event ID cannot be erased or nulled
-          && (existing().get('googleCalendarEventId', null) == null || incoming().get('googleCalendarEventId', null) != null)
           // Monotonic retry count:
           && incoming().retryCount >= existing().retryCount
+          // Strict remote ID lifecycle validation (no erasure, no orphan overwrite):
+          && isValidRemoteIdTransition(
+               existing().get('googleCalendarEventId', null),
+               incoming().get('googleCalendarEventId', null),
+               existing().status,
+               incoming().status
+             )
           // Strict status transition state machine:
           && isValidTombstoneTransition(
                existing().status,

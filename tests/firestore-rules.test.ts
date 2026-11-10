@@ -42,6 +42,10 @@ export async function runFirestoreRulesSuite() {
   // Verify static syntax and presence of key security constructs
   console.log('  🔍 [STATIC AUDIT] Memeriksa konstruksi keamanan firestore.rules...');
   assert.ok(
+    rulesContent.includes('function isValidRemoteIdTransition'),
+    'firestore.rules wajib memiliki isValidRemoteIdTransition'
+  );
+  assert.ok(
     rulesContent.includes('function isValidTombstoneTransition'),
     'firestore.rules wajib memiliki isValidTombstoneTransition'
   );
