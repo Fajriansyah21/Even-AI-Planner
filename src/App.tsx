@@ -597,22 +597,29 @@ export default function App() {
       description: `Apakah Anda yakin ingin menghapus kegiatan "${taskToDelete.title}"? Sesi pengerjaan yang sudah dijadwalkan juga akan dibatalkan. Tindakan ini tidak dapat dibatalkan.`,
       actionLabel: 'Hapus Kegiatan',
       onConfirm: async () => {
-        setTasks((prev) => prev.filter((t) => t.id !== taskId));
-        showToast(`Kegiatan "${taskToDelete.title}" telah dihapus.`, 'info');
-        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
-
-        // 1. Rekam tombstone persisten secara durable ke outbox IndexedDB
+        // Prepare session list with any remote event IDs
         const sessionsWithEvents = taskToDelete.scheduledSessions?.map((s) => ({
           sessionId: s.id,
           googleCalendarEventId: s.googleCalendarEventId,
         }));
+
+        // 1. Rekam tombstone persisten secara durable ke outbox IndexedDB TERLEBIH DAHULU
         try {
           await recordTaskDeletionDurable(userId || 'user-default', taskId, sessionsWithEvents);
         } catch (err) {
           console.error('Penyimpanan tombstone durable ke outbox gagal:', err);
+          showToast('Gagal menghapus kegiatan: penyimpanan lokal gagal.', 'error');
+          // Abort: jangan ubah React state, jangan hapus dari Firestore, jangan remote DELETE
+          setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+          return;
         }
 
-        // 2. Kompensasikan penghapusan remote jika ada Google Calendar Event ID
+        // 2. Jika durable record berhasil, mutasikan UI state dan tampilkan konfirmasi
+        setTasks((prev) => prev.filter((t) => t.id !== taskId));
+        showToast(`Kegiatan "${taskToDelete.title}" telah dihapus.`, 'info');
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+
+        // 3. Kompensasikan penghapusan remote jika ada Google Calendar Event ID
         const cachedToken = getCachedAccessToken();
         if (cachedToken && sessionsWithEvents && sessionsWithEvents.length > 0) {
           for (const s of sessionsWithEvents) {
@@ -624,6 +631,7 @@ export default function App() {
           }
         }
 
+        // 4. Hapus dokumen task dari Firestore
         if (userId && userId !== 'user-default') {
           try {
             await deleteDoc(doc(db, 'users', userId, 'tasks', taskId));

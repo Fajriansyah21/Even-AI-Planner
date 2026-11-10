@@ -33,6 +33,14 @@ service cloud.firestore {
       return resource.data;
     }
 
+    function isValidTombstoneTransition(prevStatus, nextStatus, hasNewRemoteId) {
+      return (prevStatus == nextStatus)
+        || (prevStatus == 'pending_cleanup' && nextStatus in ['cleaning', 'cleaned', 'cleanup_failed'])
+        || (prevStatus == 'cleaning' && nextStatus in ['cleaned', 'cleanup_failed'])
+        || (prevStatus == 'cleanup_failed' && nextStatus in ['cleaning', 'cleaned'])
+        || (prevStatus == 'cleaned' && nextStatus == 'pending_cleanup' && hasNewRemoteId);
+    }
+
     // Subcollections under /users/{userId}
     match /users/{userId} {
       allow read, write: if isOwner(userId);
@@ -112,13 +120,15 @@ service cloud.firestore {
           && incoming().compositeKey == existing().compositeKey
           && incoming().entityType == existing().entityType
           && incoming().deletedAt == existing().deletedAt
-          // Monotonic status transitions:
-          // 'cleaned' cannot be downgraded to 'pending_cleanup' unless a new remote ID arrived
-          && (
-            existing().status != 'cleaned'
-            || incoming().status == 'cleaned'
-            || (incoming().googleCalendarEventId != null && incoming().googleCalendarEventId != existing().googleCalendarEventId)
-          );
+          // Monotonic retry count:
+          && incoming().retryCount >= existing().retryCount
+          // Strict status transition state machine:
+          && isValidTombstoneTransition(
+               existing().status,
+               incoming().status,
+               incoming().get('googleCalendarEventId', null) != null &&
+                 incoming().get('googleCalendarEventId', null) != existing().get('googleCalendarEventId', null)
+             );
 
         // Tombstones are monotonic and permanent to guarantee User Deletion Intent Wins
         allow delete: if false;
