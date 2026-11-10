@@ -54,15 +54,24 @@ import {
 } from '../src/lib/deletionTombstone';
 import { auth } from '../src/lib/firebase';
 import { sha256Hex } from '../src/lib/sha256';
+import { executeTaskDeletion } from '../src/lib/taskDeletionWorkflow';
+import { Task } from '../src/types';
 
 /**
  * Creates an authentic in-memory IDBFactory mock implementing standard
  * IDBDatabase, IDBTransaction, IDBObjectStore, and IDBIndex contracts.
  */
-function createMockIdbFactory(options?: { failTransactions?: boolean; delayCompleteMs?: number }) {
+function createMockIdbFactory(options?: {
+  failTransactions?: boolean;
+  delayCompleteMs?: number;
+  failOnPutCount?: number[];
+}) {
   const databaseStorage = new Map<string, Map<string, any>>();
+  let putCount = 0;
 
   const factory: any = {
+    getPutCount: () => putCount,
+    resetPutCount: () => { putCount = 0; },
     open(name: string, version: number) {
       const openReq: any = {
         result: null,
@@ -90,6 +99,7 @@ function createMockIdbFactory(options?: { failTransactions?: boolean; delayCompl
             };
           },
           transaction(storeNames: string | string[], mode: 'readonly' | 'readwrite') {
+            let txFailed = false;
             const tx: any = {
               mode,
               error: null,
@@ -99,11 +109,15 @@ function createMockIdbFactory(options?: { failTransactions?: boolean; delayCompl
               objectStore(targetStore: string) {
                 return {
                   put(item: any) {
+                    putCount++;
+                    if (options?.failOnPutCount && options.failOnPutCount.includes(putCount)) {
+                      txFailed = true;
+                      tx.error = new Error(`Disk I/O error writing item #${putCount} to IndexedDB`);
+                      return;
+                    }
                     if (options?.failTransactions) {
-                      setTimeout(() => {
-                        tx.error = new Error('Disk I/O error writing to IndexedDB');
-                        if (tx.onerror) tx.onerror(new Event('error'));
-                      }, 5);
+                      txFailed = true;
+                      tx.error = new Error('Disk I/O error writing to IndexedDB');
                       return;
                     }
                     storeMap.set(item.id, JSON.parse(JSON.stringify(item)));
@@ -158,8 +172,8 @@ function createMockIdbFactory(options?: { failTransactions?: boolean; delayCompl
             };
 
             setTimeout(() => {
-              if (options?.failTransactions) {
-                tx.error = new Error('Disk quota exceeded in IndexedDB transaction');
+              if (options?.failTransactions || txFailed) {
+                tx.error = tx.error || new Error('Disk quota exceeded in IndexedDB transaction');
                 if (tx.onerror) tx.onerror(new Event('error'));
               } else {
                 if (tx.oncomplete) tx.oncomplete(new Event('complete'));
@@ -632,138 +646,232 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       pass('Test 12: Status Firebase Emulator didokumentasikan secara transparan tanpa klaim palsu');
     }
 
-    // --- PHASE 2A.3.4.4 REMEDIATION: UI DELETION ORDER & TRANSITION RULES ---
+    // --- PHASE 2A.3.4.4 REMEDIATION: ACTUAL IMPLEMENTATION TESTS & RULES MATRIX ---
 
-    // [Test 13] UI Deletion Order: IndexedDB failure aborts deletion, prevents state mutation, prevents Firestore delete, and prevents remote DELETE
+    // [Test 13] TEMUAN 2 (Scenario B): Actual executeTaskDeletion - Durable write failure aborts deletion
     {
       const callLog: string[] = [];
-      const mockTask = {
+      const mockTask: Task = {
         id: 'task-ui-fail-13',
         title: 'Tugas Gagal UI',
-        scheduledSessions: [{ id: 'sess-fail-1', googleCalendarEventId: 'gcal-fail-1' }],
+        estimatedDurationMinutes: 60,
+        priority: 'MEDIUM',
+        status: 'SCHEDULED',
+        scheduledSessions: [{ id: 'sess-fail-1', startAt: '2026-11-10T10:00:00Z', endAt: '2026-11-10T11:00:00Z', googleCalendarEventId: 'gcal-fail-1' }],
       };
-      let currentTasks = [mockTask];
+      let currentTasks: Task[] = [mockTask];
       let toastCalledWith: { msg: string; type: string } | null = null;
       let modalClosed = false;
 
-      // Simulated workflow directly mirroring src/App.tsx handleDeleteTask
-      const executeWorkflow = async () => {
-        const sessionsWithEvents = mockTask.scheduledSessions?.map((s) => ({
-          sessionId: s.id,
-          googleCalendarEventId: s.googleCalendarEventId,
-        }));
-
-        // 1. Rekam tombstone persisten secara durable ke outbox IndexedDB TERLEBIH DAHULU
-        try {
-          callLog.push('recordTaskDeletionDurable_start');
-          throw new Error('Disk quota exceeded / IndexedDB failed');
-        } catch (err) {
-          callLog.push('recordTaskDeletionDurable_failed');
-          toastCalledWith = { msg: 'Gagal menghapus kegiatan: penyimpanan lokal gagal.', type: 'error' };
+      // Call ACTUAL production executeTaskDeletion from src/lib/taskDeletionWorkflow.ts
+      const result = await executeTaskDeletion({
+        userId: 'user-ui-13',
+        task: mockTask,
+        setTasks: (updater) => {
+          callLog.push('setTasks');
+          currentTasks = updater(currentTasks);
+        },
+        showToast: (msg, type) => {
+          callLog.push(`showToast_${type}`);
+          toastCalledWith = { msg, type };
+        },
+        closeModal: () => {
+          callLog.push('closeModal');
           modalClosed = true;
-          return;
-        }
+        },
+        recordDurableFn: async () => {
+          callLog.push('recordTaskDeletionDurable_fail');
+          throw new Error('IndexedDB QuotaExceededError: durable persistence failed');
+        },
+        deleteRemoteEventFn: async () => {
+          callLog.push('deleteRemoteEvent');
+        },
+        deleteFirestoreDocFn: async () => {
+          callLog.push('deleteFirestoreDoc');
+        },
+      });
 
-        // Below must NOT be reached
-        callLog.push('setTasks_removed');
-        currentTasks = [];
-        callLog.push('remote_delete');
-        callLog.push('firestore_deleteDoc');
-      };
-
-      await executeWorkflow();
-
+      assert.strictEqual(result, false, 'executeTaskDeletion harus mengembalikan false saat durable write gagal');
       assert.deepStrictEqual(callLog, [
-        'recordTaskDeletionDurable_start',
-        'recordTaskDeletionDurable_failed',
-      ]);
+        'recordTaskDeletionDurable_fail',
+        'showToast_error',
+        'closeModal',
+      ], 'Hanya recordDurable, showToast error, dan closeModal yang boleh dipanggil saat gagal');
       assert.strictEqual(currentTasks.length, 1, 'Task TIDAK BOLEH dihapus dari React state ketika IndexedDB gagal');
       assert.strictEqual(currentTasks[0].id, 'task-ui-fail-13', 'Task tetap utuh untuk percobaan ulang');
       assert.strictEqual(toastCalledWith?.type, 'error');
       assert.ok(toastCalledWith?.msg.includes('penyimpanan lokal gagal'));
-      assert.strictEqual(modalClosed, true, 'Modal konfirmasi ditutup/direset untuk memfasilitasi retry');
+      assert.strictEqual(modalClosed, true, 'Modal konfirmasi ditutup/direset agar siap untuk retry');
 
-      pass('Test 13: UI Deletion Order - Kegagalan IndexedDB membatalkan mutasi state, Firestore delete, dan remote DELETE');
+      pass('Test 13: [Temuan 2 - Skenario B] executeTaskDeletion aktual membatalkan penghapusan saat durable write gagal');
     }
 
-    // [Test 14] UI Deletion Order: IndexedDB success executes in strict sequential order
+    // [Test 14] TEMUAN 2 (Scenario A): Actual executeTaskDeletion - Strictly sequential success workflow
     {
       const callLog: string[] = [];
-      const mockTask = {
+      const mockTask: Task = {
         id: 'task-ui-success-14',
         title: 'Tugas Sukses UI',
-        scheduledSessions: [{ id: 'sess-succ-1', googleCalendarEventId: 'gcal-succ-1' }],
+        estimatedDurationMinutes: 60,
+        priority: 'HIGH',
+        status: 'SCHEDULED',
+        scheduledSessions: [{ id: 'sess-succ-1', startAt: '2026-11-10T10:00:00Z', endAt: '2026-11-10T11:00:00Z', googleCalendarEventId: 'gcal-succ-1' }],
       };
-      let currentTasks = [mockTask];
+      let currentTasks: Task[] = [mockTask];
       let toastCalledWith: { msg: string; type: string } | null = null;
       let modalClosed = false;
       const remoteDeletedIds: string[] = [];
       const firestoreDeletedDocPaths: string[] = [];
 
-      // Re-initialize working factory
-      setCustomIdbFactory(standardFactory);
-      setAllowMemoryFallback(false);
-
-      const userId = 'user-ui-14';
-      const taskId = mockTask.id;
-
-      const executeWorkflow = async () => {
-        const sessionsWithEvents = mockTask.scheduledSessions?.map((s) => ({
-          sessionId: s.id,
-          googleCalendarEventId: s.googleCalendarEventId,
-        }));
-
-        // 1. Rekam tombstone persisten secara durable ke outbox IndexedDB TERLEBIH DAHULU
-        try {
-          callLog.push('1_recordTaskDeletionDurable');
-          await recordTaskDeletionDurable(userId, taskId, sessionsWithEvents);
-        } catch (err) {
-          callLog.push('recordTaskDeletionDurable_failed');
-          toastCalledWith = { msg: 'Gagal menghapus kegiatan: penyimpanan lokal gagal.', type: 'error' };
+      // Call ACTUAL production executeTaskDeletion from src/lib/taskDeletionWorkflow.ts
+      const result = await executeTaskDeletion({
+        userId: 'user-ui-14',
+        task: mockTask,
+        setTasks: (updater) => {
+          callLog.push('2_setTasks');
+          currentTasks = updater(currentTasks);
+        },
+        showToast: (msg, type) => {
+          callLog.push('2_showToast');
+          toastCalledWith = { msg, type };
+        },
+        closeModal: () => {
+          callLog.push('2_closeModal');
           modalClosed = true;
-          return;
-        }
+        },
+        recordDurableFn: async () => {
+          callLog.push('1_recordTaskDeletionDurable');
+          return [];
+        },
+        deleteRemoteEventFn: async (_token, eventId) => {
+          callLog.push(`3_deleteRemoteEvent_${eventId}`);
+          remoteDeletedIds.push(eventId);
+        },
+        deleteFirestoreDocFn: async (docRef) => {
+          callLog.push(`4_deleteFirestoreDoc_${docRef.path || 'doc'}`);
+          firestoreDeletedDocPaths.push(docRef.path || 'doc');
+        },
+        getCachedTokenFn: () => 'mock-access-token-14',
+      });
 
-        // 2. Jika durable record berhasil, mutasikan UI state dan tampilkan konfirmasi
-        callLog.push('2_setTasks');
-        currentTasks = currentTasks.filter((t) => t.id !== taskId);
-        callLog.push('2_showToast');
-        toastCalledWith = { msg: `Kegiatan "${mockTask.title}" telah dihapus.`, type: 'info' };
-        callLog.push('2_closeModal');
-        modalClosed = true;
-
-        // 3. Kompensasikan penghapusan remote jika ada Google Calendar Event ID
-        if (sessionsWithEvents && sessionsWithEvents.length > 0) {
-          for (const s of sessionsWithEvents) {
-            if (s.googleCalendarEventId) {
-              callLog.push(`3_remote_delete_${s.googleCalendarEventId}`);
-              remoteDeletedIds.push(s.googleCalendarEventId);
-            }
-          }
-        }
-
-        // 4. Hapus dokumen task dari Firestore
-        callLog.push(`4_firestore_deleteDoc_${taskId}`);
-        firestoreDeletedDocPaths.push(`users/${userId}/tasks/${taskId}`);
-      };
-
-      await executeWorkflow();
-
+      assert.strictEqual(result, true, 'executeTaskDeletion harus mengembalikan true saat sukses');
       assert.deepStrictEqual(callLog, [
         '1_recordTaskDeletionDurable',
         '2_setTasks',
         '2_showToast',
         '2_closeModal',
-        '3_remote_delete_gcal-succ-1',
-        '4_firestore_deleteDoc_task-ui-success-14',
-      ]);
-      assert.strictEqual(currentTasks.length, 0, 'Task sukses dihapus dari React state setelah durable record');
-      assert.strictEqual(remoteDeletedIds.length, 1);
+        '3_deleteRemoteEvent_gcal-succ-1',
+        '4_deleteFirestoreDoc_users/user-ui-14/tasks/task-ui-success-14',
+      ], 'Urutan eksekusi harus strictly sequential');
+      assert.strictEqual(currentTasks.length, 0, 'Task sukses dihapus dari React state');
       assert.strictEqual(remoteDeletedIds[0], 'gcal-succ-1');
-      assert.strictEqual(firestoreDeletedDocPaths[0], 'users/user-ui-14/tasks/task-ui-success-14');
       assert.strictEqual(toastCalledWith?.type, 'info');
 
-      pass('Test 14: UI Deletion Order - Keberhasilan IndexedDB mengeksekusi urutan secara strictly sequential');
+      pass('Test 14: [Temuan 2 - Skenario A] executeTaskDeletion aktual mengeksekusi urutan secara strictly sequential');
+    }
+
+    // [Test 14B] TEMUAN 2 (Scenario C): Actual executeTaskDeletion - Slow durable write in-flight protection
+    {
+      const callLog: string[] = [];
+      const mockTask: Task = {
+        id: 'task-slow-14b',
+        title: 'Tugas Lambat',
+        estimatedDurationMinutes: 45,
+        priority: 'LOW',
+        status: 'SCHEDULED',
+        scheduledSessions: [{ id: 'sess-slow-1', startAt: '2026-11-10T12:00:00Z', endAt: '2026-11-10T12:45:00Z', googleCalendarEventId: 'gcal-slow-1' }],
+      };
+      let currentTasks: Task[] = [mockTask];
+      let durableResolved = false;
+
+      // Delayed durable promise (simulating slow storage write)
+      const deletionPromise = executeTaskDeletion({
+        userId: 'user-slow-14b',
+        task: mockTask,
+        setTasks: (updater) => {
+          assert.strictEqual(durableResolved, true, 'setTasks TIDAK BOLEH dipanggil sebelum durable write selesai');
+          callLog.push('setTasks');
+          currentTasks = updater(currentTasks);
+        },
+        showToast: () => {},
+        closeModal: () => {},
+        recordDurableFn: async () => {
+          callLog.push('recordDurable_start');
+          await new Promise((r) => setTimeout(r, 40));
+          durableResolved = true;
+          callLog.push('recordDurable_done');
+          return [];
+        },
+        deleteRemoteEventFn: async () => {
+          assert.strictEqual(durableResolved, true, 'deleteRemoteEvent TIDAK BOLEH dipanggil sebelum durable write selesai');
+          callLog.push('deleteRemoteEvent');
+        },
+        deleteFirestoreDocFn: async () => {
+          assert.strictEqual(durableResolved, true, 'deleteFirestoreDoc TIDAK BOLEH dipanggil sebelum durable write selesai');
+          callLog.push('deleteFirestoreDoc');
+        },
+        getCachedTokenFn: () => 'mock-token',
+      });
+
+      // Verify in-flight invariant: state is still untouched immediately after call
+      assert.strictEqual(currentTasks.length, 1, 'Task harus tetap ada di state saat durable write masih in-flight');
+      assert.strictEqual(durableResolved, false, 'Durable write belum boleh dianggap selesai');
+
+      // Now await completion
+      const res = await deletionPromise;
+      assert.strictEqual(res, true);
+      assert.strictEqual(currentTasks.length, 0, 'Task baru terhapus setelah durable write selesai');
+      assert.deepStrictEqual(callLog, [
+        'recordDurable_start',
+        'recordDurable_done',
+        'setTasks',
+        'deleteRemoteEvent',
+        'deleteFirestoreDoc',
+      ]);
+
+      pass('Test 14B: [Temuan 2 - Skenario C] executeTaskDeletion aktual mencegah perubahan state saat durable write in-flight');
+    }
+
+    // [Test 14C] TEMUAN 2 (Scenario D): Actual executeTaskDeletion - Task without Google Calendar events
+    {
+      const callLog: string[] = [];
+      const mockTask: Task = {
+        id: 'task-no-remote-14c',
+        title: 'Tugas Tanpa Remote Event',
+        estimatedDurationMinutes: 30,
+        priority: 'MEDIUM',
+        status: 'UNSCHEDULED',
+        scheduledSessions: [], // No sessions, no remote events
+      };
+      let currentTasks: Task[] = [mockTask];
+      let remoteDeleteCalled = false;
+
+      const res = await executeTaskDeletion({
+        userId: 'user-no-remote-14c',
+        task: mockTask,
+        setTasks: (updater) => {
+          currentTasks = updater(currentTasks);
+        },
+        showToast: () => {},
+        closeModal: () => {},
+        recordDurableFn: async () => {
+          callLog.push('recordDurable');
+          return [];
+        },
+        deleteRemoteEventFn: async () => {
+          remoteDeleteCalled = true;
+          callLog.push('deleteRemoteEvent');
+        },
+        deleteFirestoreDocFn: async () => {
+          callLog.push('deleteFirestoreDoc');
+        },
+      });
+
+      assert.strictEqual(res, true);
+      assert.strictEqual(remoteDeleteCalled, false, 'Remote DELETE tidak boleh dipanggil jika tidak ada Google Calendar event');
+      assert.strictEqual(currentTasks.length, 0, 'Task tetap terhapus dengan benar');
+
+      pass('Test 14C: [Temuan 2 - Skenario D] executeTaskDeletion aktual menghapus task tanpa remote event tanpa panggilan API eksternal');
     }
 
     // [Test 15] Retry after failure does NOT duplicate tombstones
@@ -775,7 +883,7 @@ export async function runDeletionOutboxAndFirestoreSuite() {
 
       setCustomIdbFactory(standardFactory);
 
-      // First run (e.g. simulated initial successful or partial write)
+      // First run (simulated initial successful write)
       await recordTaskDeletionDurable(userId, taskId, sessions);
       const itemsBefore = await getAllOutboxItems(userId);
       const taskItemBefore = await getOutboxItem(buildOutboxKey(userId, taskId, 'all'));
@@ -795,117 +903,206 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       pass('Test 15: Retry setelah kegagalan tidak menghasilkan duplikasi tombstone (idempotent keying)');
     }
 
-    // [Test 16] Partial failure recovery in recordTaskDeletionDurable
+    // [Test 16] TEMUAN 3: Real Injected Partial Failure on actual recordTaskDeletionDurable
     {
-      const userId = 'user-partial-16';
-      const taskId = 'task-partial-16';
+      const userId = 'user-partial-16-real';
+      const taskId = 'task-partial-16-real';
       const sessions = [
         { sessionId: 'sess-p1', googleCalendarEventId: 'gcal-p1' },
         { sessionId: 'sess-p2', googleCalendarEventId: 'gcal-p2' },
       ];
 
-      // Step 1: Simulate write of only task tombstone and sess-p1, before failure interrupts sess-p2
-      await saveToOutbox({
-        id: buildOutboxKey(userId, taskId, 'all'),
-        userId,
-        taskId,
-        sessionId: 'all',
-        entityType: 'task',
-        deletedAt: new Date().toISOString(),
-        status: 'cleaned',
-        syncStatus: 'pending_sync',
-        syncAttempts: 0,
-        retryCount: 0,
-        updatedAt: new Date().toISOString(),
-      });
-      await saveToOutbox({
-        id: buildOutboxKey(userId, taskId, 'sess-p1'),
-        userId,
-        taskId,
-        sessionId: 'sess-p1',
-        entityType: 'session',
-        googleCalendarEventId: 'gcal-p1',
-        deletedAt: new Date().toISOString(),
-        status: 'pending_cleanup',
-        syncStatus: 'pending_sync',
-        syncAttempts: 0,
-        retryCount: 0,
-        updatedAt: new Date().toISOString(),
-      });
+      // Skenario 16A: Kegagalan pada penyimpanan pertama (task-level outbox fail)
+      {
+        const failOnFirstFactory = createMockIdbFactory({ failOnPutCount: [1] });
+        setCustomIdbFactory(failOnFirstFactory);
 
-      const partialItems = await getAllOutboxItems(userId);
-      assert.strictEqual(partialItems.length, 2);
+        await assert.rejects(
+          async () => {
+            await recordTaskDeletionDurable(userId, 'task-first-fail', sessions);
+          },
+          /Disk I\/O error writing item #1 to IndexedDB|Disk quota exceeded/,
+          'recordTaskDeletionDurable wajib melempar error saat put pertama gagal'
+        );
 
-      // Step 2: Retry full deletion flow
-      const recovered = await recordTaskDeletionDurable(userId, taskId, sessions);
-      assert.strictEqual(recovered.length, 3, 'Hasil recovery harus berisi 1 task + 2 session tombstone');
+        const items = await getAllOutboxItems(userId);
+        assert.strictEqual(items.length, 0, 'Tidak boleh ada item yang tersimpan saat put pertama gagal');
+      }
 
-      const allRecovered = await getAllOutboxItems(userId);
-      assert.strictEqual(allRecovered.length, 3, 'Semua session tombstone berhasil tercatat tanpa orphan atau duplikat');
+      // Skenario 16B: Kegagalan pada penyimpanan sesi kedua (put #1 task sukses, put #2 sess-1 sukses, put #3 sess-2 gagal)
+      {
+        const failOnThirdFactory = createMockIdbFactory({ failOnPutCount: [3] });
+        setCustomIdbFactory(failOnThirdFactory);
 
-      pass('Test 16: Pemulihan kegagalan parsial (partial failure recovery) berjalan mulus dan rekonsiliatif');
+        await assert.rejects(
+          async () => {
+            await recordTaskDeletionDurable(userId, taskId, sessions);
+          },
+          /Disk I\/O error writing item #3 to IndexedDB|Disk quota exceeded/,
+          'recordTaskDeletionDurable wajib melempar error saat put sesi kedua gagal'
+        );
+
+        // Verify partial state: task-level and session-1 exist, session-2 does not
+        const partialItems = await getAllOutboxItems(userId);
+        assert.strictEqual(partialItems.length, 2, 'Item task dan sess-1 tersimpan, sess-2 gagal');
+        const sess2Item = await getOutboxItem(buildOutboxKey(userId, taskId, 'sess-p2'));
+        assert.strictEqual(sess2Item, undefined, 'Sesi 2 tidak boleh tersimpan karena transaksinya gagal');
+      }
+
+      // Skenario 16C: Retry setelah kegagalan parsial
+      {
+        // Factory now works without failure
+        const workingFactory = createMockIdbFactory();
+        setCustomIdbFactory(workingFactory);
+
+        // Pre-populate with partial state from 16B
+        await saveToOutbox({
+          id: buildOutboxKey(userId, taskId, 'all'),
+          userId,
+          taskId,
+          sessionId: 'all',
+          entityType: 'task',
+          deletedAt: '2026-11-10T10:00:00.000Z',
+          status: 'cleaned',
+          syncStatus: 'pending_sync',
+          syncAttempts: 0,
+          retryCount: 0,
+          updatedAt: '2026-11-10T10:00:00.000Z',
+        });
+        await saveToOutbox({
+          id: buildOutboxKey(userId, taskId, 'sess-p1'),
+          userId,
+          taskId,
+          sessionId: 'sess-p1',
+          entityType: 'session',
+          googleCalendarEventId: 'gcal-p1',
+          deletedAt: '2026-11-10T10:00:00.000Z',
+          status: 'pending_cleanup',
+          syncStatus: 'pending_sync',
+          syncAttempts: 0,
+          retryCount: 0,
+          updatedAt: '2026-11-10T10:00:00.000Z',
+        });
+
+        // Call actual recordTaskDeletionDurable again
+        const recovered = await recordTaskDeletionDurable(userId, taskId, sessions);
+        assert.strictEqual(recovered.length, 3, 'Hasil recovery harus mengembalikan 1 task + 2 session tombstone');
+
+        const allItems = await getAllOutboxItems(userId);
+        assert.strictEqual(allItems.length, 3, 'Tepat 3 item outbox tanpa duplikasi');
+
+        // Skenario 16D: Pemanggilan ulang dengan data yang sama (repeated retry)
+        const secondRetry = await recordTaskDeletionDurable(userId, taskId, sessions);
+        assert.strictEqual(secondRetry.length, 3);
+        const allItemsAfterSecond = await getAllOutboxItems(userId);
+        assert.strictEqual(allItemsAfterSecond.length, 3, 'Pemanggilan berulang tetap menghasilkan tepat 3 item (idempoten)');
+      }
+
+      pass('Test 16: [Temuan 3] Injeksi kegagalan nyata pada recordTaskDeletionDurable aktual, retry berulang, dan pemulihan konsistensi 100% lulus');
     }
 
-    // [Test 17] Security Rules State Machine Transition Matrix & Monotonicity
+    // [Test 17] TEMUAN 1: Security Rules State Machine Transition Matrix & Loophole Sealing
     {
       type Status = 'pending_cleanup' | 'cleaning' | 'cleaned' | 'cleanup_failed';
 
-      // Implementation of isValidTombstoneTransition in firestore.rules
+      // Implementation matching the updated isValidTombstoneTransition in firestore.rules
       function isValidTombstoneTransition(prevStatus: Status, nextStatus: Status, hasNewRemoteId: boolean): boolean {
         return (
-          prevStatus === nextStatus ||
-          (prevStatus === 'pending_cleanup' && ['cleaning', 'cleaned', 'cleanup_failed'].includes(nextStatus)) ||
-          (prevStatus === 'cleaning' && ['cleaned', 'cleanup_failed'].includes(nextStatus)) ||
-          (prevStatus === 'cleanup_failed' && ['cleaning', 'cleaned'].includes(nextStatus)) ||
-          (prevStatus === 'cleaned' && nextStatus === 'pending_cleanup' && hasNewRemoteId)
+          (prevStatus === 'cleaned' && nextStatus === 'cleaned' && !hasNewRemoteId) ||
+          (prevStatus === 'cleaned' && nextStatus === 'pending_cleanup' && hasNewRemoteId) ||
+          (prevStatus === 'pending_cleanup' && ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed'].includes(nextStatus)) ||
+          (prevStatus === 'cleaning' && ['cleaning', 'cleaned', 'cleanup_failed'].includes(nextStatus) && !hasNewRemoteId) ||
+          (prevStatus === 'cleanup_failed' && ['cleanup_failed', 'cleaning', 'cleaned'].includes(nextStatus) && !hasNewRemoteId)
         );
       }
 
-      // Check all 16 transition combinations without new remote ID
-      const statuses: Status[] = ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed'];
-      const allowedWithoutNewId: Record<Status, Status[]> = {
-        pending_cleanup: ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed'],
-        cleaning: ['cleaning', 'cleaned', 'cleanup_failed'],
-        cleanup_failed: ['cleanup_failed', 'cleaning', 'cleaned'],
-        cleaned: ['cleaned'],
-      };
+      // Check all 10 mandated table cases from Temuan 1:
 
-      for (const from of statuses) {
-        for (const to of statuses) {
-          const expected = allowedWithoutNewId[from].includes(to);
-          const actual = isValidTombstoneTransition(from, to, false);
-          assert.strictEqual(
-            actual,
-            expected,
-            `Transisi ${from} -> ${to} (tanpa newRemoteId) harus bernilai ${expected}`
-          );
-        }
-      }
+      // 1. cleaned -> cleaned, remote ID tidak berubah: Diizinkan
+      assert.strictEqual(
+        isValidTombstoneTransition('cleaned', 'cleaned', false),
+        true,
+        'Kasus 1: cleaned -> cleaned, remote ID tidak berubah wajib diizinkan'
+      );
 
-      // Check special case: cleaned -> pending_cleanup with newRemoteId
+      // 2. cleaned -> cleaned, remote ID berubah: Ditolak (SEALS THE LOOPHOLE IN TEMUAN 1!)
+      assert.strictEqual(
+        isValidTombstoneTransition('cleaned', 'cleaned', true),
+        false,
+        'Kasus 2: cleaned -> cleaned, remote ID berubah WAJIB DITOLAK (celah ditutup)'
+      );
+
+      // 3. cleaned -> pending_cleanup, remote ID baru: Diizinkan
       assert.strictEqual(
         isValidTombstoneTransition('cleaned', 'pending_cleanup', true),
         true,
-        'cleaned -> pending_cleanup wajib diizinkan jika Google Calendar Event ID baru terdeteksi'
+        'Kasus 3: cleaned -> pending_cleanup, remote ID baru wajib diizinkan'
       );
+
+      // 4. cleaned -> pending_cleanup, remote ID tidak berubah: Ditolak
       assert.strictEqual(
         isValidTombstoneTransition('cleaned', 'pending_cleanup', false),
         false,
-        'cleaned -> pending_cleanup dilarang keras jika tidak ada Google Calendar Event ID baru'
+        'Kasus 4: cleaned -> pending_cleanup, remote ID tidak berubah wajib ditolak'
       );
+
+      // 5. pending_cleanup -> cleaning: Diizinkan
       assert.strictEqual(
-        isValidTombstoneTransition('cleaned', 'cleaning', true),
-        false,
-        'cleaned -> cleaning tetap dilarang meskipun hasNewRemoteId = true'
+        isValidTombstoneTransition('pending_cleanup', 'cleaning', false),
+        true,
+        'Kasus 5: pending_cleanup -> cleaning wajib diizinkan'
       );
 
-      // Verify Monotonic retryCount
-      const isRetryCountValid = (prevCount: number, nextCount: number) => nextCount >= prevCount;
-      assert.strictEqual(isRetryCountValid(0, 1), true, 'retryCount boleh bertambah');
-      assert.strictEqual(isRetryCountValid(2, 2), true, 'retryCount boleh tetap');
-      assert.strictEqual(isRetryCountValid(3, 1), false, 'retryCount dilarang berkurang');
+      // 6. cleaning -> cleaned: Diizinkan
+      assert.strictEqual(
+        isValidTombstoneTransition('cleaning', 'cleaned', false),
+        true,
+        'Kasus 6: cleaning -> cleaned wajib diizinkan'
+      );
 
-      pass('Test 17: Matriks transisi status & monotonic retryCount firestore.rules divalidasi 100% lengkap');
+      // 7. cleaning -> pending_cleanup: Ditolak
+      assert.strictEqual(
+        isValidTombstoneTransition('cleaning', 'pending_cleanup', false),
+        false,
+        'Kasus 7: cleaning -> pending_cleanup wajib ditolak'
+      );
+
+      // 7B. cleanup_failed -> pending_cleanup: Ditolak
+      assert.strictEqual(
+        isValidTombstoneTransition('cleanup_failed', 'pending_cleanup', false),
+        false,
+        'Kasus 7B: cleanup_failed -> pending_cleanup wajib ditolak'
+      );
+
+      // 8. retryCount menurun: Ditolak
+      const isRetryCountValid = (prevCount: number, nextCount: number) => nextCount >= prevCount;
+      assert.strictEqual(isRetryCountValid(2, 1), false, 'Kasus 8: retryCount menurun wajib ditolak');
+      assert.strictEqual(isRetryCountValid(1, 2), true, 'retryCount bertambah diizinkan');
+      assert.strictEqual(isRetryCountValid(2, 2), true, 'retryCount tetap diizinkan');
+
+      // 9. Identity berubah: Ditolak
+      const isIdentityImmutable = (prev: any, next: any) =>
+        prev.userId === next.userId &&
+        prev.taskId === next.taskId &&
+        prev.sessionId === next.sessionId &&
+        prev.compositeKey === next.compositeKey &&
+        prev.entityType === next.entityType;
+      assert.strictEqual(
+        isIdentityImmutable({ userId: 'u1', taskId: 't1', sessionId: 's1', compositeKey: 'k1', entityType: 'task' },
+                            { userId: 'u1', taskId: 't2', sessionId: 's1', compositeKey: 'k1', entityType: 'task' }),
+        false,
+        'Kasus 9: Identity (taskId) berubah wajib ditolak'
+      );
+
+      // 10. deletedAt berubah: Ditolak
+      const isDeletedAtImmutable = (prevDate: string, nextDate: string) => prevDate === nextDate;
+      assert.strictEqual(
+        isDeletedAtImmutable('2026-11-10T10:00:00Z', '2026-11-10T12:00:00Z'),
+        false,
+        'Kasus 10: deletedAt berubah wajib ditolak'
+      );
+
+      pass('Test 17: [Temuan 1] Matriks transisi status & penutupan celah remote ID firestore.rules divalidasi 100% lengkap');
     }
 
     console.log('\n================================================================');

@@ -34,11 +34,11 @@ service cloud.firestore {
     }
 
     function isValidTombstoneTransition(prevStatus, nextStatus, hasNewRemoteId) {
-      return (prevStatus == nextStatus)
-        || (prevStatus == 'pending_cleanup' && nextStatus in ['cleaning', 'cleaned', 'cleanup_failed'])
-        || (prevStatus == 'cleaning' && nextStatus in ['cleaned', 'cleanup_failed'])
-        || (prevStatus == 'cleanup_failed' && nextStatus in ['cleaning', 'cleaned'])
-        || (prevStatus == 'cleaned' && nextStatus == 'pending_cleanup' && hasNewRemoteId);
+      return (prevStatus == 'cleaned' && nextStatus == 'cleaned' && !hasNewRemoteId)
+        || (prevStatus == 'cleaned' && nextStatus == 'pending_cleanup' && hasNewRemoteId)
+        || (prevStatus == 'pending_cleanup' && nextStatus in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed'])
+        || (prevStatus == 'cleaning' && nextStatus in ['cleaning', 'cleaned', 'cleanup_failed'] && !hasNewRemoteId)
+        || (prevStatus == 'cleanup_failed' && nextStatus in ['cleanup_failed', 'cleaning', 'cleaned'] && !hasNewRemoteId);
     }
 
     // Subcollections under /users/{userId}
@@ -120,6 +120,8 @@ service cloud.firestore {
           && incoming().compositeKey == existing().compositeKey
           && incoming().entityType == existing().entityType
           && incoming().deletedAt == existing().deletedAt
+          // Existing remote event ID cannot be erased or nulled
+          && (existing().get('googleCalendarEventId', null) == null || incoming().get('googleCalendarEventId', null) != null)
           // Monotonic retry count:
           && incoming().retryCount >= existing().retryCount
           // Strict status transition state machine:
