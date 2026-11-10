@@ -53,12 +53,14 @@ import {
 } from './lib/firebase';
 import {
   fetchGoogleCalendarEvents,
+  deleteGoogleCalendarEvent,
   GoogleCalendarApiError,
   classifyGoogleCalendarError,
   sanitizeSensitiveText,
 } from './lib/googleCalendar';
 import { CalendarOperationGuard } from './lib/calendarOperationGuard';
 import { executeSchedulePush, reconcileTaskSessionsWithRemote } from './lib/calendarPushService';
+import { recordTaskDeletion, processPendingDeletionCleanups } from './lib/deletionTombstone';
 import {
   getInitialKeepNotes,
   convertKeepNoteToTask,
@@ -199,6 +201,7 @@ export default function App() {
         setUserId(user.uid);
         if (token) {
           setHasGoogleAccessToken(true);
+          processPendingDeletionCleanups({ token, userId: user.uid }).catch(() => {});
         } else {
           setHasGoogleAccessToken(false);
         }
@@ -586,6 +589,25 @@ export default function App() {
         setTasks((prev) => prev.filter((t) => t.id !== taskId));
         showToast(`Kegiatan "${taskToDelete.title}" telah dihapus.`, 'info');
         setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+
+        // 1. Rekam tombstone persisten untuk task dan seluruh sesinya
+        const sessionsWithEvents = taskToDelete.scheduledSessions?.map((s) => ({
+          sessionId: s.id,
+          googleCalendarEventId: s.googleCalendarEventId,
+        }));
+        recordTaskDeletion(userId || 'user-default', taskId, sessionsWithEvents);
+
+        // 2. Kompensasikan penghapusan remote jika ada Google Calendar Event ID
+        const cachedToken = getCachedAccessToken();
+        if (cachedToken && sessionsWithEvents && sessionsWithEvents.length > 0) {
+          for (const s of sessionsWithEvents) {
+            if (s.googleCalendarEventId) {
+              deleteGoogleCalendarEvent(cachedToken, s.googleCalendarEventId).catch((err) => {
+                console.warn('Background remote delete compensation failed:', err);
+              });
+            }
+          }
+        }
 
         if (userId && userId !== 'user-default') {
           try {

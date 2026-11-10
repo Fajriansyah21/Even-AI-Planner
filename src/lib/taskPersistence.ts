@@ -3,6 +3,8 @@ import { Task, TaskScheduleSession, CalendarEvent } from '../types';
 import { db, sanitizeForFirestore, handleFirestoreError, OperationType } from './firebase';
 import { doc, setDoc } from 'firebase/firestore';
 
+import { isSessionDeleted, recordSessionDeletion } from './deletionTombstone';
+
 export interface PersistScheduledTaskOptions {
   task: Task;
   userId: string | null;
@@ -12,6 +14,12 @@ export interface PersistScheduledTaskOptions {
   isUpdate?: boolean;
   saveToStorage?: (task: Task, userId: string) => Promise<void>;
   getCurrentTask?: () => Task | undefined;
+  currentTask?: Task;
+  allTasks?: Task[];
+}
+
+export interface MergeTaskOptions {
+  userId?: string | null;
 }
 
 /**
@@ -30,13 +38,29 @@ export interface PersistScheduledTaskOptions {
  * 4. Sync Status Resolution:
  *    - Status 'synced' yang sudah terkonfirmasi tidak boleh diturunkan kembali ke 'pending' atau 'failed'.
  *    - Status 'needs_reconciliation' dipertahankan jika belum terkonfirmasi remote ID.
- * 5. Penanganan Sesi yang Dihapus / Diubah:
- *    - Jika suatu sesi dihapus dari currentTask saat push berlangsung, namun push telah telanjur memperoleh
- *      ID remote di Google Calendar, sesi tersebut dipertahankan agar ID remote tidak menjadi orphan.
+ * 5. User Deletion Intent Wins (NO RESURRECTION):
+ *    - Jika suatu sesi atau task tercatat di Deletion Tombstone, sesi tersebut DILARANG dikembalikan (resurrected).
+ *    - Jika sesi yang dihapus memiliki remote ID, remote ID dicatat ke tombstone untuk kompensasi pembersihan remote.
  */
-export function mergeTaskWithCurrent(currentTask: Task, pushingTask: Task): Task {
+export function mergeTaskWithCurrent(
+  currentTask: Task,
+  pushingTask: Task,
+  options?: MergeTaskOptions
+): Task {
   if (!currentTask || currentTask.id !== pushingTask.id) {
     return pushingTask;
+  }
+
+  const safeUser = options?.userId || currentTask.userId || pushingTask.userId;
+
+  // Jika keseluruhan task telah dihapus pengguna, jangan bangkitkan kembali
+  if (isSessionDeleted(safeUser, pushingTask.id)) {
+    return {
+      ...currentTask,
+      status: 'DELETED' as any,
+      scheduledSessions: [],
+      updatedAt: new Date().toISOString(),
+    };
   }
 
   const currentSessions = currentTask.scheduledSessions || [];
@@ -48,6 +72,12 @@ export function mergeTaskWithCurrent(currentTask: Task, pushingTask: Task): Task
   // 1. Iterasi seluruh sesi pada task terkini (currentTask)
   for (const currSess of currentSessions) {
     processedSessionIds.add(currSess.id);
+
+    // Periksa apakah sesi ini telah dihapus oleh pengguna
+    if (isSessionDeleted(safeUser, pushingTask.id, currSess.id)) {
+      continue;
+    }
+
     const pushSess = pushingSessions.find((s) => s.id === currSess.id);
 
     if (!pushSess) {
@@ -101,10 +131,18 @@ export function mergeTaskWithCurrent(currentTask: Task, pushingTask: Task): Task
     });
   }
 
-  // 2. Jika sesi dalam pushingTask telah memperoleh remote ID namun dihapus dari currentTask:
-  // Pertahankan sesi tersebut agar ID remote tidak hilang dan tidak menjadi yatim di Google Calendar
+  // 2. Periksa sesi dalam pushingTask yang tidak ada di currentTask
   for (const pushSess of pushingSessions) {
     if (!processedSessionIds.has(pushSess.id)) {
+      // Jika sesi ini telah dihapus oleh pengguna:
+      // USER DELETION INTENT WINS: Sesi DILARANG dihidupkan kembali (NO RESURRECTION).
+      if (isSessionDeleted(safeUser, pushingTask.id, pushSess.id)) {
+        if (pushSess.googleCalendarEventId) {
+          recordSessionDeletion(safeUser, pushingTask.id, pushSess.id, pushSess.googleCalendarEventId);
+        }
+        continue;
+      }
+
       const hasPushRemoteId =
         typeof pushSess.googleCalendarEventId === 'string' &&
         pushSess.googleCalendarEventId.trim().length > 0;
@@ -138,33 +176,50 @@ export function mergeTaskWithCurrent(currentTask: Task, pushingTask: Task): Task
  * Menyimpan tugas secara persisten ke state React dan Firestore (jika terautentikasi),
  * serta menambahkan acara kalender yang berhasil dibuat.
  *
- * Menerapkan Safe Merge:
- * - Mengambil state task terbaru dari React state sebelum melakukan persistensi.
- * - Menggunakan mergeTaskWithCurrent() untuk menyatukan remote ID baru tanpa menimpa data task terbaru.
+ * Menerapkan Deterministik Safe Merge & Pure Functional Updaters:
+ * - Menentukan state awal task terkini secara otoritatif sebelum mutasi.
+ * - Menggunakan functional updater murni tanpa side effect di dalam setState callback.
  * - Menjamin konsistensi 100% antara state React dan dokumen Firestore.
  */
 export async function persistScheduledTask(options: PersistScheduledTaskOptions): Promise<Task> {
-  const { task, userId, newCalendarEvents, setTasks, setEvents, isUpdate = true, getCurrentTask } = options;
+  const {
+    task,
+    userId,
+    newCalendarEvents,
+    setTasks,
+    setEvents,
+    isUpdate = true,
+    getCurrentTask,
+    currentTask,
+    allTasks,
+  } = options;
 
-  let mergedResult: Task = task;
+  // 1. Dapatkan task otoritatif saat ini sebelum persistence
+  const authoritativeTask =
+    currentTask ||
+    getCurrentTask?.() ||
+    (allTasks ? allTasks.find((t) => t.id === task.id) : undefined);
 
-  // 1. Simpan ke React task state dengan safe merge
-  setTasks((prev) => {
-    const existing = prev.find((t) => t.id === task.id);
-    if (existing) {
-      mergedResult = mergeTaskWithCurrent(existing, task);
-      return prev.map((t) => (t.id === task.id ? mergedResult : t));
-    }
-    const externalCurrent = getCurrentTask?.();
-    if (externalCurrent && externalCurrent.id === task.id) {
-      mergedResult = mergeTaskWithCurrent(externalCurrent, task);
-    } else {
-      mergedResult = task;
-    }
-    return [mergedResult, ...prev];
-  });
+  const initialMerged = authoritativeTask
+    ? mergeTaskWithCurrent(authoritativeTask, task, { userId })
+    : task;
 
-  // 2. Tambahkan agenda kalender baru yang berhasil dibuat (jika ada)
+  let mergedResult = initialMerged;
+
+  // 2. Simpan ke React task state dengan updater fungsional murni jika setTasks disediakan
+  if (setTasks) {
+    setTasks((prev) => {
+      const existingInPrev = prev.find((t) => t.id === task.id);
+      if (existingInPrev) {
+        const finalMerged = mergeTaskWithCurrent(existingInPrev, initialMerged, { userId });
+        mergedResult = finalMerged;
+        return prev.map((t) => (t.id === task.id ? finalMerged : t));
+      }
+      return [initialMerged, ...prev];
+    });
+  }
+
+  // 3. Tambahkan agenda kalender baru yang berhasil dibuat (jika ada)
   if (newCalendarEvents && newCalendarEvents.length > 0 && setEvents) {
     setEvents((prev) => {
       const existingIds = new Set(prev.map((e) => e.id));
@@ -173,7 +228,7 @@ export async function persistScheduledTask(options: PersistScheduledTaskOptions)
     });
   }
 
-  // 3. Persistensi ke Firestore menggunakan hasil merged yang sama persis
+  // 4. Persistensi ke Firestore menggunakan hasil merged deterministik
   if (userId && userId !== 'user-default') {
     try {
       if (options.saveToStorage) {

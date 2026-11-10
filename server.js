@@ -1513,7 +1513,7 @@ function createAiPlanRateLimiter(options) {
 var __filename = fileURLToPath(import.meta.url);
 var __dirname = path.dirname(__filename);
 var isProduction = process.env.NODE_ENV === "production";
-var PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3e3;
+var PORT = isProduction && process.env.PORT ? parseInt(process.env.PORT, 10) : 3e3;
 async function startServer() {
   const app = express();
   app.set("trust proxy", 1);
@@ -1912,7 +1912,10 @@ Catatan asli: "${trimmedPrompt}"`;
   if (!isProduction) {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false
+      },
       appType: "spa"
     });
     app.use(vite.middlewares);

@@ -128,6 +128,15 @@ export class CalendarOperationGuard {
   }
 
   /**
+   * Builds composite key ensuring sessions with identical IDs across different tasks/users do not collide.
+   */
+  public static buildCompositeKey(sessionId: string, taskId?: string, userId?: string): string {
+    const safeUser = userId && userId.trim() ? userId : 'all';
+    const safeTask = taskId && taskId.trim() ? taskId : 'all';
+    return `${safeUser}:${safeTask}:${sessionId}`;
+  }
+
+  /**
    * Registers a session currently being pushed by a specific push ticket.
    * If a promise is provided, concurrent operations for the same session can await or inspect it.
    */
@@ -135,9 +144,11 @@ export class CalendarOperationGuard {
     sessionId: string,
     taskId: string,
     pushId: number,
-    promise?: Promise<{ id: string; htmlLink?: string }>
+    promise?: Promise<{ id: string; htmlLink?: string }>,
+    userId?: string
   ): void {
-    this.inFlightSessions.set(sessionId, {
+    const key = CalendarOperationGuard.buildCompositeKey(sessionId, taskId, userId);
+    this.inFlightSessions.set(key, {
       sessionId,
       taskId,
       pushId,
@@ -148,19 +159,32 @@ export class CalendarOperationGuard {
 
   /**
    * Records that a session push successfully obtained a remote Google Calendar event ID.
-   * This ensures subsequent or concurrent pushes for the same session reuse the existing ID.
+   * Discards late completions if the operation has been superseded or disconnected.
    */
-  public recordSessionSuccess(sessionId: string, remoteId: string, htmlLink?: string): void {
-    const existing = this.inFlightSessions.get(sessionId);
+  public recordSessionSuccess(
+    sessionId: string,
+    taskId: string,
+    remoteId: string,
+    htmlLink?: string,
+    userId?: string,
+    pushId?: number
+  ): void {
+    // Late completion protection: If push is stale/superseded, reject writing to guard
+    if (this.pushOpId > 0 && pushId !== undefined && !this.isPushActive(pushId)) {
+      return;
+    }
+
+    const key = CalendarOperationGuard.buildCompositeKey(sessionId, taskId, userId);
+    const existing = this.inFlightSessions.get(key);
     if (existing) {
       existing.remoteId = remoteId;
       existing.htmlLink = htmlLink;
       existing.status = 'synced';
-    } else {
-      this.inFlightSessions.set(sessionId, {
+    } else if (this.pushOpId === 0 || pushId === undefined || this.isPushActive(pushId)) {
+      this.inFlightSessions.set(key, {
         sessionId,
-        taskId: '',
-        pushId: this.pushOpId,
+        taskId,
+        pushId: pushId ?? this.pushOpId,
         remoteId,
         htmlLink,
         status: 'synced',
@@ -171,25 +195,59 @@ export class CalendarOperationGuard {
   /**
    * Records failure for a session push.
    */
-  public recordSessionFailure(sessionId: string): void {
-    const existing = this.inFlightSessions.get(sessionId);
+  public recordSessionFailure(
+    sessionId: string,
+    taskId: string,
+    userId?: string,
+    pushId?: number
+  ): void {
+    if (this.pushOpId > 0 && pushId !== undefined && !this.isPushActive(pushId)) {
+      return;
+    }
+
+    const key = CalendarOperationGuard.buildCompositeKey(sessionId, taskId, userId);
+    const existing = this.inFlightSessions.get(key);
     if (existing && existing.status === 'in_flight') {
       existing.status = 'failed';
     }
   }
 
   /**
-   * Gets the active in-flight or successfully synced session record.
+   * Gets the active in-flight or successfully synced session record using composite key.
+   * Also supports fallback lookup by sessionId alone for backwards compatibility.
    */
-  public getInFlightSession(sessionId: string): InFlightSessionRecord | undefined {
-    return this.inFlightSessions.get(sessionId);
+  public getInFlightSession(
+    sessionId: string,
+    taskId?: string,
+    userId?: string
+  ): InFlightSessionRecord | undefined {
+    const key = CalendarOperationGuard.buildCompositeKey(sessionId, taskId, userId);
+    const exactMatch = this.inFlightSessions.get(key);
+    if (exactMatch) return exactMatch;
+
+    // Fallback: If taskId not supplied, search by sessionId
+    if (!taskId) {
+      for (const [k, record] of this.inFlightSessions.entries()) {
+        if (record.sessionId === sessionId) {
+          return record;
+        }
+      }
+    }
+    return undefined;
   }
 
   /**
-   * Clears the in-flight state for a single session.
+   * Clears the in-flight state for a single session using composite key.
    */
-  public clearSessionState(sessionId: string): void {
-    this.inFlightSessions.delete(sessionId);
+  public clearSessionState(sessionId: string, taskId?: string, userId?: string): void {
+    const key = CalendarOperationGuard.buildCompositeKey(sessionId, taskId, userId);
+    this.inFlightSessions.delete(key);
+    // Also remove any matching sessionId fallback
+    for (const [k, record] of this.inFlightSessions.entries()) {
+      if (record.sessionId === sessionId && (!taskId || record.taskId === taskId)) {
+        this.inFlightSessions.delete(k);
+      }
+    }
   }
 
   /**

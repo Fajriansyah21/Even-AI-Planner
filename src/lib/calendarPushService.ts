@@ -9,8 +9,14 @@ import {
   classifyGoogleCalendarError,
   sanitizeSensitiveText,
   GoogleCalendarEventInput,
+  deleteGoogleCalendarEvent,
 } from './googleCalendar';
 import { persistScheduledTask } from './taskPersistence';
+import {
+  isSessionDeleted,
+  recordSessionDeletion,
+  updateTombstone,
+} from './deletionTombstone';
 
 export interface ExecuteSchedulePushParams {
   token: string;
@@ -26,6 +32,11 @@ export interface ExecuteSchedulePushParams {
     event: GoogleCalendarEventInput,
     signal?: AbortSignal
   ) => Promise<{ id: string; htmlLink?: string }>;
+  deleteEventFn?: (
+    accessToken: string,
+    googleEventId: string,
+    signal?: AbortSignal
+  ) => Promise<void>;
   saveToStorage?: (task: Task, userId: string) => Promise<void>;
   isTaskUpdate?: boolean;
   description?: string;
@@ -93,6 +104,13 @@ export async function executeSchedulePush(
       break;
     }
 
+    // 0. User Deletion Intent Wins (Skenario A):
+    // Jika sesi ini telah dihapus oleh pengguna sebelum POST dikirim, BATALKAN POST
+    if (isSessionDeleted(userId, task.id, sess.id)) {
+      guard?.clearSessionState(sess.id, task.id, userId || 'user-default');
+      continue;
+    }
+
     const hasValidRemoteId =
       typeof sess.googleCalendarEventId === 'string' &&
       sess.googleCalendarEventId.trim().length > 0;
@@ -105,7 +123,7 @@ export async function executeSchedulePush(
 
     // 2. Proteksi Concurrency Sesi yang Sama:
     // Jika guard telah mencatat remote ID untuk sesi ini (dari operasi lain atau concurrent push)
-    const inFlightRecord = guard?.getInFlightSession(sess.id);
+    const inFlightRecord = guard?.getInFlightSession(sess.id, task.id, userId || 'user-default');
     if (inFlightRecord?.remoteId) {
       const syncedSess: TaskScheduleSession = {
         ...sess,
@@ -209,11 +227,56 @@ export async function executeSchedulePush(
         pushTicket.signal
       );
 
-      // Daftarkan sesi in-flight ke guard untuk koordinasi antar-push konkuren
-      guard?.registerInFlightSession(sess.id, task.id, pushTicket.pushId, dispatchPromise);
+      // Daftarkan sesi in-flight ke guard dengan composite key untuk koordinasi antar-push konkuren
+      guard?.registerInFlightSession(
+        sess.id,
+        task.id,
+        pushTicket.pushId,
+        dispatchPromise,
+        userId || 'user-default'
+      );
 
       const created = await dispatchPromise;
-      guard?.recordSessionSuccess(sess.id, created.id, created.htmlLink);
+
+      // User Deletion Intent Wins (Skenario B, C, D):
+      // Periksa apakah selama POST sedang in-flight, pengguna menghapus sesi ini!
+      if (isSessionDeleted(userId, task.id, sess.id)) {
+        guard?.clearSessionState(sess.id, task.id, userId || 'user-default');
+
+        // Rekam deletion tombstone dengan Google Calendar Event ID yang baru didapat
+        const tombstone = recordSessionDeletion(userId, task.id, sess.id, created.id);
+
+        // Jalankan Remote Event Compensation (DELETE) segera
+        const activeDeleteFn = params.deleteEventFn || deleteGoogleCalendarEvent;
+        try {
+          await activeDeleteFn(token, created.id);
+          updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
+        } catch (cleanupErr: any) {
+          const status = cleanupErr?.status || cleanupErr?.classification?.status;
+          if (status === 404 || status === 410) {
+            updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
+          } else {
+            updateTombstone(tombstone.id, {
+              status: 'cleanup_failed',
+              lastError: cleanupErr?.message || 'Remote DELETE compensation failed',
+              retryCount: (tombstone.retryCount || 0) + 1,
+              lastAttemptAt: new Date().toISOString(),
+            });
+          }
+        }
+
+        // Sesi TIDAK dimasukkan ke updatedSessions atau newCalendarEvents (NO RESURRECTION)
+        continue;
+      }
+
+      guard?.recordSessionSuccess(
+        sess.id,
+        task.id,
+        created.id,
+        created.htmlLink,
+        userId || 'user-default',
+        pushTicket.pushId
+      );
 
       const syncedSess: TaskScheduleSession = {
         ...sess,
@@ -244,7 +307,12 @@ export async function executeSchedulePush(
       });
       successCount++;
     } catch (err: any) {
-      guard?.recordSessionFailure(sess.id);
+      guard?.recordSessionFailure(sess.id, task.id, userId || 'user-default', pushTicket.pushId);
+
+      // Jika sesi telah dihapus pengguna saat error terjadi, jangan bangkitkan
+      if (isSessionDeleted(userId, task.id, sess.id)) {
+        continue;
+      }
       const classification =
         err instanceof GoogleCalendarApiError
           ? err.classification
@@ -374,6 +442,11 @@ export interface ReconcileTaskSessionsParams {
     timeMax?: Date,
     signal?: AbortSignal
   ) => Promise<{ events: CalendarEvent[]; rangeStart?: string; rangeEnd?: string }>;
+  deleteEventFn?: (
+    accessToken: string,
+    googleEventId: string,
+    signal?: AbortSignal
+  ) => Promise<void>;
   saveToStorage?: (task: Task, userId: string) => Promise<void>;
 }
 
@@ -527,6 +600,29 @@ export async function reconcileTaskSessionsWithRemote(
     );
 
     if (recon.status === 'confirmed' && recon.remoteEventId) {
+      // User Deletion Intent Wins (Skenario D & M):
+      // Jika pengguna telah menghapus sesi ini, jangan pernah menghidupkan kembali ke aplikasi!
+      if (isSessionDeleted(userId, task.id, sess.id)) {
+        const tombstone = recordSessionDeletion(userId, task.id, sess.id, recon.remoteEventId);
+        const activeDeleteFn = params.deleteEventFn || deleteGoogleCalendarEvent;
+        activeDeleteFn(token, recon.remoteEventId, activeSignal)
+          .then(() => updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined }))
+          .catch((cleanupErr: any) => {
+            const status = cleanupErr?.status || cleanupErr?.classification?.status;
+            if (status === 404 || status === 410) {
+              updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
+            } else {
+              updateTombstone(tombstone.id, {
+                status: 'cleanup_failed',
+                lastError: cleanupErr?.message || 'Remote compensation failed',
+                retryCount: (tombstone.retryCount || 0) + 1,
+                lastAttemptAt: new Date().toISOString(),
+              });
+            }
+          });
+        return null;
+      }
+
       reconciledCount++;
       const confirmedRemoteId = recon.remoteEventId;
       const htmlLink = recon.htmlLink || sess.htmlLink;
@@ -576,9 +672,11 @@ export async function reconcileTaskSessionsWithRemote(
     };
   });
 
+  const cleanedSessions = updatedSessions.filter((s): s is TaskScheduleSession => s !== null);
+
   const updatedTask: Task = {
     ...task,
-    scheduledSessions: updatedSessions,
+    scheduledSessions: cleanedSessions,
   };
 
   // 3. Operasi stale / aborted DILARANG mengubah state atau Firestore

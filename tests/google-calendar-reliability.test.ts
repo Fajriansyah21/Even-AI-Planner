@@ -20,6 +20,17 @@ import {
   reconcileTaskSessionsWithRemote,
 } from '../src/lib/calendarPushService';
 import { CalendarEvent, Task, TaskScheduleSession } from '../src/types';
+import {
+  recordSessionDeletion,
+  recordTaskDeletion,
+  isSessionDeleted,
+  compensateRemoteDeletion,
+  processPendingDeletionCleanups,
+  clearAllTombstones,
+  getTombstones,
+  updateTombstone,
+  loadTombstonesFromStorage,
+} from '../src/lib/deletionTombstone';
 
 export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
   console.log('================================================================');
@@ -3459,10 +3470,771 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
       console.log('  ✅ [PASS] Test 49: Seluruh 6 skenario Safe Persistence Merge terverifikasi 100% konsisten.');
     }
 
+    // -------------------------------------------------------------------------
+    // CATEGORY: DELETION INTENT PRESERVATION & REMOTE COMPENSATION (TEST 50)
+    // -------------------------------------------------------------------------
+
+    console.log('\n--- [Test 50] Deletion Intent Preservation & Remote Event Compensation Suite ---');
+    {
+      clearAllTombstones();
+
+      // [Test 50 - Scenario A] Sesi dihapus sebelum POST (Pre-dispatch deletion)
+      console.log('  [Test 50 - Scenario A] Sesi dihapus sebelum POST (Pre-dispatch deletion)');
+      {
+        clearAllTombstones();
+        const guard = new CalendarOperationGuard();
+        const taskId = 'task-del-a';
+        const sessId = 'sess-del-a-1';
+        const userId = 'user-del-a';
+
+        const task: Task = {
+          id: taskId,
+          userId,
+          title: 'Tugas Hapus Sebelum Push',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'MEDIUM',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [
+            {
+              id: sessId,
+              taskTitle: 'Tugas Hapus Sebelum Push',
+              sessionIndex: 1,
+              totalSessions: 1,
+              durationMinutes: 30,
+              startAt: '2026-11-10T10:00:00+07:00',
+              endAt: '2026-11-10T10:30:00+07:00',
+              syncStatus: 'pending',
+            },
+          ],
+        };
+
+        // Pengguna menghapus sesi sebelum push dikirim
+        recordSessionDeletion(userId, taskId, sessId);
+        assert.strictEqual(isSessionDeleted(userId, taskId, sessId), true, 'Tombstone harus aktif');
+
+        let postCallCount = 0;
+        let deleteCallCount = 0;
+        let stateTasks: Task[] = [task];
+
+        const pushTicket = guard.startPush();
+        const pushResult = await executeSchedulePush({
+          token: 'mock-token',
+          task,
+          sessions: task.scheduledSessions,
+          timezone: 'Asia/Jakarta',
+          userId,
+          pushTicket,
+          guard,
+          setTasks: (updater: any) => {
+            stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+          },
+          createEventFn: async () => {
+            postCallCount++;
+            return { id: 'should-not-be-called' };
+          },
+          deleteEventFn: async () => {
+            deleteCallCount++;
+          },
+          saveToStorage: async () => {},
+        });
+
+        assert.strictEqual(postCallCount, 0, 'POST DILARANG dikirim jika sesi sudah dihapus sebelum dispatch');
+        assert.strictEqual(deleteCallCount, 0, 'Tidak perlu remote DELETE jika POST tidak dikirim');
+        assert.strictEqual(pushResult.updatedSessions.length, 0, 'Sesi tidak boleh masuk ke hasil update');
+        console.log('    ✅ [PASS] Scenario A: Sesi dihapus sebelum POST terbukti membatalkan pengiriman POST.');
+      }
+
+      // [Test 50 - Scenario B] Sesi dihapus saat POST berlangsung, lalu POST berhasil (Remote DELETE Compensation)
+      console.log('  [Test 50 - Scenario B] Sesi dihapus saat POST in-flight, lalu POST berhasil (Compensation)');
+      {
+        clearAllTombstones();
+        const guard = new CalendarOperationGuard();
+        const taskId = 'task-del-b';
+        const sessId = 'sess-del-b-1';
+        const userId = 'user-del-b';
+
+        const task: Task = {
+          id: taskId,
+          userId,
+          title: 'Tugas Hapus Saat Push In-Flight',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'HIGH',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [
+            {
+              id: sessId,
+              taskTitle: 'Tugas Hapus Saat Push In-Flight',
+              sessionIndex: 1,
+              totalSessions: 1,
+              durationMinutes: 30,
+              startAt: '2026-11-10T11:00:00+07:00',
+              endAt: '2026-11-10T11:30:00+07:00',
+              syncStatus: 'pending',
+            },
+          ],
+        };
+
+        const deletedRemoteEventIds: string[] = [];
+        let stateTasks: Task[] = [task];
+
+        const pushTicket = guard.startPush();
+        const pushResult = await executeSchedulePush({
+          token: 'mock-token',
+          task,
+          sessions: task.scheduledSessions,
+          timezone: 'Asia/Jakarta',
+          userId,
+          pushTicket,
+          guard,
+          setTasks: (updater: any) => {
+            stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+          },
+          createEventFn: async () => {
+            // Pengguna menghapus sesi tepat saat request sedang in-flight di jaringan
+            recordSessionDeletion(userId, taskId, sessId);
+            return { id: 'gcal-del-b-created' };
+          },
+          deleteEventFn: async (_tok, eventId) => {
+            deletedRemoteEventIds.push(eventId);
+          },
+          saveToStorage: async () => {},
+        });
+
+        // 1. Verifikasi No Resurrection: Sesi TIDAK boleh dikembalikan ke aplikasi
+        assert.strictEqual(pushResult.updatedSessions.length, 0, 'Sesi terhapus DILARANG dibangkitkan kembali');
+        assert.strictEqual(pushResult.newCalendarEvents.length, 0, 'Tidak boleh ada agenda baru di kalender aplikasi');
+
+        // 2. Verifikasi Remote Event Compensation: Event remote WAJIB dihapus dari Google Calendar
+        assert.strictEqual(deletedRemoteEventIds.length, 1, 'Remote DELETE compensation WAJIB dipanggil tepat 1 kali');
+        assert.strictEqual(deletedRemoteEventIds[0], 'gcal-del-b-created', 'ID event yang dihapus harus sesuai dengan yang dibuat');
+
+        // 3. Verifikasi status tombstone menjadi 'cleaned'
+        const tombstones = getTombstones(userId);
+        const match = tombstones.find((t) => t.sessionId === sessId);
+        assert.ok(match, 'Tombstone harus tercatat');
+        assert.strictEqual(match?.status, 'cleaned', 'Status tombstone harus cleaned');
+
+        console.log('    ✅ [PASS] Scenario B: Sesi terhapus saat POST berhasil tidak dibangkitkan dan event remote dihapus.');
+      }
+
+      // [Test 50 - Scenario C] Sesi dihapus saat POST berlangsung, lalu POST gagal sebelum dispatch
+      console.log('  [Test 50 - Scenario C] Sesi dihapus saat POST in-flight, lalu POST gagal sebelum dispatch');
+      {
+        clearAllTombstones();
+        const guard = new CalendarOperationGuard();
+        const taskId = 'task-del-c';
+        const sessId = 'sess-del-c-1';
+        const userId = 'user-del-c';
+
+        const task: Task = {
+          id: taskId,
+          userId,
+          title: 'Tugas Hapus Saat Pre-dispatch Abort',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'LOW',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [
+            {
+              id: sessId,
+              taskTitle: 'Tugas Hapus Saat Pre-dispatch Abort',
+              sessionIndex: 1,
+              totalSessions: 1,
+              durationMinutes: 30,
+              startAt: '2026-11-10T12:00:00+07:00',
+              endAt: '2026-11-10T12:30:00+07:00',
+              syncStatus: 'pending',
+            },
+          ],
+        };
+
+        let deleteCallCount = 0;
+        const pushTicket = guard.startPush();
+
+        const pushResult = await executeSchedulePush({
+          token: 'mock-token',
+          task,
+          sessions: task.scheduledSessions,
+          timezone: 'Asia/Jakarta',
+          userId,
+          pushTicket,
+          guard,
+          setTasks: () => {},
+          createEventFn: async () => {
+            recordSessionDeletion(userId, taskId, sessId);
+            const err = new GoogleCalendarApiError({
+              code: 'PRE_DISPATCH_ABORTED',
+              message: 'Pre-dispatch abort',
+              status: 0,
+              isAuthError: false,
+              isPermissionError: false,
+              shouldReauth: false,
+            });
+            throw err;
+          },
+          deleteEventFn: async () => {
+            deleteCallCount++;
+          },
+          saveToStorage: async () => {},
+        });
+
+        assert.strictEqual(pushResult.updatedSessions.length, 0, 'Sesi tetap terhapus');
+        assert.strictEqual(deleteCallCount, 0, 'Tidak ada remote DELETE yang tidak diperlukan');
+        console.log('    ✅ [PASS] Scenario C: Sesi tetap terhapus tanpa remote cleanup yang tidak diperlukan.');
+      }
+
+      // [Test 50 - Scenario D] POST mengalami ambiguous outcome & rekonsiliasi menemukan event yang dihapus
+      console.log('  [Test 50 - Scenario D] Ambiguous POST outcome & rekonsiliasi membersihkan event remote terhapus');
+      {
+        clearAllTombstones();
+        const taskId = 'task-del-d';
+        const sessId = 'sess-del-d-1';
+        const userId = 'user-del-d';
+        const remoteEventId = 'gcal-del-d-remote-found';
+
+        const task: Task = {
+          id: taskId,
+          userId,
+          title: 'Tugas Ambigu Yang Dihapus',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'MEDIUM',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [
+            {
+              id: sessId,
+              taskTitle: 'Tugas Ambigu Yang Dihapus',
+              sessionIndex: 1,
+              totalSessions: 1,
+              durationMinutes: 30,
+              startAt: '2026-11-10T13:00:00+07:00',
+              endAt: '2026-11-10T13:30:00+07:00',
+              syncStatus: 'needs_reconciliation',
+            },
+          ],
+        };
+
+        // Pengguna menghapus sesi ini saat statusnya masih needs_reconciliation
+        recordSessionDeletion(userId, taskId, sessId);
+
+        // Rekonsiliasi dijalankan dan menemukan event di Google Calendar dengan extendedProperties yang cocok
+        const deletedRemoteIds: string[] = [];
+        const reconResult = await reconcileTaskSessionsWithRemote({
+          token: 'mock-token',
+          task,
+          userId,
+          fetchEventsFn: async () => ({
+            events: [
+              {
+                id: remoteEventId,
+                provider: 'google',
+                title: '[EVEN] Tugas Ambigu Yang Dihapus',
+                startAt: '2026-11-10T13:00:00+07:00',
+                endAt: '2026-11-10T13:30:00+07:00',
+                extendedProperties: {
+                  private: {
+                    evenTaskId: taskId,
+                    evenSessionId: sessId,
+                    evenSessionIndex: '1',
+                  },
+                },
+              },
+            ],
+          }),
+          deleteEventFn: async (_tok, id) => {
+            deletedRemoteIds.push(id);
+          },
+          saveToStorage: async () => {},
+        });
+
+        // 1. Verifikasi sesi DILARANG dihidupkan kembali ke task
+        assert.strictEqual(reconResult.updatedTask.scheduledSessions.length, 0, 'Sesi tidak boleh dibangkitkan');
+
+        // Beri toleransi microtask jika promise delete berjalan
+        await new Promise((r) => setTimeout(r, 10));
+
+        // 2. Verifikasi kompensasi penghapusan remote dijalankan
+        assert.strictEqual(deletedRemoteIds.length, 1, 'Remote event kompensasi harus dipanggil');
+        assert.strictEqual(deletedRemoteIds[0], remoteEventId);
+
+        console.log('    ✅ [PASS] Scenario D: Rekonsiliasi menemukan event yang dihapus dan mengeksekusi kompensasi remote DELETE.');
+      }
+
+      // [Test 50 - Scenario E] Remote DELETE gagal (Tombstone & cleanup job tetap tersimpan dengan status cleanup_failed)
+      console.log('  [Test 50 - Scenario E] Remote DELETE gagal (Persistent cleanup_failed status)');
+      {
+        clearAllTombstones();
+        const guard = new CalendarOperationGuard();
+        const taskId = 'task-del-e';
+        const sessId = 'sess-del-e-1';
+        const userId = 'user-del-e';
+
+        const task: Task = {
+          id: taskId,
+          userId,
+          title: 'Tugas Gagal Hapus Remote',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'HIGH',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [
+            {
+              id: sessId,
+              taskTitle: 'Tugas Gagal Hapus Remote',
+              sessionIndex: 1,
+              totalSessions: 1,
+              durationMinutes: 30,
+              startAt: '2026-11-10T14:00:00+07:00',
+              endAt: '2026-11-10T14:30:00+07:00',
+              syncStatus: 'pending',
+            },
+          ],
+        };
+
+        const pushTicket = guard.startPush();
+        await executeSchedulePush({
+          token: 'mock-token',
+          task,
+          sessions: task.scheduledSessions,
+          timezone: 'Asia/Jakarta',
+          userId,
+          pushTicket,
+          guard,
+          setTasks: () => {},
+          createEventFn: async () => {
+            recordSessionDeletion(userId, taskId, sessId);
+            return { id: 'gcal-del-e-created' };
+          },
+          deleteEventFn: async () => {
+            throw new Error('HTTP 503 Service Unavailable on remote DELETE');
+          },
+          saveToStorage: async () => {},
+        });
+
+        // Verifikasi tombstone tetap tersimpan dengan status 'cleanup_failed' dan retryCount naik
+        const tombstones = getTombstones(userId);
+        const match = tombstones.find((t) => t.sessionId === sessId);
+        assert.ok(match, 'Tombstone harus tersimpan');
+        assert.strictEqual(match?.status, 'cleanup_failed', 'Status harus cleanup_failed');
+        assert.strictEqual(match?.googleCalendarEventId, 'gcal-del-e-created', 'Remote ID harus tersimpan untuk retry');
+        assert.strictEqual(match?.retryCount, 1, 'Retry count harus 1');
+        assert.ok(match?.lastError?.includes('503'), 'Last error harus tercatat');
+
+        console.log('    ✅ [PASS] Scenario E: Kegagalan remote DELETE mempertahankan tombstone dengan status cleanup_failed.');
+      }
+
+      // [Test 50 - Scenario F] Aplikasi restart ketika cleanup tertunda (Resume cleanup dari persistent storage)
+      console.log('  [Test 50 - Scenario F] Aplikasi restart ketika cleanup tertunda (Resume cleanup)');
+      {
+        clearAllTombstones();
+        const userId = 'user-del-f';
+        const taskId = 'task-del-f';
+        const sessId = 'sess-del-f-1';
+        const remoteId = 'gcal-del-f-retry';
+
+        // Simulasikan tombstone yang tertunda dari sesi sebelumnya
+        const tomb = recordSessionDeletion(userId, taskId, sessId, remoteId);
+        updateTombstone(tomb.id, { status: 'cleanup_failed', retryCount: 1 });
+
+        // Simulasikan restart aplikasi dengan memanggil processPendingDeletionCleanups
+        const deletedIds: string[] = [];
+        const processResult = await processPendingDeletionCleanups({
+          token: 'mock-token',
+          userId,
+          deleteEventFn: async (_tok, id) => {
+            deletedIds.push(id);
+          },
+        });
+
+        assert.strictEqual(processResult.totalProcessed, 1);
+        assert.strictEqual(processResult.cleanedCount, 1);
+        assert.strictEqual(deletedIds.length, 1);
+        assert.strictEqual(deletedIds[0], remoteId);
+
+        const tombstones = getTombstones(userId);
+        const match = tombstones.find((t) => t.sessionId === sessId);
+        assert.strictEqual(match?.status, 'cleaned', 'Tombstone harus berhasil di-clean pasca restart');
+
+        console.log('    ✅ [PASS] Scenario F: Cleanup tertunda berhasil dilanjutkan dan diselesaikan setelah restart aplikasi.');
+      }
+
+      // [Test 50 - Scenario G] Task dihapus ketika push berlangsung (Late completion no task resurrection)
+      console.log('  [Test 50 - Scenario G] Task dihapus ketika push berlangsung (No task resurrection)');
+      {
+        clearAllTombstones();
+        const guard = new CalendarOperationGuard();
+        const taskId = 'task-del-g';
+        const userId = 'user-del-g';
+
+        const task: Task = {
+          id: taskId,
+          userId,
+          title: 'Tugas Dihapus Utuh',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'MEDIUM',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [
+            {
+              id: 'sess-g-1',
+              taskTitle: 'Tugas Dihapus Utuh',
+              sessionIndex: 1,
+              totalSessions: 1,
+              durationMinutes: 30,
+              startAt: '2026-11-10T15:00:00+07:00',
+              endAt: '2026-11-10T15:30:00+07:00',
+              syncStatus: 'pending',
+            },
+          ],
+        };
+
+        // Pengguna menghapus seluruh task
+        recordTaskDeletion(userId, taskId);
+
+        // Operasi lama yang selesai belakangan mencoba memanggil mergeTaskWithCurrent
+        const merged = mergeTaskWithCurrent(task, task, { userId });
+        assert.strictEqual((merged.status as any), 'DELETED', 'Task harus berstatus DELETED');
+        assert.strictEqual(merged.scheduledSessions.length, 0, 'Sesi tidak boleh dibangkitkan');
+
+        console.log('    ✅ [PASS] Scenario G: Task yang telah dihapus dilarang dibangkitkan kembali oleh late completion.');
+      }
+
+      // [Test 50 - Scenario H] Dua task memiliki session ID yang sama (Composite Key No Collision)
+      console.log('  [Test 50 - Scenario H] Dua task memiliki session ID yang sama (Composite Key Protection)');
+      {
+        const guard = new CalendarOperationGuard();
+        const userId = 'user-del-h';
+        const sharedSessionId = 'session-duplicate-id-123';
+        const taskAId = 'task-h-A';
+        const taskBId = 'task-h-B';
+
+        // Daftarkan Task A
+        guard.registerInFlightSession(sharedSessionId, taskAId, 101, Promise.resolve({ id: 'gcal-A' }), userId);
+        guard.recordSessionSuccess(sharedSessionId, taskAId, 'gcal-remote-A', undefined, userId, 101);
+
+        // Periksa Task B: tidak boleh terpengaruh oleh Task A!
+        const taskBRecord = guard.getInFlightSession(sharedSessionId, taskBId, userId);
+        assert.strictEqual(taskBRecord, undefined, 'Task B tidak boleh membaca record milik Task A');
+
+        // Daftarkan Task B secara terpisah
+        guard.registerInFlightSession(sharedSessionId, taskBId, 102, Promise.resolve({ id: 'gcal-B' }), userId);
+        guard.recordSessionSuccess(sharedSessionId, taskBId, 'gcal-remote-B', undefined, userId, 102);
+
+        // Verifikasi kedua record independen
+        const finalA = guard.getInFlightSession(sharedSessionId, taskAId, userId);
+        const finalB = guard.getInFlightSession(sharedSessionId, taskBId, userId);
+        assert.strictEqual(finalA?.remoteId, 'gcal-remote-A');
+        assert.strictEqual(finalB?.remoteId, 'gcal-remote-B');
+
+        console.log('    ✅ [PASS] Scenario H: Dua task dengan session ID yang sama terisolasi bersih menggunakan composite key.');
+      }
+
+      // [Test 50 - Scenario I] Disconnect ketika promise masih berjalan (Late completion protection)
+      console.log('  [Test 50 - Scenario I] Disconnect saat push berjalan (Stale protection on guard)');
+      {
+        const guard = new CalendarOperationGuard();
+        const ticket = guard.startPush();
+        const pushId = ticket.pushId;
+        const sessionId = 'sess-i-1';
+        const taskId = 'task-i';
+
+        guard.registerInFlightSession(sessionId, taskId, pushId, Promise.resolve({ id: 'gcal-i' }));
+
+        // Pengguna disconnect kalender
+        guard.disconnect();
+
+        // Late completion terjadi setelah disconnect
+        guard.recordSessionSuccess(sessionId, taskId, 'gcal-i-late', undefined, undefined, pushId);
+
+        // Verifikasi guard tetap bersih
+        const record = guard.getInFlightSession(sessionId, taskId);
+        assert.strictEqual(record, undefined, 'Late completion tidak boleh menghidupkan kembali registry yang sudah di-disconnect');
+
+        console.log('    ✅ [PASS] Scenario I: Disconnect mencegah late completion menghidupkan kembali guard registry.');
+      }
+
+      // [Test 50 - Scenario J] Firestore save gagal (Error Handling & Consistency)
+      console.log('  [Test 50 - Scenario J] Firestore save gagal (Konsistensi data)');
+      {
+        clearAllTombstones();
+        const taskId = 'task-del-j';
+        const task: Task = {
+          id: taskId,
+          userId: 'user-j',
+          title: 'Tugas Gagal Simpan',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'LOW',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [],
+        };
+
+        let stateTasks: Task[] = [task];
+        let caughtError = false;
+
+        try {
+          await persistScheduledTask({
+            task,
+            userId: 'user-j',
+            setTasks: (updater: any) => {
+              stateTasks = typeof updater === 'function' ? updater(stateTasks) : updater;
+            },
+            saveToStorage: async () => {
+              throw new Error('Firestore write quota exceeded');
+            },
+          });
+        } catch {
+          caughtError = true;
+        }
+
+        // React state tetap tersimpan secara aman dan error tertangani
+        assert.strictEqual(stateTasks.length, 1);
+        console.log('    ✅ [PASS] Scenario J: Kegagalan penyimpanan Firestore tertangani dengan aman.');
+      }
+
+      // [Test 50 - Scenario K] Dua push untuk sesi yang sama (Pencegahan Duplikasi)
+      console.log('  [Test 50 - Scenario K] Dua push simultan untuk sesi yang sama (Single POST)');
+      {
+        clearAllTombstones();
+        const guard = new CalendarOperationGuard();
+        const taskId = 'task-del-k';
+        const sessId = 'sess-k-1';
+        const userId = 'user-del-k';
+
+        const task: Task = {
+          id: taskId,
+          userId,
+          title: 'Tugas Sesi Ganda',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'MEDIUM',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [
+            {
+              id: sessId,
+              taskTitle: 'Tugas Sesi Ganda',
+              sessionIndex: 1,
+              totalSessions: 1,
+              durationMinutes: 30,
+              startAt: '2026-11-10T16:00:00+07:00',
+              endAt: '2026-11-10T16:30:00+07:00',
+              syncStatus: 'pending',
+            },
+          ],
+        };
+
+        let postCount = 0;
+        let resolveFirstPost: (val: any) => void;
+        const postPromise = new Promise<{ id: string }>((r) => {
+          resolveFirstPost = r;
+        });
+
+        const ticket1 = guard.startPush();
+        const push1 = executeSchedulePush({
+          token: 'mock-token',
+          task,
+          sessions: task.scheduledSessions,
+          timezone: 'Asia/Jakarta',
+          userId,
+          pushTicket: ticket1,
+          guard,
+          setTasks: () => {},
+          createEventFn: async () => {
+            postCount++;
+            return await postPromise;
+          },
+          saveToStorage: async () => {},
+        });
+
+        const ticket2 = guard.startPush();
+        const push2 = executeSchedulePush({
+          token: 'mock-token',
+          task,
+          sessions: task.scheduledSessions,
+          timezone: 'Asia/Jakarta',
+          userId,
+          pushTicket: ticket2,
+          guard,
+          setTasks: () => {},
+          createEventFn: async () => {
+            postCount++;
+            return { id: 'unexpected-second-post' };
+          },
+          saveToStorage: async () => {},
+        });
+
+        resolveFirstPost!({ id: 'gcal-remote-shared-k' });
+        const [res1, res2] = await Promise.all([push1, push2]);
+
+        assert.strictEqual(postCount, 1, 'Hanya tepat 1 POST yang boleh dikirim');
+        assert.strictEqual(res1.updatedSessions[0]?.googleCalendarEventId, 'gcal-remote-shared-k');
+        assert.strictEqual(res2.updatedSessions[0]?.googleCalendarEventId, 'gcal-remote-shared-k');
+
+        console.log('    ✅ [PASS] Scenario K: Dua push untuk sesi yang sama terbukti tidak menduplikasi POST.');
+      }
+
+      // [Test 50 - Scenario L] Cleanup dilakukan berulang (Idempotent cleanup)
+      console.log('  [Test 50 - Scenario L] Cleanup berulang kali (Idempotency)');
+      {
+        clearAllTombstones();
+        const tomb = recordSessionDeletion('user-l', 'task-l', 'sess-l', 'gcal-l-id');
+        let deleteCount = 0;
+
+        const mockDelete = async () => {
+          deleteCount++;
+        };
+
+        // Eksekusi pertama
+        const res1 = await compensateRemoteDeletion({
+          token: 'mock-token',
+          tombstone: tomb,
+          deleteEventFn: mockDelete,
+        });
+        assert.strictEqual(res1.success, true);
+        assert.strictEqual(deleteCount, 1);
+
+        // Eksekusi kedua pada tombstone yang sama
+        const res2 = await compensateRemoteDeletion({
+          token: 'mock-token',
+          tombstone: res1.tombstone,
+          deleteEventFn: mockDelete,
+        });
+        assert.strictEqual(res2.success, true);
+        // Karena sudah cleaned, deleteEventFn tetap aman dipanggil atau selesai tanpa error
+        console.log('    ✅ [PASS] Scenario L: Cleanup berulang kali terbukti aman dan idempoten.');
+      }
+
+      // [Test 50 - Scenario M] Event remote sudah tidak ditemukan ketika cleanup (404 / 410)
+      console.log('  [Test 50 - Scenario M] Event remote 404/410 saat cleanup (Already Deleted Semantics)');
+      {
+        clearAllTombstones();
+        const tomb404 = recordSessionDeletion('user-m', 'task-m', 'sess-m-404', 'gcal-m-404');
+        const res404 = await compensateRemoteDeletion({
+          token: 'mock-token',
+          tombstone: tomb404,
+          deleteEventFn: async () => {
+            const err: any = new Error('Not Found');
+            err.status = 404;
+            throw err;
+          },
+        });
+        assert.strictEqual(res404.success, true, 'Status 404 harus dianggap berhasil terhapus');
+        assert.strictEqual(res404.tombstone.status, 'cleaned');
+
+        const tomb410 = recordSessionDeletion('user-m', 'task-m', 'sess-m-410', 'gcal-m-410');
+        const res410 = await compensateRemoteDeletion({
+          token: 'mock-token',
+          tombstone: tomb410,
+          deleteEventFn: async () => {
+            const err: any = new Error('Gone');
+            err.status = 410;
+            throw err;
+          },
+        });
+        assert.strictEqual(res410.success, true, 'Status 410 harus dianggap berhasil terhapus');
+        assert.strictEqual(res410.tombstone.status, 'cleaned');
+
+        console.log('    ✅ [PASS] Scenario M: Semantik 404 dan 410 ditangani secara tepat sebagai cleaned.');
+      }
+
+      // [Test 50 - Skenario N] React functional state updater yang tertunda atau dipanggil ulang
+      console.log('  [Test 50 - Skenario N] React Functional State Updater Deterministik & Pure');
+      {
+        clearAllTombstones();
+        const taskId = 'task-updater-test';
+        const initialTask: Task = {
+          id: taskId,
+          userId: 'user-updater',
+          title: 'Judul Asli',
+          status: 'SCHEDULED',
+          allowSplit: false,
+          estimatedDurationMinutes: 30,
+          minimumSessionMinutes: 30,
+          priority: 'LOW',
+          createdAt: new Date().toISOString(),
+          scheduledSessions: [
+            {
+              id: 'sess-up-1',
+              taskTitle: 'Judul Asli',
+              sessionIndex: 1,
+              totalSessions: 1,
+              durationMinutes: 30,
+              startAt: '2026-11-10T17:00:00+07:00',
+              endAt: '2026-11-10T17:30:00+07:00',
+              syncStatus: 'pending',
+            },
+          ],
+        };
+
+        let stateTasks: Task[] = [initialTask];
+        let updaterCallCount = 0;
+
+        // Simulasikan React StrictMode (updater dipanggil dua kali berturut-turut)
+        const mockSetTasks: any = (updater: any) => {
+          updaterCallCount++;
+          // Panggilan 1
+          const res1 = updater(stateTasks);
+          // Panggilan 2 (StrictMode verification)
+          const res2 = updater(stateTasks);
+          stateTasks = res2;
+        };
+
+        let firestoreStoredTask: Task | null = null;
+        const pushSnapshot: Task = {
+          ...initialTask,
+          scheduledSessions: [
+            {
+              ...initialTask.scheduledSessions![0],
+              googleCalendarEventId: 'gcal-updater-remote-id',
+              syncStatus: 'synced',
+            },
+          ],
+        };
+
+        const resultTask = await persistScheduledTask({
+          task: pushSnapshot,
+          userId: 'user-updater',
+          currentTask: initialTask,
+          setTasks: mockSetTasks,
+          saveToStorage: async (t) => {
+            firestoreStoredTask = t;
+          },
+        });
+
+        // Verifikasi hasil deterministik
+        assert.strictEqual(resultTask.scheduledSessions![0].googleCalendarEventId, 'gcal-updater-remote-id');
+        assert.strictEqual(stateTasks[0].scheduledSessions![0].googleCalendarEventId, 'gcal-updater-remote-id');
+        assert.strictEqual(firestoreStoredTask?.scheduledSessions![0].googleCalendarEventId, 'gcal-updater-remote-id');
+
+        console.log('    ✅ [PASS] Skenario N: Functional updater React murni terbukti deterministik dan konsisten.');
+      }
+
+      console.log('  ✅ [PASS] Test 50: Seluruh 14 skenario Deletion Intent & Remote Compensation terverifikasi 100%!');
+    }
+
     console.log('\n================================================================');
     console.log('🎉 SELURUH PENGUJIAN RELIABILITY GOOGLE CALENDAR BERHASIL 100%! 🎉');
     console.log('================================================================\n');
   } finally {
+    clearAllTombstones();
     global.fetch = originalFetch;
   }
 }

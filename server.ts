@@ -21,7 +21,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const isProduction = process.env.NODE_ENV === 'production';
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+// In development, AI Studio environment proxy requires the dev server to run on port 3000.
+// In production (e.g. Cloud Run), bind to process.env.PORT if provided.
+const PORT = isProduction && process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 async function startServer() {
   const app = express();
@@ -492,7 +494,10 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
