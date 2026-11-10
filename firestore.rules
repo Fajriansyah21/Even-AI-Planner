@@ -79,6 +79,18 @@ service cloud.firestore {
           && incoming().title is string && incoming().title.size() <= 200;
         allow delete: if isOwner(userId);
       }
+
+      // Deletion Tombstones (Authoritative cross-device monotonic deletion records)
+      match /deletion_tombstones/{tombstoneId} {
+        allow get, list: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidId(tombstoneId)
+          && incoming().userId == userId
+          && incoming().taskId is string && incoming().taskId.size() <= 128
+          && incoming().deletedAt is string
+          && incoming().status in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed'];
+        // Tombstones are monotonic and permanent to guarantee User Deletion Intent Wins
+        allow delete: if false;
+      }
     }
   }
 }

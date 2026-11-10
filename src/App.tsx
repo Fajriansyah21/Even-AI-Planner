@@ -60,7 +60,8 @@ import {
 } from './lib/googleCalendar';
 import { CalendarOperationGuard } from './lib/calendarOperationGuard';
 import { executeSchedulePush, reconcileTaskSessionsWithRemote } from './lib/calendarPushService';
-import { recordTaskDeletion, processPendingDeletionCleanups } from './lib/deletionTombstone';
+import { recordTaskDeletion, processPendingDeletionCleanups, initDurableTombstones } from './lib/deletionTombstone';
+import { syncOutboxToFirestore } from './lib/firestoreTombstoneRepo';
 import {
   getInitialKeepNotes,
   convertKeepNoteToTask,
@@ -195,10 +196,19 @@ export default function App() {
     window.addEventListener('error', handleGlobalError, true);
     window.addEventListener('unhandledrejection', handleUnhandledRejection, true);
 
+    const handleOnline = () => {
+      const currentUid = userId || auth.currentUser?.uid;
+      if (currentUid && currentUid !== 'user-default') {
+        syncOutboxToFirestore({ userId: currentUid }).catch(() => {});
+      }
+    };
+    window.addEventListener('online', handleOnline);
+
     const unsubscribe = initAuth(
       (user, token) => {
         setIsLoggedIn(true);
         setUserId(user.uid);
+        initDurableTombstones(user.uid).catch(() => {});
         if (token) {
           setHasGoogleAccessToken(true);
           processPendingDeletionCleanups({ token, userId: user.uid }).catch(() => {});
@@ -226,9 +236,10 @@ export default function App() {
     return () => {
       window.removeEventListener('error', handleGlobalError);
       window.removeEventListener('unhandledrejection', handleUnhandledRejection);
+      window.removeEventListener('online', handleOnline);
       unsubscribe();
     };
-  }, []);
+  }, [userId]);
 
   // Persist to localStorage
   useEffect(() => {

@@ -16,6 +16,7 @@ import { runDeadlineAndSlotDiagnosticsTests } from './deadlineAndSlotDiagnostics
 import { runIndependentAuditSuite } from './independent-audit.test';
 import { runSecurityPhase1Tests } from './securityPhase1.test';
 import { runGoogleCalendarReliabilitySuite } from './google-calendar-reliability.test';
+import { runDeletionOutboxAndFirestoreSuite } from './deletion-outbox-firestore.test';
 
 async function main() {
   console.log('================================================================');
@@ -92,8 +93,12 @@ async function main() {
     await runSecurityPhase1Tests();
 
     // 18. Google Calendar Reliability Hardening Suite (Phase 2A)
-    console.log('\n>>> [18/18] Google Calendar Reliability Hardening Suite (Phase 2A)...');
+    console.log('\n>>> [18/19] Google Calendar Reliability Hardening Suite (Phase 2A)...');
     await runGoogleCalendarReliabilitySuite();
+
+    // 19. Durable Deletion Outbox & Firestore Tombstone Suite (Phase 2A.3.4.4 Step 2 & 3)
+    console.log('\n>>> [19/19] Durable Deletion Outbox & Firestore Authoritative Suite...');
+    await runDeletionOutboxAndFirestoreSuite();
 
     // Real Google Calendar Integration (Opt-in Check)
     console.log('\n>>> [Opsi] Pengujian Integrasi Google Calendar Nyata...');
