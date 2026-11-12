@@ -27,7 +27,7 @@ import {
   assertSucceeds,
   RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
-import { doc, getDoc, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc, updateDoc, deleteDoc, serverTimestamp, Timestamp } from 'firebase/firestore';
 
 export async function runFirestoreRulesSuite() {
   console.log('\n================================================================');
@@ -58,6 +58,8 @@ export async function runFirestoreRulesSuite() {
     rulesContent.includes('incoming().retryCount == 0'),
     'firestore.rules wajib membatasi create retryCount awal == 0'
   );
+  assert.ok(rulesContent.includes('function isValidClaimFenceTransition'), 'Rules wajib memvalidasi token dan lease cleanup');
+  assert.ok(rulesContent.includes('request.time >= oldLease + duration.value(7, \'m\')'), 'Lease takeover wajib memakai clock Firestore');
   assert.ok(
     rulesContent.includes("prevStatus == 'cleaned' && nextStatus == 'cleaned' && !hasNewRemoteId"),
     'firestore.rules wajib mencegah cleaned -> cleaned jika hasNewRemoteId bernilai true'
@@ -81,7 +83,7 @@ export async function runFirestoreRulesSuite() {
 
   // Static evaluation of tombstone creation rule predicate (Requirement 1 test cases):
   console.log('  🔍 [STATIC AUDIT] Menguji 5 syarat pembuatan tombstone (Requirement 1)...');
-  const allowedCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error'];
+  const allowedCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error', 'cleanupClaimToken', 'cleanupLeaseStartedAt'];
   const requiredCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt'];
 
   function evaluateCreateRule(data: any): boolean {
@@ -246,6 +248,8 @@ export async function runFirestoreRulesSuite() {
       updateDoc(aliceDocRef, {
         status: 'cleaning',
         retryCount: 1,
+        cleanupClaimToken: 'worker-a',
+        cleanupLeaseStartedAt: serverTimestamp(),
         updatedAt: '2026-11-10T10:01:00.000Z',
       })
     );
@@ -279,6 +283,8 @@ export async function runFirestoreRulesSuite() {
       updateDoc(cleaningDocRef, {
         status: 'cleaning',
         retryCount: 1,
+        cleanupClaimToken: 'worker-cleaning',
+        cleanupLeaseStartedAt: serverTimestamp(),
         updatedAt: '2026-11-10T10:01:00.000Z',
       })
     );
@@ -348,11 +354,54 @@ export async function runFirestoreRulesSuite() {
         status: 'pending_cleanup',
         googleCalendarEventId: 'brand-new-event-id-from-late-post',
         retryCount: 2,
+        cleanupClaimToken: null,
+        cleanupLeaseStartedAt: null,
         updatedAt: '2026-11-10T10:10:00.000Z',
       })
     );
 
-    console.log('\n  🎉 SELURUH 14 KASUS PENGUJIAN RUNTIME FIRESTORE RULES EMULATOR SUKSES (PASS)!');
+    console.log('\n  🎉 SELURUH 16 KASUS PENGUJIAN RUNTIME FIRESTORE RULES EMULATOR SUKSES (PASS)!');
+    // Case 11: Expired claim takeover fences a stale worker's result.
+    const fenceDocRef = doc(aliceDb, `users/${aliceUid}/deletion_tombstones/tomb_fence_case11`);
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), `users/${aliceUid}/deletion_tombstones/tomb_fence_case11`), {
+        userId: aliceUid, taskId: 'task-fence', sessionId: 'sess-fence',
+        compositeKey: `${aliceUid}:task-fence:sess-fence`, entityType: 'session',
+        deletedAt: '2026-11-10T10:00:00.000Z', googleCalendarEventId: 'gcal-fence',
+        status: 'cleaning', retryCount: 1, updatedAt: '2026-11-10T10:01:00.000Z',
+        lastAttemptAt: '2026-11-10T10:01:00.000Z', cleanupClaimToken: 'worker-a',
+        cleanupLeaseStartedAt: Timestamp.fromMillis(Date.now() - 8 * 60 * 1000), error: null,
+      });
+    });
+    await assertSucceeds(updateDoc(fenceDocRef, {
+      status: 'cleaning', retryCount: 2, cleanupClaimToken: 'worker-b',
+      cleanupLeaseStartedAt: serverTimestamp(), updatedAt: '2026-11-10T10:10:00.000Z',
+    }));
+    await assertFails(updateDoc(fenceDocRef, {
+      status: 'cleaned', retryCount: 2, cleanupClaimToken: 'worker-a',
+      cleanupLeaseStartedAt: serverTimestamp(), updatedAt: '2026-11-10T10:11:00.000Z',
+    }));
+    await assertSucceeds(updateDoc(fenceDocRef, {
+      status: 'cleaned', retryCount: 2, cleanupClaimToken: 'worker-b',
+      updatedAt: '2026-11-10T10:12:00.000Z',
+    }));
+
+    // Case 12: A fresh lease cannot be taken over.
+    const activeFenceRef = doc(aliceDb, `users/${aliceUid}/deletion_tombstones/tomb_fence_active_case12`);
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), `users/${aliceUid}/deletion_tombstones/tomb_fence_active_case12`), {
+        userId: aliceUid, taskId: 'task-active-fence', sessionId: 'sess-active-fence',
+        compositeKey: `${aliceUid}:task-active-fence:sess-active-fence`, entityType: 'session',
+        deletedAt: '2026-11-10T10:00:00.000Z', googleCalendarEventId: 'gcal-active-fence',
+        status: 'cleaning', retryCount: 1, updatedAt: '2026-11-10T10:01:00.000Z',
+        lastAttemptAt: '2026-11-10T10:01:00.000Z', cleanupClaimToken: 'worker-active-a',
+        cleanupLeaseStartedAt: Timestamp.fromMillis(Date.now() - 60 * 1000), error: null,
+      });
+    });
+    await assertFails(updateDoc(activeFenceRef, {
+      status: 'cleaning', retryCount: 2, cleanupClaimToken: 'worker-active-b',
+      cleanupLeaseStartedAt: serverTimestamp(), updatedAt: '2026-11-10T10:02:00.000Z',
+    }));
     return { status: 'PASS' };
   } finally {
     if (testEnv) {

@@ -454,6 +454,17 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       assert.ok(outboxTask, 'Task intent harus langsung tersimpan di outbox');
       assert.ok(outboxSess, 'Session intent harus langsung tersimpan di outbox');
       assert.strictEqual(outboxSess?.googleCalendarEventId, 'gcal-remote-6');
+      assert.strictEqual(tombstones[0].status, 'pending_cleanup');
+      assert.strictEqual(tombstones[0].retryCount, 0);
+      assert.strictEqual(tombstones[1].status, 'pending_cleanup');
+      assert.strictEqual(tombstones[1].retryCount, 0);
+
+      const noEvent = await recordTaskDeletionDurable(userId, 'task-no-event-6');
+      assert.strictEqual(noEvent[0].status, 'pending_cleanup', 'Task tanpa event ID tetap menjadi deletion intent pending');
+      const lateSession = await recordSessionDeletionDurable(userId, taskId, 'sess-late-6');
+      assert.strictEqual(lateSession.status, 'pending_cleanup');
+      const lateRemote = await recordSessionDeletionDurable(userId, taskId, 'sess-late-6', 'gcal-late-6');
+      assert.strictEqual(lateRemote.status, 'pending_cleanup', 'Late remote ID tetap memicu cleanup tanpa menghidupkan task');
 
       pass('Test 6: recordTaskDeletionDurable menunggu outbox persistence dan menjamin durability');
     }
@@ -494,7 +505,7 @@ export async function runDeletionOutboxAndFirestoreSuite() {
         sessionId,
         entityType: 'task',
         deletedAt: '2026-11-10T08:00:00.000Z',
-        status: 'cleaned',
+        status: 'pending_cleanup',
         syncStatus: 'pending_sync',
         syncAttempts: 0,
         retryCount: 0,
@@ -504,6 +515,10 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       await saveAuthoritativeTombstone(intent1, {
         customRunTransaction: mockRunTransaction as any,
       });
+      const cleanupCompleted = await saveAuthoritativeTombstone({ ...intent1, status: 'cleaned', updatedAt: '2026-11-10T08:05:00.000Z' }, {
+        customRunTransaction: mockRunTransaction as any,
+      });
+      assert.strictEqual(cleanupCompleted.status, 'cleaned', 'Pending no-ID intent dapat selesai setelah Firestore mengonfirmasi CREATE');
 
       // 2. Stale concurrent push attempting downgrade to pending_cleanup
       const staleIntent: DurableDeletionIntent = {
@@ -526,6 +541,20 @@ export async function runDeletionOutboxAndFirestoreSuite() {
 
       assert.strictEqual(result.status, 'cleaned', 'Status cleaned dilarang diturunkan ke pending_cleanup');
       assert.strictEqual(result.deletedAt, '2026-11-10T08:00:00.000Z', 'DeletedAt awal harus dipertahankan');
+
+      const legacyCreate: DurableDeletionIntent = {
+        ...intent1,
+        taskId: 'task-legacy-cleaned-create',
+        id: buildOutboxKey(userId, 'task-legacy-cleaned-create', 'all'),
+        status: 'cleaned',
+        retryCount: 7,
+      };
+      const normalizedCreate = await saveAuthoritativeTombstone(legacyCreate, {
+        customRunTransaction: mockRunTransaction as any,
+      });
+      assert.strictEqual(normalizedCreate.status, 'pending_cleanup');
+      assert.strictEqual(normalizedCreate.retryCount, 0);
+      assert.strictEqual(normalizedCreate.googleCalendarEventId, null, 'CREATE tanpa remote ID tetap merekam deletion intent');
 
       pass('Test 7: Firestore runTransaction memastikan concurrency atomik dan monotonic merge');
     }
@@ -561,7 +590,18 @@ export async function runDeletionOutboxAndFirestoreSuite() {
               exists: () => store.has(ref.path),
               data: () => store.get(ref.path),
             }),
-            set: (ref: any, data: any) => store.set(ref.path, data),
+            set: (ref: any, data: any) => {
+              const previousDoc = store.get(ref.path);
+              if (previousDoc?.status === 'cleaning' && data.status === 'cleaning' &&
+                data.cleanupClaimToken !== previousDoc.cleanupClaimToken) {
+                const previousAttempt = Date.parse(previousDoc.lastAttemptAt || '');
+                const nextAttempt = Date.parse(data.lastAttemptAt || '');
+                if (!Number.isFinite(previousAttempt) || nextAttempt - previousAttempt < 7 * 60 * 1000) {
+                  throw Object.assign(new Error('live cleanup lease'), { code: 'permission-denied' });
+                }
+              }
+              store.set(ref.path, data);
+            },
           });
         } finally {
           release();
@@ -585,8 +625,8 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       assert.ok([claimA, claimB].some((result) => !result.claimed && result.reason === 'busy'));
       assert.deepStrictEqual(
         Object.keys(store.get(path)!).sort(),
-        ['compositeKey', 'userId', 'taskId', 'sessionId', 'entityType', 'googleCalendarEventId', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'lastAttemptAt', 'error'].sort(),
-        'Payload produksi harus sesuai schema Firestore Rules Step 3 tanpa field tambahan'
+        ['compositeKey', 'userId', 'taskId', 'sessionId', 'entityType', 'googleCalendarEventId', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'lastAttemptAt', 'error', 'cleanupClaimToken', 'cleanupLeaseStartedAt'].sort(),
+        'Payload produksi harus memakai schema fencing yang diizinkan Firestore Rules'
       );
 
       const staleId = await claimAuthoritativeRemoteCleanup({
@@ -594,18 +634,35 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       }, claimOptions);
       assert.deepStrictEqual(staleId, { claimed: false, reason: 'stale_remote_id' });
 
+      const workerA = claims[0] as Extract<typeof claimA, { claimed: true }>;
       const currentDoc = store.get(path)!;
-      store.set(path, { ...currentDoc, status: 'cleaning', lastAttemptAt: now.toISOString() });
-      const activeLease = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
-      assert.deepStrictEqual(activeLease, { claimed: false, reason: 'busy' });
-
       store.set(path, {
-        ...currentDoc, status: 'cleaning', retryCount: 9,
+        ...currentDoc, status: 'cleaning', retryCount: workerA.tombstone.retryCount,
+        cleanupClaimToken: workerA.claimToken,
         lastAttemptAt: '2026-11-12T08:00:00.000Z',
+        cleanupLeaseStartedAt: new Date('2026-11-12T08:00:00.000Z'),
       });
       const reclaimedLease = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
       assert.strictEqual(reclaimedLease.claimed, true, 'Lease cleaning yang kedaluwarsa harus dapat dipulihkan');
-      assert.strictEqual((reclaimedLease as any).tombstone.retryCount, 10);
+      assert.strictEqual((reclaimedLease as any).tombstone.retryCount, workerA.tombstone.retryCount + 1);
+      assert.notStrictEqual((reclaimedLease as any).claimToken, workerA.claimToken);
+
+      const staleFinish = { ...intent, status: 'cleaned' as const, retryCount: workerA.tombstone.retryCount,
+        cleanupClaimToken: workerA.claimToken, lastAttemptAt: now.toISOString(), updatedAt: now.toISOString() };
+      await assert.rejects(() => saveAuthoritativeTombstone(staleFinish, {
+        requiredClaimToken: workerA.claimToken, customRunTransaction: atomicRunTransaction as any,
+      }), /Fencing/);
+      const workerB = reclaimedLease as Extract<typeof reclaimedLease, { claimed: true }>;
+      const successfulFinish = { ...intent, status: 'cleaned' as const, retryCount: workerB.tombstone.retryCount,
+        cleanupClaimToken: workerB.claimToken, lastAttemptAt: now.toISOString(), updatedAt: now.toISOString() };
+      const finalDoc = await saveAuthoritativeTombstone(successfulFinish, {
+        requiredClaimToken: workerB.claimToken, customRunTransaction: atomicRunTransaction as any,
+      });
+      assert.strictEqual(finalDoc.status, 'cleaned');
+      assert.strictEqual(finalDoc.cleanupClaimToken, workerB.claimToken);
+      await assert.rejects(() => saveAuthoritativeTombstone(staleFinish, {
+        requiredClaimToken: workerA.claimToken, customRunTransaction: atomicRunTransaction as any,
+      }), /Fencing/);
 
       store.set(path, { ...currentDoc, status: 'cleaned' });
       const alreadyCleaned = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
@@ -1307,7 +1364,7 @@ export async function runDeletionOutboxAndFirestoreSuite() {
 
     // [Test 18] ISSUE 1: Firestore Tombstone Creation Constraints
     {
-      const allowedCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error'];
+      const allowedCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error', 'cleanupClaimToken', 'cleanupLeaseStartedAt'];
       const requiredCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt'];
 
       function validateTombstoneCreationRule(incoming: any, userId: string, tombstoneId: string): { allowed: boolean; reason?: string } {

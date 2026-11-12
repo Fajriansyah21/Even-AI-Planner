@@ -25,6 +25,7 @@ export interface DurableDeletionIntent {
   retryCount: number;
   lastError?: string;
   lastAttemptAt?: string;
+  cleanupClaimToken?: string;
   updatedAt: string; // ISO 8601 string
 }
 
@@ -332,12 +333,13 @@ export async function getPendingSyncOutboxItems(userId?: string): Promise<Durabl
 /**
  * Marks an outbox item as synchronized after Firestore confirmation.
  */
-export async function markOutboxItemSynced(id: string): Promise<void> {
+export async function markOutboxItemSynced(id: string, authoritativePatch: Partial<DurableDeletionIntent> = {}): Promise<void> {
   const existing = await getOutboxItem(id);
   if (!existing) return;
 
   const updated: DurableDeletionIntent = {
     ...existing,
+    ...authoritativePatch,
     syncStatus: 'synced',
     syncError: undefined,
     updatedAt: new Date().toISOString(),

@@ -14,6 +14,7 @@ import {
   getDocs,
   collection,
   runTransaction,
+  serverTimestamp,
   Transaction,
 } from 'firebase/firestore';
 import { db, auth, sanitizeForFirestore, handleFirestoreError, OperationType } from './firebase';
@@ -41,6 +42,8 @@ export interface FirestoreTombstoneDoc {
   retryCount: number;
   lastError?: string | null;
   lastAttemptAt?: string | null;
+  cleanupClaimToken?: string | null;
+  cleanupLeaseStartedAt?: unknown;
   syncedAt?: string;
   updatedAt: string;
 }
@@ -70,8 +73,21 @@ function encodeFirestoreTombstone(tombstone: FirestoreTombstoneDoc): Record<stri
     retryCount: tombstone.retryCount,
     updatedAt: tombstone.updatedAt,
     lastAttemptAt: tombstone.lastAttemptAt ?? null,
+    cleanupClaimToken: tombstone.cleanupClaimToken ?? null,
+    cleanupLeaseStartedAt: tombstone.cleanupLeaseStartedAt ?? null,
     error: tombstone.lastError ?? null,
   };
+}
+
+function sanitizeTombstoneForFirestore(
+  tombstone: FirestoreTombstoneDoc,
+  leaseValue: unknown
+): Record<string, unknown> {
+  const data = sanitizeForFirestore(encodeFirestoreTombstone(tombstone));
+  // Preserve Firestore Timestamp / FieldValue instances. The generic sanitizer
+  // recursively treats arbitrary objects as maps, which would corrupt them.
+  data.cleanupLeaseStartedAt = leaseValue;
+  return data;
 }
 
 /**
@@ -107,6 +123,7 @@ export function validateUserOwnership(userId: string): void {
 }
 
 export interface SaveFirestoreTombstoneOptions {
+  requiredClaimToken?: string | null;
   customRunTransaction?: (
     firestoreDb: typeof db,
     updateFunction: (transaction: Transaction) => Promise<any>
@@ -114,23 +131,60 @@ export interface SaveFirestoreTombstoneOptions {
 }
 
 export type RemoteCleanupClaimResult =
-  | { claimed: true; tombstone: FirestoreTombstoneDoc }
+  | { claimed: true; tombstone: FirestoreTombstoneDoc; claimToken: string }
   | { claimed: false; reason: 'missing' | 'cleaned' | 'busy' | 'stale_remote_id' | 'not_retryable' };
 
 export interface ClaimRemoteCleanupOptions {
   now?: Date;
   leaseMs?: number;
+  createClaimToken?: () => string;
   customRunTransaction?: (
     firestoreDb: typeof db,
     updateFunction: (transaction: Transaction) => Promise<any>
   ) => Promise<any>;
 }
 
+export interface RenewRemoteCleanupClaimOptions {
+  customRunTransaction?: (
+    firestoreDb: typeof db,
+    updateFunction: (transaction: Transaction) => Promise<any>
+  ) => Promise<any>;
+}
+
+/** Refreshes a live claim immediately before DELETE; the token is checked atomically. */
+export async function renewAuthoritativeRemoteCleanupClaim(
+  tombstone: DurableDeletionIntent,
+  claimToken: string,
+  options: RenewRemoteCleanupClaimOptions = {}
+): Promise<boolean> {
+  validateUserOwnership(tombstone.userId);
+  const docId = buildFirestoreTombstoneDocId(tombstone.taskId, tombstone.sessionId);
+  const docRef = doc(db, 'users', tombstone.userId, 'deletion_tombstones', docId);
+  const txRunner = options.customRunTransaction || runTransaction;
+  const nowIso = new Date().toISOString();
+
+  return txRunner(db, async (transaction) => {
+    const snap = await transaction.get(docRef);
+    if (!snap.exists()) return false;
+    const current = decodeFirestoreTombstone(snap.data(), docId);
+    if (
+      current.status !== 'cleaning' ||
+      current.cleanupClaimToken !== claimToken ||
+      current.googleCalendarEventId !== tombstone.googleCalendarEventId
+    ) return false;
+
+    transaction.set(docRef, sanitizeTombstoneForFirestore({ ...current, updatedAt: nowIso }, serverTimestamp()));
+    return true;
+  });
+}
+
 /**
  * Atomically claims one exact remote event for cleanup. Firestore transaction
  * serialization makes the pending -> cleaning transition exclusive across tabs
- * and devices. `lastAttemptAt` is the lease clock because Step 3's schema does
- * not include a separate lease field.
+ * and devices. `cleanupClaimToken` is the monotonic fencing identity: takeover
+ * replaces it, so an old worker cannot commit its result afterward. Client time
+ * is diagnostic only; Firestore Rules use `request.time` to decide whether an
+ * existing lease may be taken over.
  */
 export async function claimAuthoritativeRemoteCleanup(
   tombstone: DurableDeletionIntent,
@@ -142,9 +196,11 @@ export async function claimAuthoritativeRemoteCleanup(
   const txRunner = options.customRunTransaction || runTransaction;
   const now = options.now || new Date();
   const nowIso = now.toISOString();
-  const leaseMs = options.leaseMs ?? 5 * 60 * 1000;
+  const createClaimToken = options.createClaimToken || (() => crypto.randomUUID());
+  let attemptedTakeover = false;
 
-  return txRunner(db, async (transaction) => {
+  try {
+    return await txRunner(db, async (transaction) => {
     const snap = await transaction.get(docRef);
     if (!snap.exists()) return { claimed: false, reason: 'missing' } as const;
     const existing = decodeFirestoreTombstone(snap.data(), docId);
@@ -155,26 +211,31 @@ export async function claimAuthoritativeRemoteCleanup(
     if (existing.status === 'cleaned') {
       return { claimed: false, reason: 'cleaned' } as const;
     }
-    if (existing.status === 'cleaning') {
-      const lastAttempt = existing.lastAttemptAt ? Date.parse(existing.lastAttemptAt) : NaN;
-      if (Number.isFinite(lastAttempt) && now.getTime() - lastAttempt < leaseMs) {
-        return { claimed: false, reason: 'busy' } as const;
-      }
-    } else if (existing.status !== 'pending_cleanup' && existing.status !== 'cleanup_failed') {
+    if (existing.status !== 'cleaning' && existing.status !== 'pending_cleanup' && existing.status !== 'cleanup_failed') {
       return { claimed: false, reason: 'not_retryable' } as const;
     }
+    attemptedTakeover = existing.status === 'cleaning';
 
+    const claimToken = createClaimToken();
     const claimed: FirestoreTombstoneDoc = {
       ...existing,
       status: 'cleaning',
       retryCount: (existing.retryCount || 0) + 1,
       lastAttemptAt: nowIso,
+      cleanupClaimToken: claimToken,
+      cleanupLeaseStartedAt: serverTimestamp(),
       lastError: null,
       updatedAt: nowIso,
     };
-    transaction.set(docRef, sanitizeForFirestore(encodeFirestoreTombstone(claimed)));
-    return { claimed: true, tombstone: claimed } as const;
-  });
+    transaction.set(docRef, sanitizeTombstoneForFirestore(claimed, serverTimestamp()));
+    return { claimed: true, tombstone: claimed, claimToken } as const;
+    });
+  } catch (error: any) {
+    // A live lease is rejected by Rules using server request.time. Do not infer
+    // expiry from this device's wall clock.
+    if (attemptedTakeover && error?.code === 'permission-denied') return { claimed: false, reason: 'busy' };
+    throw error;
+  }
 }
 
 /**
@@ -214,6 +275,21 @@ export async function saveAuthoritativeTombstone(
       let finalLastAttemptAt = tombstone.lastAttemptAt || null;
 
       if (existingData) {
+        const isCleanupResult = tombstone.status === 'cleanup_failed' || (
+          tombstone.status === 'cleaned' && Boolean(tombstone.googleCalendarEventId)
+        );
+        if (isCleanupResult && existingData.status !== 'cleaned' && !options?.requiredClaimToken) {
+          throw new Error('Fencing: hasil cleanup wajib disimpan dengan claim token');
+        }
+        // Fencing: If saving a cleanup result, verify the claim token hasn't changed.
+        if (options?.requiredClaimToken !== undefined && options.requiredClaimToken !== null && (
+          existingData.cleanupClaimToken !== options.requiredClaimToken ||
+          existingData.status !== 'cleaning' ||
+          existingData.googleCalendarEventId !== tombstone.googleCalendarEventId
+        )) {
+          throw new Error('Fencing: Klaim cleanup kedaluwarsa atau telah diambil alih oleh worker lain');
+        }
+
         // Retry attempts are claimed atomically before DELETE. A stale outbox
         // snapshot must never lower that authoritative counter.
         finalRetryCount = Math.max(finalRetryCount, existingData.retryCount || 0);
@@ -253,6 +329,10 @@ export async function saveAuthoritativeTombstone(
           finalRemoteId = existingData.googleCalendarEventId || null;
           finalStatus = existingData.status;
           finalRetryCount = Math.max(finalRetryCount, existingData.retryCount || 0);
+        } else if (!tombstone.googleCalendarEventId && existingData.googleCalendarEventId) {
+          // A no-ID snapshot cannot complete or erase a remote cleanup intent.
+          finalRemoteId = existingData.googleCalendarEventId;
+          finalStatus = existingData.status;
         } else {
           // If already cleaned, retain cleaned status unless a new remote ID arrived
           if (existingData.status === 'cleaned') {
@@ -270,6 +350,12 @@ export async function saveAuthoritativeTombstone(
         }
       }
 
+      // New authoritative intents must satisfy the strict Firestore CREATE contract.
+      if (!existingData) {
+        finalStatus = 'pending_cleanup';
+        finalRetryCount = 0;
+      }
+      const acceptedNewRemoteId = Boolean(existingData && finalRemoteId !== existingData.googleCalendarEventId && finalStatus === 'pending_cleanup');
       const firestoreData: FirestoreTombstoneDoc = {
         id: docId,
         compositeKey: tombstone.id || buildOutboxKey(userId, taskId, sessionId),
@@ -283,17 +369,23 @@ export async function saveAuthoritativeTombstone(
         retryCount: finalRetryCount,
         lastError: finalLastError,
         lastAttemptAt: finalLastAttemptAt,
+        cleanupClaimToken: acceptedNewRemoteId ? null : (existingData?.cleanupClaimToken || tombstone.cleanupClaimToken || null),
+        cleanupLeaseStartedAt: acceptedNewRemoteId ? null : (existingData?.cleanupLeaseStartedAt ?? null),
         syncedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
       // 3. Transactional write
-      transaction.set(docRef, sanitizeForFirestore(encodeFirestoreTombstone(firestoreData)));
+      transaction.set(docRef, sanitizeTombstoneForFirestore(
+        firestoreData,
+        acceptedNewRemoteId ? null : (existingData?.cleanupLeaseStartedAt ?? null)
+      ));
       return firestoreData;
     });
 
     return resultDoc;
   } catch (err) {
+    if (err instanceof Error && err.message.startsWith('Fencing:')) throw err;
     handleFirestoreError(
       err,
       OperationType.WRITE,
@@ -369,10 +461,15 @@ export async function syncOutboxToFirestore(options: SyncOutboxOptions): Promise
   for (const item of itemsToProcess) {
     try {
       // 1. Send tombstone to authoritative Firestore repository
-      await saveAuthoritativeFn(item);
+      const authoritative = await saveAuthoritativeFn(item);
 
       // 2. Mark item as synced in durable IndexedDB outbox
-      await markOutboxItemSynced(item.id);
+      const reconciled: Partial<DurableDeletionIntent> = {};
+      if (authoritative.status) reconciled.status = authoritative.status;
+      if (typeof authoritative.retryCount === 'number') reconciled.retryCount = authoritative.retryCount;
+      if (Object.prototype.hasOwnProperty.call(authoritative, 'googleCalendarEventId')) reconciled.googleCalendarEventId = authoritative.googleCalendarEventId || undefined;
+      if (Object.prototype.hasOwnProperty.call(authoritative, 'cleanupClaimToken')) reconciled.cleanupClaimToken = authoritative.cleanupClaimToken || undefined;
+      await markOutboxItemSynced(item.id, reconciled);
       syncedCount++;
     } catch (err: any) {
       failedCount++;
@@ -422,6 +519,7 @@ export async function reconcileRemoteTombstonesToLocal(
       retryCount: remote.retryCount || 0,
       lastError: remote.lastError || undefined,
       lastAttemptAt: remote.lastAttemptAt || undefined,
+      cleanupClaimToken: remote.cleanupClaimToken || undefined,
       updatedAt: remote.updatedAt || new Date().toISOString(),
     };
 

@@ -3855,7 +3855,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
           token: 'mock-token',
           userId,
           deleteEventFn: async (_tok: string, id: string) => { deletedIds.push(id); },
-          claimCleanupFn: async (candidate: any) => ({ claimed: true as const, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          claimCleanupFn: async (candidate: any) => ({ claimed: true as const, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString(), claimToken: 'test-claim' }),
+          renewCleanupClaimFn: async () => true,
           syncStateFn: async () => true,
         };
         const backoffResult = await processPendingDeletionCleanups({ ...cleanupOptions, now: Date.now() });
@@ -4115,7 +4116,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
           token: 'mock-token',
           tombstone: tomb,
           deleteEventFn: mockDelete,
-          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString(), claimToken: 'test-claim' }),
+          renewCleanupClaimFn: async () => true,
           syncStateFn: async () => true,
         });
         assert.strictEqual(res1.success, true);
@@ -4126,7 +4128,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
           token: 'mock-token',
           tombstone: res1.tombstone,
           deleteEventFn: mockDelete,
-          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString(), claimToken: 'test-claim' }),
+          renewCleanupClaimFn: async () => true,
           syncStateFn: async () => true,
         });
         assert.strictEqual(res2.success, true);
@@ -4147,7 +4150,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
             err.status = 404;
             throw err;
           },
-          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString(), claimToken: 'test-claim' }),
+          renewCleanupClaimFn: async () => true,
           syncStateFn: async () => true,
         });
         assert.strictEqual(res404.success, true, 'Status 404 harus dianggap berhasil terhapus');
@@ -4162,7 +4166,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
             err.status = 410;
             throw err;
           },
-          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString(), claimToken: 'test-claim' }),
+          renewCleanupClaimFn: async () => true,
           syncStateFn: async () => true,
         });
         assert.strictEqual(res410.success, true, 'Status 410 harus dianggap berhasil terhapus');
@@ -4177,6 +4182,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         const makeHarness = (initial: any) => {
           const authoritative = new Map<string, any>([[initial.id, { ...initial }]]);
           let syncAllowed = true;
+          let claimGeneration = 0;
+          let renewCount = 0;
           const claimCleanupFn = async (candidate: any) => {
             const state = authoritative.get(candidate.id);
             if (!state || state.googleCalendarEventId !== candidate.googleCalendarEventId) {
@@ -4186,17 +4193,27 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
             if (state.status === 'cleaning') return { claimed: false as const, reason: 'busy' as const };
             const retryCount = (state.retryCount || 0) + 1;
             const lastAttemptAt = new Date().toISOString();
-            authoritative.set(candidate.id, { ...state, status: 'cleaning', retryCount, lastAttemptAt });
-            return { claimed: true as const, retryCount, lastAttemptAt };
+            const claimToken = `${candidate.id}:claim:${++claimGeneration}`;
+            authoritative.set(candidate.id, { ...state, status: 'cleaning', retryCount, lastAttemptAt, cleanupClaimToken: claimToken });
+            return { claimed: true as const, retryCount, lastAttemptAt, claimToken };
           };
-          const syncStateFn = async (_userId: string, candidate: any) => {
+          const renewCleanupClaimFn = async (candidate: any, claimToken: string) => {
+            renewCount++;
+            const state = authoritative.get(candidate.id);
+            return Boolean(state?.status === 'cleaning' && state.cleanupClaimToken === claimToken && state.googleCalendarEventId === candidate.googleCalendarEventId);
+          };
+          const syncStateFn = async (_userId: string, candidate: any, claimToken?: string) => {
             if (!syncAllowed) return false;
+            const current = authoritative.get(candidate.id);
+            if (claimToken && (current?.status !== 'cleaning' || current.cleanupClaimToken !== claimToken || current.googleCalendarEventId !== candidate.googleCalendarEventId)) return false;
             authoritative.set(candidate.id, { ...authoritative.get(candidate.id), ...candidate });
             return true;
           };
           return {
             authoritative,
             claimCleanupFn,
+            renewCleanupClaimFn,
+            getRenewCount: () => renewCount,
             syncStateFn,
             failSync: () => { syncAllowed = false; },
           };
@@ -4209,12 +4226,14 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         let releaseDelete!: () => void;
         const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
         const deleteEventFn = async () => { deleteCount++; await deleteGate; };
-        const cleanupOptions = { token: 'mock-token', tombstone: concurrentTomb, deleteEventFn, claimCleanupFn: h1.claimCleanupFn, syncStateFn: h1.syncStateFn };
+        const cleanupOptions = { token: 'mock-token', tombstone: concurrentTomb, deleteEventFn, claimCleanupFn: h1.claimCleanupFn, renewCleanupClaimFn: h1.renewCleanupClaimFn, leaseHeartbeatIntervalMs: 5, syncStateFn: h1.syncStateFn };
         const first = compensateRemoteDeletion(cleanupOptions);
         const second = compensateRemoteDeletion(cleanupOptions);
         assert.strictEqual(first, second, 'Pemanggilan serentak pada tab yang sama harus berbagi promise in-flight');
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.strictEqual(deleteCount, 1, 'DELETE serentak harus dibatasi menjadi satu');
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        assert.ok(h1.getRenewCount() >= 2, 'Lease harus diperpanjang ketika remote DELETE masih berjalan');
         releaseDelete();
         const [firstResult, secondResult] = await Promise.all([first, second]);
         assert.strictEqual(firstResult.success, true);
@@ -4227,7 +4246,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         const failed = await compensateRemoteDeletion({
           token: 'mock-token', tombstone: retryTomb,
           deleteEventFn: async () => { attempts++; throw new Error('network disconnected'); },
-          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
+          claimCleanupFn: h2.claimCleanupFn, renewCleanupClaimFn: h2.renewCleanupClaimFn, syncStateFn: h2.syncStateFn,
         });
         assert.strictEqual(failed.success, false);
         assert.strictEqual(failed.tombstone.status, 'cleanup_failed');
@@ -4235,7 +4254,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         const retried = await compensateRemoteDeletion({
           token: 'mock-token', tombstone: failed.tombstone,
           deleteEventFn: async () => { attempts++; },
-          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
+          claimCleanupFn: h2.claimCleanupFn, renewCleanupClaimFn: h2.renewCleanupClaimFn, syncStateFn: h2.syncStateFn,
         });
         assert.strictEqual(retried.success, true);
         assert.strictEqual(retried.tombstone.retryCount, 2, 'Retry harus mengambil counter terbaru dan menaikkannya sekali');
@@ -4245,7 +4264,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         let noTokenDeletes = 0;
         const noToken = await compensateRemoteDeletion({
           token: '', tombstone: noTokenTomb, deleteEventFn: async () => { noTokenDeletes++; },
-          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
+          claimCleanupFn: h2.claimCleanupFn, renewCleanupClaimFn: h2.renewCleanupClaimFn, syncStateFn: h2.syncStateFn,
         });
         assert.strictEqual(noToken.success, false);
         assert.strictEqual(noTokenDeletes, 0, 'Tanpa token tidak boleh mengirim DELETE');
@@ -4255,7 +4274,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         const expiredToken = await compensateRemoteDeletion({
           token: 'expired-token', tombstone: expiredTokenTomb,
           deleteEventFn: async () => { const err: any = new Error('Unauthorized'); err.status = 401; throw err; },
-          claimCleanupFn: hExpired.claimCleanupFn, syncStateFn: hExpired.syncStateFn,
+          claimCleanupFn: hExpired.claimCleanupFn, renewCleanupClaimFn: hExpired.renewCleanupClaimFn, syncStateFn: hExpired.syncStateFn,
         });
         assert.strictEqual(expiredToken.success, false);
         assert.strictEqual(expiredToken.tombstone.status, 'cleanup_failed');
@@ -4263,9 +4282,11 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
 
         const cleanedTomb = { ...retryTomb, status: 'cleaned' as const };
         updateTombstone(cleanedTomb.id, cleanedTomb);
+        const stalePendingSnapshot = updateTombstone(cleanedTomb.id, { status: 'pending_cleanup' });
+        assert.strictEqual(stalePendingSnapshot?.status, 'cleaned', 'Snapshot lama tidak boleh menurunkan cleaned ke pending_cleanup');
         const cleaned = await compensateRemoteDeletion({
           token: 'mock-token', tombstone: cleanedTomb, deleteEventFn: async () => { attempts++; },
-          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
+          claimCleanupFn: h2.claimCleanupFn, renewCleanupClaimFn: h2.renewCleanupClaimFn, syncStateFn: h2.syncStateFn,
         });
         assert.strictEqual(cleaned.success, true);
         assert.strictEqual(attempts, 2, 'Tombstone cleaned tidak boleh di-DELETE kembali');
@@ -4276,7 +4297,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         const busy = await compensateRemoteDeletion({
           token: 'mock-token', tombstone: { ...busyTomb, status: 'cleaning', lastAttemptAt: new Date().toISOString() },
           deleteEventFn: async () => { busyDeletes++; },
-          claimCleanupFn: hBusy.claimCleanupFn, syncStateFn: hBusy.syncStateFn,
+          claimCleanupFn: hBusy.claimCleanupFn, renewCleanupClaimFn: hBusy.renewCleanupClaimFn, syncStateFn: hBusy.syncStateFn,
         });
         assert.strictEqual(busy.success, false);
         assert.strictEqual(busyDeletes, 0, 'Status cleaning yang aktif harus menolak klaim kedua');
@@ -4287,7 +4308,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         let staleDeletes = 0;
         const stale = await compensateRemoteDeletion({
           token: 'mock-token', tombstone: changedTomb, deleteEventFn: async () => { staleDeletes++; },
-          claimCleanupFn: hChanged.claimCleanupFn, syncStateFn: hChanged.syncStateFn,
+          claimCleanupFn: hChanged.claimCleanupFn, renewCleanupClaimFn: hChanged.renewCleanupClaimFn, syncStateFn: hChanged.syncStateFn,
         });
         assert.strictEqual(stale.success, false);
         assert.strictEqual(staleDeletes, 0, 'Snapshot lama tidak boleh menghapus remote ID yang lebih baru');
@@ -4297,7 +4318,7 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         hPersist.failSync();
         const persistenceFailure = await compensateRemoteDeletion({
           token: 'mock-token', tombstone: persistTomb, deleteEventFn: async () => {},
-          claimCleanupFn: hPersist.claimCleanupFn, syncStateFn: hPersist.syncStateFn,
+          claimCleanupFn: hPersist.claimCleanupFn, renewCleanupClaimFn: hPersist.renewCleanupClaimFn, syncStateFn: hPersist.syncStateFn,
         });
         assert.strictEqual(persistenceFailure.success, false, 'Kegagalan konfirmasi Firestore tidak boleh dianggap cleaned');
         assert.strictEqual(persistenceFailure.tombstone.status, 'cleaning');
@@ -4305,6 +4326,17 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
         assert.ok(retainedIntent, 'Outbox intent harus dipertahankan saat Firestore gagal');
         assert.strictEqual(retainedIntent?.status, 'cleaned');
         assert.strictEqual(retainedIntent?.syncStatus, 'pending_sync');
+
+        const noEventTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-no-event-id');
+        let noEventDeletes = 0;
+        const noEventResult = await compensateRemoteDeletion({
+          token: '', tombstone: noEventTomb,
+          deleteEventFn: async () => { noEventDeletes++; },
+          syncStateFn: async () => true,
+        });
+        assert.strictEqual(noEventResult.success, true, 'Tombstone tanpa remote ID selesai setelah sync authoritative');
+        assert.strictEqual(noEventResult.tombstone.status, 'cleaned');
+        assert.strictEqual(noEventDeletes, 0);
 
         console.log('    ✅ [PASS] Cleanup produksi: concurrent dedupe, retry counter, no-token/401, cleaned/busy guard, stale ID, dan kegagalan konfirmasi Firestore.');
       }

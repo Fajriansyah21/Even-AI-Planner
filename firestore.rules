@@ -49,6 +49,44 @@ service cloud.firestore {
         || (prevStatus == 'cleanup_failed' && nextStatus in ['cleanup_failed', 'cleaning', 'cleaned'] && !hasNewRemoteId);
     }
 
+    function claimToken(data) { return data.get('cleanupClaimToken', null); }
+    function leaseStartedAt(data) { return data.get('cleanupLeaseStartedAt', null); }
+
+    function isValidClaimFenceTransition() {
+      let oldToken = claimToken(existing());
+      let newToken = claimToken(incoming());
+      let oldLease = leaseStartedAt(existing());
+      let newLease = leaseStartedAt(incoming());
+      let takeover = incoming().status == 'cleaning'
+        && newToken is string && newToken.size() >= 1 && newToken.size() <= 128
+        && newToken != oldToken
+        && newLease == request.time
+        && incoming().retryCount == existing().retryCount + 1
+        && (existing().status in ['pending_cleanup', 'cleanup_failed']
+          || (existing().status == 'cleaning'
+            && (oldLease == null || request.time >= oldLease + duration.value(7, 'm'))));
+      let renewal = existing().status == 'cleaning' && incoming().status == 'cleaning'
+        && newToken == oldToken && newToken is string
+        && newLease == request.time
+        && incoming().retryCount == existing().retryCount;
+      let releaseForLateEvent = existing().status == 'cleaned'
+        && incoming().status == 'pending_cleanup'
+        && incoming().get('googleCalendarEventId', null) != existing().get('googleCalendarEventId', null)
+        && newToken == null && newLease == null;
+      let fencedResult = existing().status == 'cleaning'
+        && incoming().status in ['cleaned', 'cleanup_failed']
+        && oldToken is string && newToken == oldToken && newLease == oldLease;
+      let noRemoteCleanup = existing().status == 'pending_cleanup'
+        && incoming().status == 'cleaned'
+        && existing().get('googleCalendarEventId', null) == null
+        && incoming().get('googleCalendarEventId', null) == null
+        && oldToken == null && newToken == null && oldLease == null && newLease == null;
+      let stableState = oldToken == newToken && oldLease == newLease
+        && existing().status == incoming().status
+        && existing().status in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed'];
+      return stableState || takeover || renewal || releaseForLateEvent || fencedResult || noRemoteCleanup;
+    }
+
     // Subcollections under /users/{userId}
     match /users/{userId} {
       allow read, write: if isOwner(userId);
@@ -101,7 +139,7 @@ service cloud.firestore {
         allow get, list: if isOwner(userId);
 
         allow create: if isOwner(userId) && isValidId(tombstoneId)
-          && incoming().keys().hasOnly(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error'])
+          && incoming().keys().hasOnly(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error', 'cleanupClaimToken', 'cleanupLeaseStartedAt'])
           && incoming().keys().hasAll(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt'])
           && incoming().userId == userId
           && incoming().taskId is string && incoming().taskId.size() > 0 && incoming().taskId.size() <= 256
@@ -114,10 +152,12 @@ service cloud.firestore {
           && incoming().updatedAt is string && incoming().updatedAt.size() <= 64
           && (!('googleCalendarEventId' in incoming()) || incoming().googleCalendarEventId == null || (incoming().googleCalendarEventId is string && incoming().googleCalendarEventId.size() > 0 && incoming().googleCalendarEventId.size() <= 256))
           && (!('lastAttemptAt' in incoming()) || incoming().lastAttemptAt == null || (incoming().lastAttemptAt is string && incoming().lastAttemptAt.size() <= 64))
-          && (!('error' in incoming()) || incoming().error == null || (incoming().error is string && incoming().error.size() <= 500));
+          && (!('error' in incoming()) || incoming().error == null || (incoming().error is string && incoming().error.size() <= 500))
+          && (!('cleanupClaimToken' in incoming()) || incoming().cleanupClaimToken == null)
+          && (!('cleanupLeaseStartedAt' in incoming()) || incoming().cleanupLeaseStartedAt == null);
 
         allow update: if isOwner(userId) && isValidId(tombstoneId)
-          && incoming().keys().hasOnly(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error'])
+          && incoming().keys().hasOnly(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error', 'cleanupClaimToken', 'cleanupLeaseStartedAt'])
           && incoming().keys().hasAll(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt'])
           && incoming().userId == userId
           && incoming().taskId is string && incoming().taskId.size() > 0 && incoming().taskId.size() <= 256
@@ -131,6 +171,8 @@ service cloud.firestore {
           && (!('googleCalendarEventId' in incoming()) || incoming().googleCalendarEventId == null || (incoming().googleCalendarEventId is string && incoming().googleCalendarEventId.size() > 0 && incoming().googleCalendarEventId.size() <= 256))
           && (!('lastAttemptAt' in incoming()) || incoming().lastAttemptAt == null || (incoming().lastAttemptAt is string && incoming().lastAttemptAt.size() <= 64))
           && (!('error' in incoming()) || incoming().error == null || (incoming().error is string && incoming().error.size() <= 500))
+          && (!('cleanupClaimToken' in incoming()) || incoming().cleanupClaimToken == null || (incoming().cleanupClaimToken is string && incoming().cleanupClaimToken.size() >= 1 && incoming().cleanupClaimToken.size() <= 128))
+          && (!('cleanupLeaseStartedAt' in incoming()) || incoming().cleanupLeaseStartedAt == null || incoming().cleanupLeaseStartedAt is timestamp)
           // Immutability: identity and initial deletion timestamp cannot be changed or forged
           && incoming().userId == existing().userId
           && incoming().taskId == existing().taskId
@@ -153,7 +195,9 @@ service cloud.firestore {
                incoming().status,
                incoming().get('googleCalendarEventId', null) != null &&
                  incoming().get('googleCalendarEventId', null) != existing().get('googleCalendarEventId', null)
-             );
+             )
+          // Claim takeover/renewal uses Firestore request.time, not client clocks.
+          && isValidClaimFenceTransition();
 
         // Tombstones are monotonic and permanent to guarantee User Deletion Intent Wins
         allow delete: if false;
