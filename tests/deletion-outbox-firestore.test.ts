@@ -68,10 +68,20 @@ function createMockIdbFactory(options?: {
 }) {
   const databaseStorage = new Map<string, Map<string, any>>();
   let putCount = 0;
+  let failTransactions = Boolean(options?.failTransactions);
+  let failOnPutCount: number[] | null = options?.failOnPutCount ? [...options.failOnPutCount] : null;
+  let delayCompleteMs = options?.delayCompleteMs ?? 10;
 
   const factory: any = {
     getPutCount: () => putCount,
     resetPutCount: () => { putCount = 0; },
+    setFailTransactions: (fail: boolean) => { failTransactions = fail; },
+    setFailOnPutCount: (counts: number[] | null) => { failOnPutCount = counts ? [...counts] : null; },
+    clearFailureInjection: () => {
+      failTransactions = false;
+      failOnPutCount = null;
+    },
+    getDatabaseStorage: () => databaseStorage,
     open(name: string, version: number) {
       const openReq: any = {
         result: null,
@@ -101,6 +111,7 @@ function createMockIdbFactory(options?: {
           transaction(storeNames: string | string[], mode: 'readonly' | 'readwrite') {
             let txFailed = false;
             let txAborted = false;
+            let txCompleted = false;
             // Transaction-local uncommitted buffer to accurately model transactional rollback
             const txBuffer = new Map<string, any>();
             const txDeletes = new Set<string>();
@@ -112,6 +123,7 @@ function createMockIdbFactory(options?: {
               onerror: null,
               onabort: null,
               abort() {
+                if (txAborted || txCompleted) return;
                 txAborted = true;
                 txBuffer.clear();
                 txDeletes.clear();
@@ -121,12 +133,12 @@ function createMockIdbFactory(options?: {
                 return {
                   put(item: any) {
                     putCount++;
-                    if (options?.failOnPutCount && options.failOnPutCount.includes(putCount)) {
+                    if (failOnPutCount && failOnPutCount.includes(putCount)) {
                       txFailed = true;
                       tx.error = new Error(`Disk I/O error writing item #${putCount} to IndexedDB`);
                       return;
                     }
-                    if (options?.failTransactions) {
+                    if (failTransactions) {
                       txFailed = true;
                       tx.error = new Error('Disk I/O error writing to IndexedDB');
                       return;
@@ -197,11 +209,12 @@ function createMockIdbFactory(options?: {
             };
 
             setTimeout(() => {
-              if (txAborted) {
-                // Aborted: uncommitted buffer is discarded
+              if (txAborted || txCompleted) {
+                // Aborted or completed: uncommitted buffer is discarded
                 return;
               }
-              if (options?.failTransactions || txFailed) {
+              if (failTransactions || txFailed) {
+                txAborted = true;
                 tx.error = tx.error || new Error('Disk quota exceeded in IndexedDB transaction');
                 // Rollback uncommitted changes in this transaction
                 txBuffer.clear();
@@ -209,6 +222,7 @@ function createMockIdbFactory(options?: {
                 if (tx.onerror) tx.onerror(new Event('error'));
                 if (tx.onabort) tx.onabort(new Event('abort'));
               } else {
+                txCompleted = true;
                 // Commit uncommitted changes to persistent storage
                 for (const [k, v] of txBuffer.entries()) {
                   storeMap.set(k, v);
@@ -218,7 +232,7 @@ function createMockIdbFactory(options?: {
                 }
                 if (tx.oncomplete) tx.oncomplete(new Event('complete'));
               }
-            }, options?.delayCompleteMs || 10);
+            }, delayCompleteMs);
 
             return tx;
           },
@@ -943,7 +957,7 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       pass('Test 15: Retry setelah kegagalan tidak menghasilkan duplikasi tombstone (idempotent keying)');
     }
 
-    // [Test 16] TEMUAN 3: Real Injected Partial Failure on actual recordTaskDeletionDurable
+    // [Test 16] ISSUE 2: Retry dengan Database Persistence yang Sama (Real Injected Partial Failure)
     {
       const userId = 'user-partial-16-real';
       const taskId = 'task-partial-16-real';
@@ -969,76 +983,58 @@ export async function runDeletionOutboxAndFirestoreSuite() {
         assert.strictEqual(items.length, 0, 'Tidak boleh ada item yang tersimpan saat put pertama gagal');
       }
 
-      // Skenario 16B: Kegagalan pada penyimpanan sesi kedua (put #1 task sukses, put #2 sess-1 sukses, put #3 sess-2 gagal)
-      {
-        const failOnThirdFactory = createMockIdbFactory({ failOnPutCount: [3] });
-        setCustomIdbFactory(failOnThirdFactory);
+      // Skenario 16B & 16C: MENGGUNAKAN SATU INSTANCE DATABASE STORAGE YANG SAMA PERSIS
+      const sharedFactory = createMockIdbFactory({ failOnPutCount: [3] });
+      setCustomIdbFactory(sharedFactory);
 
+      // Skenario 16B: Jalankan recordTaskDeletionDurable() dan paksa transaksi ketiga gagal
+      {
         await assert.rejects(
           async () => {
             await recordTaskDeletionDurable(userId, taskId, sessions);
           },
           /Disk I\/O error writing item #3 to IndexedDB|Disk quota exceeded/,
-          'recordTaskDeletionDurable wajib melempar error saat put sesi kedua gagal'
+          'recordTaskDeletionDurable wajib melempar error saat transaksi ketiga gagal'
         );
 
-        // Verify partial state: task-level and session-1 exist, session-2 does not
+        // Verifikasi dua item pertama tetap tersedia di database
         const partialItems = await getAllOutboxItems(userId);
-        assert.strictEqual(partialItems.length, 2, 'Item task dan sess-1 tersimpan, sess-2 gagal');
+        assert.strictEqual(partialItems.length, 2, 'Dua transaksi pertama (task dan sess-1) tetap commit dan tersedia');
+        const taskItem = await getOutboxItem(buildOutboxKey(userId, taskId, 'all'));
+        assert.ok(taskItem, 'Task tombstone harus tersimpan di database');
+        const sess1Item = await getOutboxItem(buildOutboxKey(userId, taskId, 'sess-p1'));
+        assert.ok(sess1Item, 'Session 1 tombstone harus tersimpan di database');
         const sess2Item = await getOutboxItem(buildOutboxKey(userId, taskId, 'sess-p2'));
-        assert.strictEqual(sess2Item, undefined, 'Sesi 2 tidak boleh tersimpan karena transaksinya gagal');
+        assert.strictEqual(sess2Item, undefined, 'Sesi 2 tidak boleh tersimpan karena transaksinya di-rollback');
       }
 
-      // Skenario 16C: Retry setelah kegagalan parsial
+      // Skenario 16C: Matikan injeksi kegagalan tanpa menghapus database & panggil recordTaskDeletionDurable kembali (TANPA PRE-POPULATION MANUAL)
       {
-        // Factory now works without failure
-        const workingFactory = createMockIdbFactory();
-        setCustomIdbFactory(workingFactory);
+        // Matikan injeksi kegagalan pada instance sharedFactory yang SAMA
+        sharedFactory.clearFailureInjection();
+        sharedFactory.resetPutCount();
 
-        // Pre-populate with partial state from 16B
-        await saveToOutbox({
-          id: buildOutboxKey(userId, taskId, 'all'),
-          userId,
-          taskId,
-          sessionId: 'all',
-          entityType: 'task',
-          deletedAt: '2026-11-10T10:00:00.000Z',
-          status: 'cleaned',
-          syncStatus: 'pending_sync',
-          syncAttempts: 0,
-          retryCount: 0,
-          updatedAt: '2026-11-10T10:00:00.000Z',
-        });
-        await saveToOutbox({
-          id: buildOutboxKey(userId, taskId, 'sess-p1'),
-          userId,
-          taskId,
-          sessionId: 'sess-p1',
-          entityType: 'session',
-          googleCalendarEventId: 'gcal-p1',
-          deletedAt: '2026-11-10T10:00:00.000Z',
-          status: 'pending_cleanup',
-          syncStatus: 'pending_sync',
-          syncAttempts: 0,
-          retryCount: 0,
-          updatedAt: '2026-11-10T10:00:00.000Z',
-        });
-
-        // Call actual recordTaskDeletionDurable again
+        // Panggil recordTaskDeletionDurable kembali secara aktual pada database yang sama
         const recovered = await recordTaskDeletionDurable(userId, taskId, sessions);
-        assert.strictEqual(recovered.length, 3, 'Hasil recovery harus mengembalikan 1 task + 2 session tombstone');
+        assert.strictEqual(recovered.length, 3, 'Hasil recovery mengembalikan 1 task + 2 session tombstone');
 
+        // Pastikan item ketiga berhasil disimpan
+        const sess2ItemRecovered = await getOutboxItem(buildOutboxKey(userId, taskId, 'sess-p2'));
+        assert.ok(sess2ItemRecovered, 'Item ketiga (sess-2) sekarang berhasil disimpan');
+        assert.strictEqual(sess2ItemRecovered?.googleCalendarEventId, 'gcal-p2');
+
+        // Pastikan total item tepat tiga
         const allItems = await getAllOutboxItems(userId);
-        assert.strictEqual(allItems.length, 3, 'Tepat 3 item outbox tanpa duplikasi');
+        assert.strictEqual(allItems.length, 3, 'Tepat tiga item outbox tersimpan di database yang sama');
 
-        // Skenario 16D: Pemanggilan ulang dengan data yang sama (repeated retry)
+        // Skenario 16D: Panggil retry sekali lagi dan pastikan tidak ada duplikasi
         const secondRetry = await recordTaskDeletionDurable(userId, taskId, sessions);
         assert.strictEqual(secondRetry.length, 3);
         const allItemsAfterSecond = await getAllOutboxItems(userId);
-        assert.strictEqual(allItemsAfterSecond.length, 3, 'Pemanggilan berulang tetap menghasilkan tepat 3 item (idempoten)');
+        assert.strictEqual(allItemsAfterSecond.length, 3, 'Pemanggilan ulang kedua tetap menghasilkan tepat 3 item (zero duplicates)');
       }
 
-      pass('Test 16: [Temuan 3] Injeksi kegagalan nyata pada recordTaskDeletionDurable aktual, retry berulang, dan pemulihan konsistensi 100% lulus');
+      pass('Test 16: [Issue 2] Retry dengan database persistence yang sama berhasil memulihkan partial state tanpa pre-population manual');
     }
 
     // [Test 17] TEMUAN 1: Security Rules State Machine Transition Matrix & Loophole Sealing
@@ -1189,6 +1185,70 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       );
 
       pass('Test 17: [Temuan 1] Matriks transisi status & penutupan celah remote ID firestore.rules divalidasi 100% lengkap');
+    }
+
+    // [Test 18] ISSUE 1: Firestore Tombstone Creation Constraints
+    {
+      const allowedCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error'];
+      const requiredCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt'];
+
+      function validateTombstoneCreationRule(incoming: any, userId: string, tombstoneId: string): { allowed: boolean; reason?: string } {
+        const keys = Object.keys(incoming);
+        const hasOnly = keys.every((k) => allowedCreateKeys.includes(k));
+        const hasAll = requiredCreateKeys.every((k) => keys.includes(k));
+        if (!hasOnly || !hasAll) return { allowed: false, reason: 'Invalid keys / schema mismatch' };
+        if (incoming.userId !== userId) return { allowed: false, reason: 'Owner mismatch' };
+        if (typeof incoming.taskId !== 'string' || incoming.taskId.length === 0 || incoming.taskId.length > 256) return { allowed: false, reason: 'Invalid taskId' };
+        if (typeof incoming.sessionId !== 'string' || incoming.sessionId.length === 0 || incoming.sessionId.length > 256) return { allowed: false, reason: 'Invalid sessionId' };
+        if (typeof incoming.compositeKey !== 'string' || incoming.compositeKey.length === 0 || incoming.compositeKey.length > 512) return { allowed: false, reason: 'Invalid compositeKey' };
+        if (!['task', 'session'].includes(incoming.entityType)) return { allowed: false, reason: 'Invalid entityType' };
+        if (typeof incoming.deletedAt !== 'string' || incoming.deletedAt.length > 64) return { allowed: false, reason: 'Invalid deletedAt' };
+        // Strict create constraints matching firestore.rules:
+        if (incoming.status !== 'pending_cleanup') return { allowed: false, reason: 'Tombstone baru hanya boleh pending_cleanup' };
+        if (incoming.retryCount !== 0) return { allowed: false, reason: 'Tombstone baru wajib retryCount == 0' };
+        if (typeof incoming.updatedAt !== 'string' || incoming.updatedAt.length > 64) return { allowed: false, reason: 'Invalid updatedAt' };
+        if ('googleCalendarEventId' in incoming && incoming.googleCalendarEventId !== null) {
+          if (typeof incoming.googleCalendarEventId !== 'string' || incoming.googleCalendarEventId.length === 0 || incoming.googleCalendarEventId.length > 256) {
+            return { allowed: false, reason: 'Invalid remote ID' };
+          }
+        }
+        return { allowed: true };
+      }
+
+      const baseValidTombstone = {
+        userId: 'alice',
+        taskId: 't1',
+        sessionId: 's1',
+        compositeKey: 'alice:t1:s1',
+        entityType: 'session',
+        deletedAt: '2026-11-10T10:00:00Z',
+        status: 'pending_cleanup',
+        retryCount: 0,
+        updatedAt: '2026-11-10T10:00:00Z',
+        googleCalendarEventId: 'gcal-123',
+      };
+
+      // 1. Create dengan pending_cleanup diterima
+      const res1 = validateTombstoneCreationRule({ ...baseValidTombstone, status: 'pending_cleanup', retryCount: 0 }, 'alice', 'tomb_1');
+      assert.strictEqual(res1.allowed, true, 'Create dengan pending_cleanup dan retryCount 0 wajib diterima');
+
+      // 2. Create dengan cleaning ditolak
+      const res2 = validateTombstoneCreationRule({ ...baseValidTombstone, status: 'cleaning', retryCount: 0 }, 'alice', 'tomb_1');
+      assert.strictEqual(res2.allowed, false, 'Create dengan cleaning wajib ditolak');
+
+      // 3. Create dengan cleaned ditolak
+      const res3 = validateTombstoneCreationRule({ ...baseValidTombstone, status: 'cleaned', retryCount: 0 }, 'alice', 'tomb_1');
+      assert.strictEqual(res3.allowed, false, 'Create dengan cleaned wajib ditolak');
+
+      // 4. Create dengan cleanup_failed ditolak
+      const res4 = validateTombstoneCreationRule({ ...baseValidTombstone, status: 'cleanup_failed', retryCount: 0 }, 'alice', 'tomb_1');
+      assert.strictEqual(res4.allowed, false, 'Create dengan cleanup_failed wajib ditolak');
+
+      // 5. Create dengan retryCount lebih dari 0 ditolak
+      const res5 = validateTombstoneCreationRule({ ...baseValidTombstone, status: 'pending_cleanup', retryCount: 1 }, 'alice', 'tomb_1');
+      assert.strictEqual(res5.allowed, false, 'Create dengan retryCount > 0 wajib ditolak');
+
+      pass('Test 18: [Issue 1] Validasi aturan Create: hanya pending_cleanup & retryCount 0 diterima, status lain & retryCount > 0 ditolak');
     }
 
     console.log('\n================================================================');

@@ -109,8 +109,8 @@ service cloud.firestore {
           && incoming().compositeKey is string && incoming().compositeKey.size() > 0 && incoming().compositeKey.size() <= 512
           && incoming().entityType in ['task', 'session']
           && incoming().deletedAt is string && incoming().deletedAt.size() <= 64
-          && incoming().status in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed']
-          && incoming().retryCount is number && incoming().retryCount >= 0
+          && incoming().status == 'pending_cleanup'
+          && incoming().retryCount == 0
           && incoming().updatedAt is string && incoming().updatedAt.size() <= 64
           && (!('googleCalendarEventId' in incoming()) || incoming().googleCalendarEventId == null || (incoming().googleCalendarEventId is string && incoming().googleCalendarEventId.size() > 0 && incoming().googleCalendarEventId.size() <= 256))
           && (!('lastAttemptAt' in incoming()) || incoming().lastAttemptAt == null || (incoming().lastAttemptAt is string && incoming().lastAttemptAt.size() <= 64))

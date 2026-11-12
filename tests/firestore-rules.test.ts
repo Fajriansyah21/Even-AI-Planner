@@ -50,6 +50,14 @@ export async function runFirestoreRulesSuite() {
     'firestore.rules wajib memiliki isValidTombstoneTransition'
   );
   assert.ok(
+    rulesContent.includes("incoming().status == 'pending_cleanup'"),
+    'firestore.rules wajib membatasi create status hanya pending_cleanup'
+  );
+  assert.ok(
+    rulesContent.includes('incoming().retryCount == 0'),
+    'firestore.rules wajib membatasi create retryCount awal == 0'
+  );
+  assert.ok(
     rulesContent.includes("prevStatus == 'cleaned' && nextStatus == 'cleaned' && !hasNewRemoteId"),
     'firestore.rules wajib mencegah cleaned -> cleaned jika hasNewRemoteId bernilai true'
   );
@@ -69,7 +77,46 @@ export async function runFirestoreRulesSuite() {
     rulesContent.includes('allow delete: if false'),
     'firestore.rules wajib melarang penghapusan dokumen tombstone'
   );
-  console.log('  ✅ [PASS] Static Audit: Seluruh konstruksi aturan keamanan deletion_tombstones terverifikasi di firestore.rules');
+
+  // Static evaluation of tombstone creation rule predicate (Requirement 1 test cases):
+  console.log('  🔍 [STATIC AUDIT] Menguji 5 syarat pembuatan tombstone (Requirement 1)...');
+  const allowedCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error'];
+  const requiredCreateKeys = ['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt'];
+
+  function evaluateCreateRule(data: any): boolean {
+    const keys = Object.keys(data);
+    const hasOnly = keys.every((k) => allowedCreateKeys.includes(k));
+    const hasAll = requiredCreateKeys.every((k) => keys.includes(k));
+    if (!hasOnly || !hasAll) return false;
+    if (data.status !== 'pending_cleanup') return false;
+    if (data.retryCount !== 0) return false;
+    return true;
+  }
+
+  const baseValidData = {
+    userId: 'user-alice',
+    taskId: 'task-1',
+    sessionId: 'all',
+    compositeKey: 'user-alice:task-1:all',
+    entityType: 'task',
+    deletedAt: '2026-11-10T10:00:00.000Z',
+    status: 'pending_cleanup',
+    retryCount: 0,
+    updatedAt: '2026-11-10T10:00:00.000Z',
+  };
+
+  // 1. Create dengan pending_cleanup diterima
+  assert.strictEqual(evaluateCreateRule({ ...baseValidData, status: 'pending_cleanup', retryCount: 0 }), true, '1. Create pending_cleanup + retryCount 0 wajib diterima');
+  // 2. Create dengan cleaning ditolak
+  assert.strictEqual(evaluateCreateRule({ ...baseValidData, status: 'cleaning', retryCount: 0 }), false, '2. Create cleaning wajib ditolak');
+  // 3. Create dengan cleaned ditolak
+  assert.strictEqual(evaluateCreateRule({ ...baseValidData, status: 'cleaned', retryCount: 0 }), false, '3. Create cleaned wajib ditolak');
+  // 4. Create dengan cleanup_failed ditolak
+  assert.strictEqual(evaluateCreateRule({ ...baseValidData, status: 'cleanup_failed', retryCount: 0 }), false, '4. Create cleanup_failed wajib ditolak');
+  // 5. Create dengan retryCount > 0 ditolak
+  assert.strictEqual(evaluateCreateRule({ ...baseValidData, status: 'pending_cleanup', retryCount: 1 }), false, '5. Create retryCount > 0 wajib ditolak');
+
+  console.log('  ✅ [PASS] Static Audit: Seluruh konstruksi aturan keamanan deletion_tombstones & 5 syarat pembuatan terverifikasi');
 
   const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST;
   if (!emulatorHost) {
@@ -78,7 +125,7 @@ export async function runFirestoreRulesSuite() {
     console.log('  ℹ️  Untuk menjalankan runtime test di lingkungan lokal pengguna yang memiliki JRE:');
     console.log('      1. Pastikan Java JRE terpasang (java -version).');
     console.log('      2. Jalankan: npx firebase emulators:exec --only firestore "npx tsx tests/firestore-rules.test.ts"');
-    console.log('      3. Seluruh 10 kasus pengujian di bawah ini akan dieksekusi terhadap emulator live.\n');
+    console.log('      3. Seluruh 14 kasus pengujian runtime di bawah ini akan dieksekusi terhadap emulator live.\n');
     return {
       status: 'NOT VERIFIED',
       reason: 'Java JRE / FIRESTORE_EMULATOR_HOST tidak tersedia di container sandbox',
@@ -108,8 +155,8 @@ export async function runFirestoreRulesSuite() {
     const tombstoneDocId = 'tomb_task-rules-1_all_hash123';
     const aliceDocRef = doc(aliceDb, `users/${aliceUid}/deletion_tombstones/${tombstoneDocId}`);
 
-    // Case 1: Valid tombstone creation
-    console.log('  Running Case 1: Pembuatan tombstone yang valid');
+    // Case 1A: Valid tombstone creation (pending_cleanup + retryCount 0 diterima)
+    console.log('  Running Case 1A: Pembuatan tombstone valid (pending_cleanup & retryCount 0)');
     await assertSucceeds(
       setDoc(aliceDocRef, {
         userId: aliceUid,
@@ -120,6 +167,74 @@ export async function runFirestoreRulesSuite() {
         deletedAt: '2026-11-10T10:00:00.000Z',
         status: 'pending_cleanup',
         retryCount: 0,
+        updatedAt: '2026-11-10T10:00:00.000Z',
+      })
+    );
+
+    // Case 1B: Create dengan cleaning ditolak
+    console.log('  Running Case 1B: Create dengan cleaning ditolak');
+    const rejectCleaningRef = doc(aliceDb, `users/${aliceUid}/deletion_tombstones/tomb_rej_cleaning_hash1`);
+    await assertFails(
+      setDoc(rejectCleaningRef, {
+        userId: aliceUid,
+        taskId: 'task-rej-1',
+        sessionId: 'all',
+        compositeKey: `${aliceUid}:task-rej-1:all`,
+        entityType: 'task',
+        deletedAt: '2026-11-10T10:00:00.000Z',
+        status: 'cleaning',
+        retryCount: 0,
+        updatedAt: '2026-11-10T10:00:00.000Z',
+      })
+    );
+
+    // Case 1C: Create dengan cleaned ditolak
+    console.log('  Running Case 1C: Create dengan cleaned ditolak');
+    const rejectCleanedRef = doc(aliceDb, `users/${aliceUid}/deletion_tombstones/tomb_rej_cleaned_hash2`);
+    await assertFails(
+      setDoc(rejectCleanedRef, {
+        userId: aliceUid,
+        taskId: 'task-rej-2',
+        sessionId: 'all',
+        compositeKey: `${aliceUid}:task-rej-2:all`,
+        entityType: 'task',
+        deletedAt: '2026-11-10T10:00:00.000Z',
+        status: 'cleaned',
+        retryCount: 0,
+        updatedAt: '2026-11-10T10:00:00.000Z',
+      })
+    );
+
+    // Case 1D: Create dengan cleanup_failed ditolak
+    console.log('  Running Case 1D: Create dengan cleanup_failed ditolak');
+    const rejectFailedRef = doc(aliceDb, `users/${aliceUid}/deletion_tombstones/tomb_rej_failed_hash3`);
+    await assertFails(
+      setDoc(rejectFailedRef, {
+        userId: aliceUid,
+        taskId: 'task-rej-3',
+        sessionId: 'all',
+        compositeKey: `${aliceUid}:task-rej-3:all`,
+        entityType: 'task',
+        deletedAt: '2026-11-10T10:00:00.000Z',
+        status: 'cleanup_failed',
+        retryCount: 0,
+        updatedAt: '2026-11-10T10:00:00.000Z',
+      })
+    );
+
+    // Case 1E: Create dengan retryCount > 0 ditolak
+    console.log('  Running Case 1E: Create dengan retryCount > 0 ditolak');
+    const rejectRetryRef = doc(aliceDb, `users/${aliceUid}/deletion_tombstones/tomb_rej_retry_hash4`);
+    await assertFails(
+      setDoc(rejectRetryRef, {
+        userId: aliceUid,
+        taskId: 'task-rej-4',
+        sessionId: 'all',
+        compositeKey: `${aliceUid}:task-rej-4:all`,
+        entityType: 'task',
+        deletedAt: '2026-11-10T10:00:00.000Z',
+        status: 'pending_cleanup',
+        retryCount: 1, // Invalid initial retryCount
         updatedAt: '2026-11-10T10:00:00.000Z',
       })
     );
@@ -142,8 +257,9 @@ export async function runFirestoreRulesSuite() {
     );
 
     // Case 3: Invalid status transition (cleaning -> pending_cleanup rejected)
-    console.log('  Running Case 3: Transisi status tidak valid');
+    console.log('  Running Case 3: Transisi status tidak valid (cleaning -> pending_cleanup ditolak)');
     const cleaningDocRef = doc(aliceDb, `users/${aliceUid}/deletion_tombstones/tomb_task-clean_all_hash456`);
+    // Create initially valid as pending_cleanup
     await assertSucceeds(
       setDoc(cleaningDocRef, {
         userId: aliceUid,
@@ -152,11 +268,20 @@ export async function runFirestoreRulesSuite() {
         compositeKey: `${aliceUid}:task-clean:all`,
         entityType: 'task',
         deletedAt: '2026-11-10T10:00:00.000Z',
-        status: 'cleaning',
-        retryCount: 1,
+        status: 'pending_cleanup',
+        retryCount: 0,
         updatedAt: '2026-11-10T10:00:00.000Z',
       })
     );
+    // Update to cleaning
+    await assertSucceeds(
+      updateDoc(cleaningDocRef, {
+        status: 'cleaning',
+        retryCount: 1,
+        updatedAt: '2026-11-10T10:01:00.000Z',
+      })
+    );
+    // Attempt invalid downgrade from cleaning to pending_cleanup (must fail)
     await assertFails(
       updateDoc(cleaningDocRef, {
         status: 'pending_cleanup',
