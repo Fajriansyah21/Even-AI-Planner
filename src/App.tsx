@@ -201,6 +201,8 @@ export default function App() {
       const currentUid = userId || auth.currentUser?.uid;
       if (currentUid && currentUid !== 'user-default') {
         syncOutboxToFirestore({ userId: currentUid }).catch(() => {});
+        const token = getCachedAccessToken();
+        if (token) processPendingDeletionCleanups({ token, userId: currentUid }).catch(() => {});
       }
     };
     window.addEventListener('online', handleOnline);
@@ -209,11 +211,11 @@ export default function App() {
       (user, token) => {
         setIsLoggedIn(true);
         setUserId(user.uid);
-        initDurableTombstones(user.uid).catch(() => {});
         if (token) {
           setHasGoogleAccessToken(true);
           processPendingDeletionCleanups({ token, userId: user.uid }).catch(() => {});
         } else {
+          initDurableTombstones(user.uid).catch(() => {});
           setHasGoogleAccessToken(false);
         }
         setPreferences((prev) => ({

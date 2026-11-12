@@ -13,7 +13,11 @@
 import { doc, deleteDoc } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType, getCachedAccessToken } from './firebase';
 import { Task } from '../types';
-import { recordTaskDeletionDurable } from './deletionTombstone';
+import {
+  compensateRemoteDeletion,
+  DeletionTombstone,
+  recordTaskDeletionDurable,
+} from './deletionTombstone';
 import { deleteGoogleCalendarEvent } from './googleCalendar';
 
 export interface ExecuteTaskDeletionParams {
@@ -31,6 +35,7 @@ export interface ExecuteTaskDeletionParams {
   deleteRemoteEventFn?: (accessToken: string, eventId: string) => Promise<any>;
   deleteFirestoreDocFn?: (docRef: any) => Promise<void>;
   getCachedTokenFn?: () => string | null;
+  compensateRemoteDeletionFn?: typeof compensateRemoteDeletion;
 }
 
 export async function executeTaskDeletion(params: ExecuteTaskDeletionParams): Promise<boolean> {
@@ -39,6 +44,8 @@ export async function executeTaskDeletion(params: ExecuteTaskDeletionParams): Pr
   const deleteRemoteEvent = params.deleteRemoteEventFn || deleteGoogleCalendarEvent;
   const deleteFirestoreDoc = params.deleteFirestoreDocFn || (async (ref) => { await deleteDoc(ref); });
   const getCachedToken = params.getCachedTokenFn || getCachedAccessToken;
+  const compensate = params.compensateRemoteDeletionFn || compensateRemoteDeletion;
+  let durableTombstones: DeletionTombstone[] = [];
 
   // Prepare session list with any remote event IDs
   const sessionsWithEvents = task.scheduledSessions?.map((s) => ({
@@ -48,7 +55,7 @@ export async function executeTaskDeletion(params: ExecuteTaskDeletionParams): Pr
 
   // 1. Rekam tombstone persisten secara durable ke outbox IndexedDB TERLEBIH DAHULU
   try {
-    await recordDurable(userId || 'user-default', task.id, sessionsWithEvents);
+    durableTombstones = await recordDurable(userId || 'user-default', task.id, sessionsWithEvents) || [];
   } catch (err) {
     console.error('Penyimpanan tombstone durable ke outbox gagal:', err);
     showToast('Gagal menghapus kegiatan: penyimpanan lokal gagal.', 'error');
@@ -66,11 +73,17 @@ export async function executeTaskDeletion(params: ExecuteTaskDeletionParams): Pr
   const cachedToken = getCachedToken();
   if (cachedToken && sessionsWithEvents && sessionsWithEvents.length > 0) {
     for (const s of sessionsWithEvents) {
-      if (s.googleCalendarEventId) {
-        deleteRemoteEvent(cachedToken, s.googleCalendarEventId).catch((err) => {
-          console.warn('Background remote delete compensation failed:', err);
-        });
-      }
+      if (!s.googleCalendarEventId) continue;
+      const tombstone = durableTombstones.find((item) => item.sessionId === s.sessionId);
+      // Never dispatch a remote DELETE without its durable, identity-bound tombstone.
+      if (!tombstone) continue;
+      void compensate({
+        token: cachedToken,
+        tombstone,
+        deleteEventFn: deleteRemoteEvent,
+      }).catch((err) => {
+        console.warn('Background remote delete compensation failed:', err);
+      });
     }
   }
 

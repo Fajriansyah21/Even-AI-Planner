@@ -1,0 +1,1227 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 1711712..0666bc7 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -201,6 +201,8 @@ export default function App() {
+       const currentUid = userId || auth.currentUser?.uid;
+       if (currentUid && currentUid !== 'user-default') {
+         syncOutboxToFirestore({ userId: currentUid }).catch(() => {});
++        const token = getCachedAccessToken();
++        if (token) processPendingDeletionCleanups({ token, userId: currentUid }).catch(() => {});
+       }
+     };
+     window.addEventListener('online', handleOnline);
+@@ -209,11 +211,11 @@ export default function App() {
+       (user, token) => {
+         setIsLoggedIn(true);
+         setUserId(user.uid);
+-        initDurableTombstones(user.uid).catch(() => {});
+         if (token) {
+           setHasGoogleAccessToken(true);
+           processPendingDeletionCleanups({ token, userId: user.uid }).catch(() => {});
+         } else {
++          initDurableTombstones(user.uid).catch(() => {});
+           setHasGoogleAccessToken(false);
+         }
+         setPreferences((prev) => ({
+diff --git a/src/lib/calendarPushService.ts b/src/lib/calendarPushService.ts
+index 9c5ff1f..2fe0c4d 100644
+--- a/src/lib/calendarPushService.ts
++++ b/src/lib/calendarPushService.ts
+@@ -14,8 +14,8 @@ import {
+ import { persistScheduledTask } from './taskPersistence';
+ import {
+   isSessionDeleted,
+-  recordSessionDeletion,
+-  updateTombstone,
++  recordSessionDeletionDurable,
++  compensateRemoteDeletion,
+ } from './deletionTombstone';
+ 
+ export interface ExecuteSchedulePushParams {
+@@ -37,6 +37,8 @@ export interface ExecuteSchedulePushParams {
+     googleEventId: string,
+     signal?: AbortSignal
+   ) => Promise<void>;
++  cleanupClaimFn?: Parameters<typeof compensateRemoteDeletion>[0]['claimCleanupFn'];
++  cleanupSyncStateFn?: Parameters<typeof compensateRemoteDeletion>[0]['syncStateFn'];
+   saveToStorage?: (task: Task, userId: string) => Promise<void>;
+   isTaskUpdate?: boolean;
+   description?: string;
+@@ -244,26 +246,15 @@ export async function executeSchedulePush(
+         guard?.clearSessionState(sess.id, task.id, userId || 'user-default');
+ 
+         // Rekam deletion tombstone dengan Google Calendar Event ID yang baru didapat
+-        const tombstone = recordSessionDeletion(userId, task.id, sess.id, created.id);
+-
+-        // Jalankan Remote Event Compensation (DELETE) segera
+-        const activeDeleteFn = params.deleteEventFn || deleteGoogleCalendarEvent;
+-        try {
+-          await activeDeleteFn(token, created.id);
+-          updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
+-        } catch (cleanupErr: any) {
+-          const status = cleanupErr?.status || cleanupErr?.classification?.status;
+-          if (status === 404 || status === 410) {
+-            updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
+-          } else {
+-            updateTombstone(tombstone.id, {
+-              status: 'cleanup_failed',
+-              lastError: cleanupErr?.message || 'Remote DELETE compensation failed',
+-              retryCount: (tombstone.retryCount || 0) + 1,
+-              lastAttemptAt: new Date().toISOString(),
+-            });
+-          }
+-        }
++        const tombstone = await recordSessionDeletionDurable(userId, task.id, sess.id, created.id);
++        await compensateRemoteDeletion({
++          token,
++          tombstone,
++          deleteEventFn: params.deleteEventFn || deleteGoogleCalendarEvent,
++          signal: pushTicket.signal,
++          claimCleanupFn: params.cleanupClaimFn,
++          syncStateFn: params.cleanupSyncStateFn,
++        });
+ 
+         // Sesi TIDAK dimasukkan ke updatedSessions atau newCalendarEvents (NO RESURRECTION)
+         continue;
+@@ -447,6 +438,8 @@ export interface ReconcileTaskSessionsParams {
+     googleEventId: string,
+     signal?: AbortSignal
+   ) => Promise<void>;
++  cleanupClaimFn?: Parameters<typeof compensateRemoteDeletion>[0]['claimCleanupFn'];
++  cleanupSyncStateFn?: Parameters<typeof compensateRemoteDeletion>[0]['syncStateFn'];
+   saveToStorage?: (task: Task, userId: string) => Promise<void>;
+ }
+ 
+@@ -603,23 +596,16 @@ export async function reconcileTaskSessionsWithRemote(
+       // User Deletion Intent Wins (Skenario D & M):
+       // Jika pengguna telah menghapus sesi ini, jangan pernah menghidupkan kembali ke aplikasi!
+       if (isSessionDeleted(userId, task.id, sess.id)) {
+-        const tombstone = recordSessionDeletion(userId, task.id, sess.id, recon.remoteEventId);
+-        const activeDeleteFn = params.deleteEventFn || deleteGoogleCalendarEvent;
+-        activeDeleteFn(token, recon.remoteEventId, activeSignal)
+-          .then(() => updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined }))
+-          .catch((cleanupErr: any) => {
+-            const status = cleanupErr?.status || cleanupErr?.classification?.status;
+-            if (status === 404 || status === 410) {
+-              updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
+-            } else {
+-              updateTombstone(tombstone.id, {
+-                status: 'cleanup_failed',
+-                lastError: cleanupErr?.message || 'Remote compensation failed',
+-                retryCount: (tombstone.retryCount || 0) + 1,
+-                lastAttemptAt: new Date().toISOString(),
+-              });
+-            }
+-          });
++        recordSessionDeletionDurable(userId, task.id, sess.id, recon.remoteEventId)
++          .then((tombstone) => compensateRemoteDeletion({
++            token,
++            tombstone,
++            deleteEventFn: params.deleteEventFn || deleteGoogleCalendarEvent,
++            signal: activeSignal,
++            claimCleanupFn: params.cleanupClaimFn,
++            syncStateFn: params.cleanupSyncStateFn,
++          }))
++          .catch((err) => console.warn('Durable remote cleanup intent was retained for retry:', err));
+         return null;
+       }
+ 
+diff --git a/src/lib/deletionTombstone.ts b/src/lib/deletionTombstone.ts
+index eb5e092..5b27753 100644
+--- a/src/lib/deletionTombstone.ts
++++ b/src/lib/deletionTombstone.ts
+@@ -12,9 +12,14 @@ import {
+   DurableDeletionIntent,
+   clearIndexedDbOutbox,
+   getAllOutboxItems,
++  getOutboxItem,
+   migrateLocalStorageToIndexedDb,
+ } from './indexedDbOutbox';
+-import { syncOutboxToFirestore, reconcileRemoteTombstonesToLocal } from './firestoreTombstoneRepo';
++import {
++  claimAuthoritativeRemoteCleanup,
++  syncOutboxToFirestore,
++  reconcileRemoteTombstonesToLocal,
++} from './firestoreTombstoneRepo';
+ import { auth } from './firebase';
+ 
+ export type TombstoneCleanupStatus =
+@@ -41,6 +46,8 @@ const STORAGE_KEY = 'even_deletion_tombstones_v1';
+ 
+ // In-memory cache for fast, synchronous lookups within the same session
+ const inMemoryTombstones = new Map<string, DeletionTombstone>();
++const cleanupInFlight = new Map<string, Promise<{ success: boolean; tombstone: DeletionTombstone }>>();
++const CLEANUP_LEASE_MS = 5 * 60 * 1000;
+ 
+ let firestoreSyncEnabled = true;
+ 
+@@ -511,6 +518,23 @@ export async function initDurableTombstones(userId?: string): Promise<void> {
+     try {
+       await reconcileRemoteTombstonesToLocal(userId);
+       await syncOutboxToFirestore({ userId });
++      // Reconciliation may discover a new remote ID for a tombstone already
++      // cached as cleaned in this tab. Refresh memory from the reconciled outbox.
++      const reconciledItems = await getAllOutboxItems(userId);
++      for (const item of reconciledItems) {
++        inMemoryTombstones.set(item.id, {
++          id: item.id,
++          userId: item.userId,
++          taskId: item.taskId,
++          sessionId: item.sessionId === 'all' ? undefined : item.sessionId,
++          googleCalendarEventId: item.googleCalendarEventId,
++          deletedAt: item.deletedAt,
++          status: item.status,
++          retryCount: item.retryCount,
++          lastError: item.lastError,
++          lastAttemptAt: item.lastAttemptAt,
++        });
++      }
+     } catch (err) {
+       console.warn('Background Firestore tombstone sync notice:', err);
+     }
+@@ -522,55 +546,237 @@ export interface CompensateRemoteDeletionOptions {
+   tombstone: DeletionTombstone;
+   deleteEventFn?: (accessToken: string, googleEventId: string, signal?: AbortSignal) => Promise<void>;
+   signal?: AbortSignal;
++  claimCleanupFn?: (tombstone: DeletionTombstone) => Promise<
++    { claimed: true; retryCount: number; lastAttemptAt: string } |
++    { claimed: false; reason: 'missing' | 'cleaned' | 'busy' | 'stale_remote_id' | 'not_retryable' }
++  >;
++  syncStateFn?: (userId: string, tombstone: DeletionTombstone) => Promise<boolean>;
+ }
+ 
+ /**
+  * Executes remote event compensation (DELETE) for a tombstoned session.
+  * Idempotent: Handles 404/410 by marking as cleaned.
+  */
+-export async function compensateRemoteDeletion(
++export function compensateRemoteDeletion(
+   options: CompensateRemoteDeletionOptions
+ ): Promise<{ success: boolean; tombstone: DeletionTombstone }> {
+-  const { token, tombstone, deleteEventFn = deleteGoogleCalendarEvent, signal } = options;
++  const active = cleanupInFlight.get(options.tombstone.id);
++  if (active) return active;
++
++  const operation = runRemoteDeletionCompensation(options).finally(() => {
++    if (cleanupInFlight.get(options.tombstone.id) === operation) {
++      cleanupInFlight.delete(options.tombstone.id);
++    }
++  });
++  cleanupInFlight.set(options.tombstone.id, operation);
++  return operation;
++}
+ 
+-  if (!tombstone.googleCalendarEventId) {
+-    // No remote ID to delete, consider already cleaned
+-    const updated = updateTombstone(tombstone.id, { status: 'cleaned' }) || tombstone;
+-    return { success: true, tombstone: updated };
++async function runRemoteDeletionCompensation(
++  options: CompensateRemoteDeletionOptions
++): Promise<{ success: boolean; tombstone: DeletionTombstone }> {
++  const { token, tombstone, deleteEventFn = deleteGoogleCalendarEvent, signal } = options;
++  let current = inMemoryTombstones.get(tombstone.id) || tombstone;
++  if (!current.googleCalendarEventId) {
++    return { success: current.status === 'cleaned', tombstone: current };
++  }
++  if (!token?.trim() || signal?.aborted) return { success: false, tombstone: current };
++  if (current.googleCalendarEventId !== tombstone.googleCalendarEventId) {
++    return { success: false, tombstone: current };
++  }
++  if (current.status === 'cleaned' && (current.userId === 'user-default' || options.claimCleanupFn)) {
++    return { success: true, tombstone: current };
+   }
+ 
+-  updateTombstone(tombstone.id, {
+-    status: 'cleaning',
+-    lastAttemptAt: new Date().toISOString(),
+-  });
++  const userId = current.userId;
++  let retryCount = current.retryCount || 0;
++  let lastAttemptAt = new Date().toISOString();
+ 
+   try {
+-    await deleteEventFn(token, tombstone.googleCalendarEventId, signal);
+-    const updated = updateTombstone(tombstone.id, {
++    if (userId !== 'user-default' && !options.claimCleanupFn) {
++      // Reconcile first so a new remote ID or cleaned state from another device
++      // cannot be overwritten by a stale local outbox snapshot.
++      await reconcileRemoteTombstonesToLocal(userId);
++      const reconciled = await getOutboxItem(current.id);
++      if (reconciled?.syncStatus === 'synced') {
++        current = {
++          id: reconciled.id,
++          userId: reconciled.userId,
++          taskId: reconciled.taskId,
++          sessionId: reconciled.sessionId === 'all' ? undefined : reconciled.sessionId,
++          googleCalendarEventId: reconciled.googleCalendarEventId,
++          deletedAt: reconciled.deletedAt,
++          status: reconciled.status,
++          retryCount: reconciled.retryCount,
++          lastError: reconciled.lastError,
++          lastAttemptAt: reconciled.lastAttemptAt,
++        };
++        inMemoryTombstones.set(current.id, current);
++        if (current.googleCalendarEventId !== tombstone.googleCalendarEventId) {
++          return { success: false, tombstone: current };
++        }
++        if (current.status === 'cleaned') return { success: true, tombstone: current };
++      }
++      // Ensure the durable local intent has reached Firestore before taking a remote action.
++      await syncOutboxToFirestore({ userId });
++    }
++
++    if (options.claimCleanupFn) {
++      const claim = await options.claimCleanupFn(current);
++      if (!claim.claimed) {
++        const latest = inMemoryTombstones.get(current.id) || current;
++        return { success: claim.reason === 'cleaned', tombstone: latest };
++      }
++      retryCount = claim.retryCount;
++      lastAttemptAt = claim.lastAttemptAt;
++    } else if (userId !== 'user-default') {
++      const intent: DurableDeletionIntent = {
++        id: current.id,
++        userId,
++        taskId: current.taskId,
++        sessionId: current.sessionId || 'all',
++        entityType: current.sessionId && current.sessionId !== 'all' ? 'session' : 'task',
++        googleCalendarEventId: current.googleCalendarEventId,
++        deletedAt: current.deletedAt,
++        status: current.status,
++        syncStatus: 'synced',
++        syncAttempts: 0,
++        retryCount,
++        lastError: current.lastError,
++        lastAttemptAt: current.lastAttemptAt,
++        updatedAt: new Date().toISOString(),
++      };
++      const claim = await claimAuthoritativeRemoteCleanup(intent, { leaseMs: CLEANUP_LEASE_MS });
++      if (!claim.claimed) {
++        const latest = inMemoryTombstones.get(current.id) || current;
++        return { success: claim.reason === 'cleaned', tombstone: latest };
++      }
++      retryCount = claim.tombstone.retryCount;
++      lastAttemptAt = claim.tombstone.lastAttemptAt || lastAttemptAt;
++    } else {
++      if (current.status === 'cleaning') {
++        const lastAttempt = current.lastAttemptAt ? Date.parse(current.lastAttemptAt) : NaN;
++        if (Number.isFinite(lastAttempt) && Date.now() - lastAttempt < CLEANUP_LEASE_MS) {
++          return { success: false, tombstone: current };
++        }
++      } else if (current.status !== 'pending_cleanup' && current.status !== 'cleanup_failed') {
++        return { success: false, tombstone: current };
++      }
++      retryCount += 1;
++    }
++
++    // Persist the claimed state in IndexedDB before issuing DELETE.
++    const claimedTombstone: DeletionTombstone = {
++      ...current,
++      status: 'cleaning',
++      retryCount,
++      lastAttemptAt,
++      lastError: undefined,
++    };
++    await saveToOutbox(toDurableIntent(claimedTombstone, 'synced'));
++    const latestBeforeDelete = inMemoryTombstones.get(current.id) || current;
++    if (latestBeforeDelete.googleCalendarEventId !== current.googleCalendarEventId) {
++      return { success: false, tombstone: latestBeforeDelete };
++    }
++    if (latestBeforeDelete.status === 'cleaned') {
++      return { success: true, tombstone: latestBeforeDelete };
++    }
++    inMemoryTombstones.set(current.id, claimedTombstone);
++    saveTombstonesToStorage();
++
++    try {
++      await deleteEventFn(token, current.googleCalendarEventId, signal);
++    } catch (err: any) {
++      const status = err?.status || err?.classification?.status;
++      if (status !== 404 && status !== 410) {
++        return await finishCleanupAttempt(options, claimedTombstone, {
++          status: 'cleanup_failed',
++          lastError: describeCleanupFailure(err),
++          lastAttemptAt,
++        });
++      }
++    }
++
++    return await finishCleanupAttempt(options, claimedTombstone, {
+       status: 'cleaned',
+       lastError: undefined,
+-    }) || tombstone;
+-    return { success: true, tombstone: updated };
++      lastAttemptAt,
++    });
+   } catch (err: any) {
+-    // Check if error represents 404 (Not Found) or 410 (Gone) -> already deleted remotely
+-    const status = err?.status || err?.classification?.status;
+-    if (status === 404 || status === 410) {
+-      const updated = updateTombstone(tombstone.id, {
+-        status: 'cleaned',
+-        lastError: undefined,
+-      }) || tombstone;
+-      return { success: true, tombstone: updated };
+-    }
++    const latest = inMemoryTombstones.get(current.id) || current;
++    return { success: false, tombstone: latest };
++  }
++}
++
++function describeCleanupFailure(err: any): string {
++  const status = err?.status || err?.classification?.status || 0;
++  const code = err?.code || err?.classification?.code;
++  const category = status === 401
++    ? 'AUTHENTICATION'
++    : status === 403
++      ? 'PERMISSION'
++      : status === 0
++        ? 'NETWORK_OR_ABORT'
++        : status >= 500 || status === 429
++          ? 'TRANSIENT_SERVICE'
++          : 'REMOTE_FAILURE';
++  const detail = err?.message || 'Remote DELETE failed';
++  return `[${category}${code ? `/${code}` : ''}${status ? ` HTTP ${status}` : ''}] ${detail}`;
++}
++
++function toDurableIntent(
++  tombstone: DeletionTombstone,
++  syncStatus: DurableDeletionIntent['syncStatus']
++): DurableDeletionIntent {
++  return {
++    id: tombstone.id,
++    userId: tombstone.userId,
++    taskId: tombstone.taskId,
++    sessionId: tombstone.sessionId || 'all',
++    entityType: tombstone.sessionId && tombstone.sessionId !== 'all' ? 'session' : 'task',
++    googleCalendarEventId: tombstone.googleCalendarEventId,
++    deletedAt: tombstone.deletedAt,
++    status: tombstone.status,
++    syncStatus,
++    syncAttempts: 0,
++    retryCount: tombstone.retryCount || 0,
++    lastError: tombstone.lastError,
++    lastAttemptAt: tombstone.lastAttemptAt,
++    updatedAt: new Date().toISOString(),
++  };
++}
+ 
+-    const updated = updateTombstone(tombstone.id, {
+-      status: 'cleanup_failed',
+-      retryCount: (tombstone.retryCount || 0) + 1,
+-      lastError: err?.message || 'Remote DELETE failed',
+-      lastAttemptAt: new Date().toISOString(),
+-    }) || tombstone;
++async function finishCleanupAttempt(
++  options: CompensateRemoteDeletionOptions,
++  claimedTombstone: DeletionTombstone,
++  patch: Pick<DeletionTombstone, 'status' | 'lastError' | 'lastAttemptAt'>
++): Promise<{ success: boolean; tombstone: DeletionTombstone }> {
++  const current = inMemoryTombstones.get(claimedTombstone.id) || claimedTombstone;
++  if (current.googleCalendarEventId !== claimedTombstone.googleCalendarEventId) {
++    return { success: false, tombstone: current };
++  }
++  if (current.status === 'cleaned') return { success: true, tombstone: current };
++
++  const next = { ...current, ...patch };
++  await saveToOutbox(toDurableIntent(next, 'pending_sync'));
++  let confirmed = options.syncStateFn
++    ? await options.syncStateFn(next.userId, next)
++    : next.userId === 'user-default';
++
++  if (!options.syncStateFn && next.userId !== 'user-default') {
++    const sync = await syncOutboxToFirestore({ userId: next.userId });
++    const outbox = await getOutboxItem(next.id);
++    confirmed = sync.failedCount === 0 && outbox?.syncStatus === 'synced' && outbox.status === next.status;
++  }
+ 
+-    return { success: false, tombstone: updated };
++  if (!confirmed) return { success: false, tombstone: current };
++  const latest = inMemoryTombstones.get(next.id) || current;
++  if (latest.googleCalendarEventId !== claimedTombstone.googleCalendarEventId) {
++    return { success: false, tombstone: latest };
+   }
++  inMemoryTombstones.set(next.id, next);
++  saveTombstonesToStorage();
++  return { success: patch.status === 'cleaned', tombstone: next };
+ }
+ 
+ export interface ProcessPendingCleanupsOptions {
+@@ -578,6 +784,9 @@ export interface ProcessPendingCleanupsOptions {
+   userId?: string;
+   deleteEventFn?: (accessToken: string, googleEventId: string, signal?: AbortSignal) => Promise<void>;
+   signal?: AbortSignal;
++  claimCleanupFn?: CompensateRemoteDeletionOptions['claimCleanupFn'];
++  syncStateFn?: CompensateRemoteDeletionOptions['syncStateFn'];
++  now?: number;
+ }
+ 
+ /**
+@@ -592,12 +801,17 @@ export async function processPendingDeletionCleanups(
+   failedCount: number;
+ }> {
+   const { token, userId, deleteEventFn, signal } = options;
++  if (userId && userId !== 'user-default' && !options.claimCleanupFn) {
++    await initDurableTombstones(userId);
++  }
+   const tombstones = getTombstones(userId);
+ 
++  const now = options.now ?? Date.now();
+   const pending = tombstones.filter(
+     (t) =>
+-      (t.status === 'pending_cleanup' || t.status === 'cleanup_failed') &&
+-      Boolean(t.googleCalendarEventId)
++      (t.status === 'pending_cleanup' || t.status === 'cleanup_failed' || t.status === 'cleaning') &&
++      Boolean(t.googleCalendarEventId) &&
++      isCleanupDue(t, now)
+   );
+ 
+   let cleanedCount = 0;
+@@ -610,6 +824,8 @@ export async function processPendingDeletionCleanups(
+       tombstone: t,
+       deleteEventFn,
+       signal,
++      claimCleanupFn: options.claimCleanupFn,
++      syncStateFn: options.syncStateFn,
+     });
+     if (res.success) {
+       cleanedCount++;
+@@ -625,5 +841,20 @@ export async function processPendingDeletionCleanups(
+   };
+ }
+ 
++function cleanupRetryDelayMs(retryCount: number): number {
++  const attemptExponent = Math.max(0, Math.min(16, (retryCount || 0) - 1));
++  return Math.min(6 * 60 * 60 * 1000, 5_000 * 2 ** attemptExponent);
++}
++
++function isCleanupDue(tombstone: DeletionTombstone, now: number): boolean {
++  if (!tombstone.lastAttemptAt) return true;
++  const lastAttempt = Date.parse(tombstone.lastAttemptAt);
++  if (!Number.isFinite(lastAttempt)) return true;
++  const delay = tombstone.status === 'cleaning'
++    ? CLEANUP_LEASE_MS
++    : cleanupRetryDelayMs(tombstone.retryCount);
++  return now - lastAttempt >= delay;
++}
++
+ // Automatically load tombstones on module initialization
+ loadTombstonesFromStorage();
+diff --git a/src/lib/firestoreTombstoneRepo.ts b/src/lib/firestoreTombstoneRepo.ts
+index 8f03cf9..7c9e8e7 100644
+--- a/src/lib/firestoreTombstoneRepo.ts
++++ b/src/lib/firestoreTombstoneRepo.ts
+@@ -45,6 +45,35 @@ export interface FirestoreTombstoneDoc {
+   updatedAt: string;
+ }
+ 
++function decodeFirestoreTombstone(
++  data: Record<string, any>,
++  documentId: string
++): FirestoreTombstoneDoc {
++  return {
++    ...data,
++    id: documentId,
++    lastError: data.lastError ?? data.error ?? null,
++  } as FirestoreTombstoneDoc;
++}
++
++function encodeFirestoreTombstone(tombstone: FirestoreTombstoneDoc): Record<string, unknown> {
++  // Keep the wire schema aligned with firestore.rules (Step 3 contract).
++  return {
++    compositeKey: tombstone.compositeKey,
++    userId: tombstone.userId,
++    taskId: tombstone.taskId,
++    sessionId: tombstone.sessionId,
++    entityType: tombstone.entityType,
++    googleCalendarEventId: tombstone.googleCalendarEventId ?? null,
++    deletedAt: tombstone.deletedAt,
++    status: tombstone.status,
++    retryCount: tombstone.retryCount,
++    updatedAt: tombstone.updatedAt,
++    lastAttemptAt: tombstone.lastAttemptAt ?? null,
++    error: tombstone.lastError ?? null,
++  };
++}
++
+ /**
+  * Builds standard collision-resistant Firestore document ID conforming to isValidId rule: ^[a-zA-Z0-9_\-]+$
+  * Uses SHA-256 hash over canonical un-truncated (taskId\0sessionId) to prevent collisions.
+@@ -84,6 +113,70 @@ export interface SaveFirestoreTombstoneOptions {
+   ) => Promise<any>;
+ }
+ 
++export type RemoteCleanupClaimResult =
++  | { claimed: true; tombstone: FirestoreTombstoneDoc }
++  | { claimed: false; reason: 'missing' | 'cleaned' | 'busy' | 'stale_remote_id' | 'not_retryable' };
++
++export interface ClaimRemoteCleanupOptions {
++  now?: Date;
++  leaseMs?: number;
++  customRunTransaction?: (
++    firestoreDb: typeof db,
++    updateFunction: (transaction: Transaction) => Promise<any>
++  ) => Promise<any>;
++}
++
++/**
++ * Atomically claims one exact remote event for cleanup. Firestore transaction
++ * serialization makes the pending -> cleaning transition exclusive across tabs
++ * and devices. `lastAttemptAt` is the lease clock because Step 3's schema does
++ * not include a separate lease field.
++ */
++export async function claimAuthoritativeRemoteCleanup(
++  tombstone: DurableDeletionIntent,
++  options: ClaimRemoteCleanupOptions = {}
++): Promise<RemoteCleanupClaimResult> {
++  validateUserOwnership(tombstone.userId);
++  const docId = buildFirestoreTombstoneDocId(tombstone.taskId, tombstone.sessionId);
++  const docRef = doc(db, 'users', tombstone.userId, 'deletion_tombstones', docId);
++  const txRunner = options.customRunTransaction || runTransaction;
++  const now = options.now || new Date();
++  const nowIso = now.toISOString();
++  const leaseMs = options.leaseMs ?? 5 * 60 * 1000;
++
++  return txRunner(db, async (transaction) => {
++    const snap = await transaction.get(docRef);
++    if (!snap.exists()) return { claimed: false, reason: 'missing' } as const;
++    const existing = decodeFirestoreTombstone(snap.data(), docId);
++
++    if (existing.googleCalendarEventId !== tombstone.googleCalendarEventId) {
++      return { claimed: false, reason: 'stale_remote_id' } as const;
++    }
++    if (existing.status === 'cleaned') {
++      return { claimed: false, reason: 'cleaned' } as const;
++    }
++    if (existing.status === 'cleaning') {
++      const lastAttempt = existing.lastAttemptAt ? Date.parse(existing.lastAttemptAt) : NaN;
++      if (Number.isFinite(lastAttempt) && now.getTime() - lastAttempt < leaseMs) {
++        return { claimed: false, reason: 'busy' } as const;
++      }
++    } else if (existing.status !== 'pending_cleanup' && existing.status !== 'cleanup_failed') {
++      return { claimed: false, reason: 'not_retryable' } as const;
++    }
++
++    const claimed: FirestoreTombstoneDoc = {
++      ...existing,
++      status: 'cleaning',
++      retryCount: (existing.retryCount || 0) + 1,
++      lastAttemptAt: nowIso,
++      lastError: null,
++      updatedAt: nowIso,
++    };
++    transaction.set(docRef, sanitizeForFirestore(encodeFirestoreTombstone(claimed)));
++    return { claimed: true, tombstone: claimed } as const;
++  });
++}
++
+ /**
+  * Authoritatively saves or merges a deletion tombstone into Firestore using an atomic transaction.
+  * Monotonic:
+@@ -108,7 +201,9 @@ export async function saveAuthoritativeTombstone(
+     const resultDoc = await txRunner(db, async (transaction) => {
+       // 1. Transactional read - if this throws (e.g. offline / permission), transaction aborts
+       const snap = await transaction.get(docRef);
+-      const existingData = snap.exists() ? (snap.data() as FirestoreTombstoneDoc) : undefined;
++      const existingData = snap.exists()
++        ? decodeFirestoreTombstone(snap.data(), docId)
++        : undefined;
+ 
+       // 2. Monotonic resolution rules
+       let finalDeletedAt = tombstone.deletedAt;
+@@ -119,6 +214,9 @@ export async function saveAuthoritativeTombstone(
+       let finalLastAttemptAt = tombstone.lastAttemptAt || null;
+ 
+       if (existingData) {
++        // Retry attempts are claimed atomically before DELETE. A stale outbox
++        // snapshot must never lower that authoritative counter.
++        finalRetryCount = Math.max(finalRetryCount, existingData.retryCount || 0);
+         // Enforce earliest deletedAt
+         const existingTime = new Date(existingData.deletedAt).getTime();
+         const incomingTime = new Date(tombstone.deletedAt).getTime();
+@@ -127,14 +225,34 @@ export async function saveAuthoritativeTombstone(
+         }
+ 
+         // Remote ID & Status Monotonicity:
+-        const hasNewRemoteId =
++        const remoteIdDiffers =
+           Boolean(tombstone.googleCalendarEventId) &&
+           tombstone.googleCalendarEventId !== existingData.googleCalendarEventId;
++        const firstRemoteIdArrival =
++          !existingData.googleCalendarEventId &&
++          Boolean(tombstone.googleCalendarEventId) &&
++          existingData.status === 'pending_cleanup' &&
++          tombstone.status === 'pending_cleanup';
++        const existingUpdatedAt = Date.parse(existingData.updatedAt);
++        const incomingUpdatedAt = Date.parse(tombstone.updatedAt);
++        const newerRemoteIdAfterCleanup =
++          existingData.status === 'cleaned' &&
++          tombstone.status === 'pending_cleanup' &&
++          remoteIdDiffers &&
++          Number.isFinite(incomingUpdatedAt) &&
++          Number.isFinite(existingUpdatedAt) &&
++          incomingUpdatedAt > existingUpdatedAt;
++        const hasNewRemoteId = firstRemoteIdArrival || newerRemoteIdAfterCleanup;
+ 
+         if (hasNewRemoteId) {
+           // A delayed POST completed and created an event remotely: MUST transition to pending_cleanup for compensation
+           finalRemoteId = tombstone.googleCalendarEventId;
+           finalStatus = 'pending_cleanup';
++        } else if (remoteIdDiffers) {
++          // A stale or illegal ID change must not replace the current remote identity.
++          finalRemoteId = existingData.googleCalendarEventId || null;
++          finalStatus = existingData.status;
++          finalRetryCount = Math.max(finalRetryCount, existingData.retryCount || 0);
+         } else {
+           // If already cleaned, retain cleaned status unless a new remote ID arrived
+           if (existingData.status === 'cleaned') {
+@@ -145,7 +263,7 @@ export async function saveAuthoritativeTombstone(
+             finalStatus = 'cleaned';
+           } else if (tombstone.status === 'cleanup_failed') {
+             finalStatus = 'cleanup_failed';
+-            finalRetryCount = Math.max(tombstone.retryCount || 0, (existingData.retryCount || 0) + 1);
++            finalRetryCount = Math.max(tombstone.retryCount || 0, existingData.retryCount || 0);
+             finalLastError = tombstone.lastError || existingData.lastError || null;
+             finalLastAttemptAt = tombstone.lastAttemptAt || new Date().toISOString();
+           }
+@@ -170,7 +288,7 @@ export async function saveAuthoritativeTombstone(
+       };
+ 
+       // 3. Transactional write
+-      transaction.set(docRef, sanitizeForFirestore(firestoreData));
++      transaction.set(docRef, sanitizeForFirestore(encodeFirestoreTombstone(firestoreData)));
+       return firestoreData;
+     });
+ 
+@@ -206,7 +324,7 @@ export async function getAuthoritativeTombstones(
+     const results: FirestoreTombstoneDoc[] = [];
+     snapshot.forEach((docSnap) => {
+       if (docSnap.exists()) {
+-        results.push(docSnap.data() as FirestoreTombstoneDoc);
++        results.push(decodeFirestoreTombstone(docSnap.data(), docSnap.id));
+       }
+     });
+     return results;
+diff --git a/src/lib/indexedDbOutbox.ts b/src/lib/indexedDbOutbox.ts
+index f49699d..1e2755d 100644
+--- a/src/lib/indexedDbOutbox.ts
++++ b/src/lib/indexedDbOutbox.ts
+@@ -282,14 +282,14 @@ export async function getAllOutboxItems(userId?: string): Promise<DurableDeletio
+ }
+ 
+ /**
+- * Retrieves all outbox items that require synchronization to Firestore.
++ * Retrieves all outbox items that require synchronization or retry.
+  */
+ export async function getPendingSyncOutboxItems(userId?: string): Promise<DurableDeletionIntent[]> {
+   const idb = getIndexedDbInstance();
+   if (!idb) {
+     if (memoryFallbackExplicitlyAllowed) {
+       return Array.from(inMemoryStore.values()).filter(
+-        (item) => item.syncStatus === 'pending_sync' && (!userId || item.userId === userId)
++        (item) => (item.syncStatus === 'pending_sync' || item.syncStatus === 'sync_failed') && (!userId || item.userId === userId)
+       );
+     }
+     throw new Error('IndexedDB tidak tersedia di environment ini');
+@@ -308,26 +308,18 @@ export async function getPendingSyncOutboxItems(userId?: string): Promise<Durabl
+     const store = tx.objectStore(OUTBOX_STORE);
+     let req: IDBRequest<any>;
+     if (userId) {
+-      if (typeof IDBKeyRange !== 'undefined') {
+-        const index = store.index('by_user_syncStatus');
+-        req = index.getAll(IDBKeyRange.only([userId, 'pending_sync']));
+-      } else {
+-        const index = store.index('by_userId');
+-        req = index.getAll(userId);
+-      }
++      req = store.index('by_userId').getAll(userId);
+     } else {
+-      const index = store.index('by_syncStatus');
+-      req = index.getAll('pending_sync');
++      req = store.getAll();
+     }
+ 
+     req.onsuccess = () => {
+       db.close();
+       const list: DurableDeletionIntent[] = req.result || [];
+-      if (userId && typeof IDBKeyRange === 'undefined') {
+-        resolve(list.filter((i) => i.syncStatus === 'pending_sync'));
+-      } else {
+-        resolve(list);
+-      }
++      resolve(list.filter((i) =>
++        (i.syncStatus === 'pending_sync' || i.syncStatus === 'sync_failed') &&
++        (!userId || i.userId === userId)
++      ));
+     };
+ 
+     req.onerror = () => {
+diff --git a/src/lib/taskDeletionWorkflow.ts b/src/lib/taskDeletionWorkflow.ts
+index 53a0df1..1ea5630 100644
+--- a/src/lib/taskDeletionWorkflow.ts
++++ b/src/lib/taskDeletionWorkflow.ts
+@@ -13,7 +13,11 @@
+ import { doc, deleteDoc } from 'firebase/firestore';
+ import { db, handleFirestoreError, OperationType, getCachedAccessToken } from './firebase';
+ import { Task } from '../types';
+-import { recordTaskDeletionDurable } from './deletionTombstone';
++import {
++  compensateRemoteDeletion,
++  DeletionTombstone,
++  recordTaskDeletionDurable,
++} from './deletionTombstone';
+ import { deleteGoogleCalendarEvent } from './googleCalendar';
+ 
+ export interface ExecuteTaskDeletionParams {
+@@ -31,6 +35,7 @@ export interface ExecuteTaskDeletionParams {
+   deleteRemoteEventFn?: (accessToken: string, eventId: string) => Promise<any>;
+   deleteFirestoreDocFn?: (docRef: any) => Promise<void>;
+   getCachedTokenFn?: () => string | null;
++  compensateRemoteDeletionFn?: typeof compensateRemoteDeletion;
+ }
+ 
+ export async function executeTaskDeletion(params: ExecuteTaskDeletionParams): Promise<boolean> {
+@@ -39,6 +44,8 @@ export async function executeTaskDeletion(params: ExecuteTaskDeletionParams): Pr
+   const deleteRemoteEvent = params.deleteRemoteEventFn || deleteGoogleCalendarEvent;
+   const deleteFirestoreDoc = params.deleteFirestoreDocFn || (async (ref) => { await deleteDoc(ref); });
+   const getCachedToken = params.getCachedTokenFn || getCachedAccessToken;
++  const compensate = params.compensateRemoteDeletionFn || compensateRemoteDeletion;
++  let durableTombstones: DeletionTombstone[] = [];
+ 
+   // Prepare session list with any remote event IDs
+   const sessionsWithEvents = task.scheduledSessions?.map((s) => ({
+@@ -48,7 +55,7 @@ export async function executeTaskDeletion(params: ExecuteTaskDeletionParams): Pr
+ 
+   // 1. Rekam tombstone persisten secara durable ke outbox IndexedDB TERLEBIH DAHULU
+   try {
+-    await recordDurable(userId || 'user-default', task.id, sessionsWithEvents);
++    durableTombstones = await recordDurable(userId || 'user-default', task.id, sessionsWithEvents) || [];
+   } catch (err) {
+     console.error('Penyimpanan tombstone durable ke outbox gagal:', err);
+     showToast('Gagal menghapus kegiatan: penyimpanan lokal gagal.', 'error');
+@@ -66,11 +73,17 @@ export async function executeTaskDeletion(params: ExecuteTaskDeletionParams): Pr
+   const cachedToken = getCachedToken();
+   if (cachedToken && sessionsWithEvents && sessionsWithEvents.length > 0) {
+     for (const s of sessionsWithEvents) {
+-      if (s.googleCalendarEventId) {
+-        deleteRemoteEvent(cachedToken, s.googleCalendarEventId).catch((err) => {
+-          console.warn('Background remote delete compensation failed:', err);
+-        });
+-      }
++      if (!s.googleCalendarEventId) continue;
++      const tombstone = durableTombstones.find((item) => item.sessionId === s.sessionId);
++      // Never dispatch a remote DELETE without its durable, identity-bound tombstone.
++      if (!tombstone) continue;
++      void compensate({
++        token: cachedToken,
++        tombstone,
++        deleteEventFn: deleteRemoteEvent,
++      }).catch((err) => {
++        console.warn('Background remote delete compensation failed:', err);
++      });
+     }
+   }
+ 
+diff --git a/tests/deletion-outbox-firestore.test.ts b/tests/deletion-outbox-firestore.test.ts
+index af172e5..731a741 100644
+--- a/tests/deletion-outbox-firestore.test.ts
++++ b/tests/deletion-outbox-firestore.test.ts
+@@ -37,6 +37,7 @@ import {
+   buildFirestoreTombstoneDocId,
+   validateUserOwnership,
+   saveAuthoritativeTombstone,
++  claimAuthoritativeRemoteCleanup,
+   getAuthoritativeTombstones,
+   syncOutboxToFirestore,
+   reconcileRemoteTombstonesToLocal,
+@@ -529,6 +530,104 @@ export async function runDeletionOutboxAndFirestoreSuite() {
+       pass('Test 7: Firestore runTransaction memastikan concurrency atomik dan monotonic merge');
+     }
+ 
++    // [Test 7B] Actual cleanup claim function is atomic and remote-ID bound
++    {
++      (auth as any).currentUser = { uid: 'user-claim-7b' };
++      const userId = 'user-claim-7b';
++      const taskId = 'task-claim-7b';
++      const sessionId = 'sess-claim-7b';
++      const docId = buildFirestoreTombstoneDocId(taskId, sessionId);
++      const path = `users/${userId}/deletion_tombstones/${docId}`;
++      const now = new Date('2026-11-12T10:00:00.000Z');
++      const store = new Map<string, any>([[path, {
++        id: docId,
++        compositeKey: buildOutboxKey(userId, taskId, sessionId),
++        userId, taskId, sessionId, entityType: 'session',
++        googleCalendarEventId: 'gcal-claim-7b',
++        deletedAt: '2026-11-12T09:00:00.000Z',
++        status: 'pending_cleanup', retryCount: 8,
++        lastAttemptAt: null, lastError: null,
++        updatedAt: now.toISOString(),
++      }]]);
++      let transactionQueue = Promise.resolve();
++      const atomicRunTransaction = async (_db: any, updateFn: (tx: any) => Promise<any>) => {
++        let release!: () => void;
++        const previous = transactionQueue;
++        transactionQueue = new Promise<void>((resolve) => { release = resolve; });
++        await previous;
++        try {
++          return await updateFn({
++            get: async (ref: any) => ({
++              exists: () => store.has(ref.path),
++              data: () => store.get(ref.path),
++            }),
++            set: (ref: any, data: any) => store.set(ref.path, data),
++          });
++        } finally {
++          release();
++        }
++      };
++      const intent: DurableDeletionIntent = {
++        id: buildOutboxKey(userId, taskId, sessionId), userId, taskId, sessionId,
++        entityType: 'session', googleCalendarEventId: 'gcal-claim-7b',
++        deletedAt: '2026-11-12T09:00:00.000Z', status: 'pending_cleanup',
++        syncStatus: 'synced', syncAttempts: 0, retryCount: 0,
++        updatedAt: now.toISOString(),
++      };
++      const claimOptions = { now, customRunTransaction: atomicRunTransaction as any };
++      const [claimA, claimB] = await Promise.all([
++        claimAuthoritativeRemoteCleanup(intent, claimOptions),
++        claimAuthoritativeRemoteCleanup(intent, claimOptions),
++      ]);
++      const claims = [claimA, claimB].filter((result) => result.claimed);
++      assert.strictEqual(claims.length, 1, 'Hanya satu transaksi boleh memperoleh claim cleanup');
++      assert.strictEqual((claims[0] as any).tombstone.retryCount, 9, 'Retry count harus memakai nilai Firestore terbaru');
++      assert.ok([claimA, claimB].some((result) => !result.claimed && result.reason === 'busy'));
++      assert.deepStrictEqual(
++        Object.keys(store.get(path)!).sort(),
++        ['compositeKey', 'userId', 'taskId', 'sessionId', 'entityType', 'googleCalendarEventId', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'lastAttemptAt', 'error'].sort(),
++        'Payload produksi harus sesuai schema Firestore Rules Step 3 tanpa field tambahan'
++      );
++
++      const staleId = await claimAuthoritativeRemoteCleanup({
++        ...intent, googleCalendarEventId: 'gcal-old',
++      }, claimOptions);
++      assert.deepStrictEqual(staleId, { claimed: false, reason: 'stale_remote_id' });
++
++      const currentDoc = store.get(path)!;
++      store.set(path, { ...currentDoc, status: 'cleaning', lastAttemptAt: now.toISOString() });
++      const activeLease = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
++      assert.deepStrictEqual(activeLease, { claimed: false, reason: 'busy' });
++
++      store.set(path, {
++        ...currentDoc, status: 'cleaning', retryCount: 9,
++        lastAttemptAt: '2026-11-12T08:00:00.000Z',
++      });
++      const reclaimedLease = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
++      assert.strictEqual(reclaimedLease.claimed, true, 'Lease cleaning yang kedaluwarsa harus dapat dipulihkan');
++      assert.strictEqual((reclaimedLease as any).tombstone.retryCount, 10);
++
++      store.set(path, { ...currentDoc, status: 'cleaned' });
++      const alreadyCleaned = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
++      assert.deepStrictEqual(alreadyCleaned, { claimed: false, reason: 'cleaned' });
++
++      store.set(path, {
++        ...currentDoc, googleCalendarEventId: 'gcal-new-current', status: 'cleaned',
++        updatedAt: '2026-11-12T10:10:00.000Z',
++      });
++      const staleOutbox: DurableDeletionIntent = {
++        ...intent, googleCalendarEventId: 'gcal-stale-old', status: 'pending_cleanup',
++        updatedAt: '2026-11-12T10:05:00.000Z',
++      };
++      const mergeResult = await saveAuthoritativeTombstone(staleOutbox, {
++        customRunTransaction: atomicRunTransaction as any,
++      });
++      assert.strictEqual(mergeResult.googleCalendarEventId, 'gcal-new-current');
++      assert.strictEqual(mergeResult.status, 'cleaned', 'Outbox stale tidak boleh menghidupkan kembali tombstone cleaned');
++
++      pass('Test 7B: claim aktual serial, memakai retry Firestore terbaru, menolak ID stale, dan memulihkan/menolak lease sesuai status');
++    }
++
+     // [Test 8] Firestore Read Failure inside transaction rejects and retains outbox
+     {
+       (auth as any).currentUser = { uid: 'user-err-8' };
+@@ -676,10 +775,11 @@ export async function runDeletionOutboxAndFirestoreSuite() {
+       const itemAfterFail = await getOutboxItem(key);
+       assert.ok(itemAfterFail, 'Item outbox harus tetap ada saat sync gagal');
+       assert.strictEqual(itemAfterFail?.syncStatus, 'sync_failed');
++      const retryItems = await getPendingSyncOutboxItems(userId);
++      assert.ok(retryItems.some((item) => item.id === key), 'sync_failed harus tetap masuk antrean retry');
+ 
+       // 2. Retry succeeds
+       simulateFailure = false;
+-      await saveToOutbox({ ...itemAfterFail, syncStatus: 'pending_sync' });
+       const successRes = await syncOutboxToFirestore({ userId, saveAuthoritativeFn: mockSave });
+       assert.strictEqual(successRes.syncedCount, 1);
+ 
+@@ -795,12 +895,21 @@ export async function runDeletionOutboxAndFirestoreSuite() {
+         },
+         recordDurableFn: async () => {
+           callLog.push('1_recordTaskDeletionDurable');
+-          return [];
++          return [{
++            id: 'user-ui-14:task-ui-success-14:sess-succ-1',
++            userId: 'user-ui-14', taskId: 'task-ui-success-14', sessionId: 'sess-succ-1',
++            googleCalendarEventId: 'gcal-succ-1', deletedAt: new Date().toISOString(),
++            status: 'pending_cleanup', retryCount: 0,
++          }];
+         },
+         deleteRemoteEventFn: async (_token, eventId) => {
+           callLog.push(`3_deleteRemoteEvent_${eventId}`);
+           remoteDeletedIds.push(eventId);
+         },
++        compensateRemoteDeletionFn: async ({ token, tombstone, deleteEventFn }) => {
++          await deleteEventFn!(token, tombstone.googleCalendarEventId!);
++          return { success: true, tombstone };
++        },
+         deleteFirestoreDocFn: async (docRef) => {
+           callLog.push(`4_deleteFirestoreDoc_${docRef.path || 'doc'}`);
+           firestoreDeletedDocPaths.push(docRef.path || 'doc');
+@@ -854,12 +963,21 @@ export async function runDeletionOutboxAndFirestoreSuite() {
+           await new Promise((r) => setTimeout(r, 40));
+           durableResolved = true;
+           callLog.push('recordDurable_done');
+-          return [];
++          return [{
++            id: 'user-slow-14b:task-slow-14b:sess-slow-1',
++            userId: 'user-slow-14b', taskId: 'task-slow-14b', sessionId: 'sess-slow-1',
++            googleCalendarEventId: 'gcal-slow-1', deletedAt: new Date().toISOString(),
++            status: 'pending_cleanup', retryCount: 0,
++          }];
+         },
+         deleteRemoteEventFn: async () => {
+           assert.strictEqual(durableResolved, true, 'deleteRemoteEvent TIDAK BOLEH dipanggil sebelum durable write selesai');
+           callLog.push('deleteRemoteEvent');
+         },
++        compensateRemoteDeletionFn: async ({ tombstone, deleteEventFn, token }) => {
++          await deleteEventFn!(token, tombstone.googleCalendarEventId!);
++          return { success: true, tombstone };
++        },
+         deleteFirestoreDocFn: async () => {
+           assert.strictEqual(durableResolved, true, 'deleteFirestoreDoc TIDAK BOLEH dipanggil sebelum durable write selesai');
+           callLog.push('deleteFirestoreDoc');
+diff --git a/tests/google-calendar-reliability.test.ts b/tests/google-calendar-reliability.test.ts
+index b405fda..56be25e 100644
+--- a/tests/google-calendar-reliability.test.ts
++++ b/tests/google-calendar-reliability.test.ts
+@@ -31,6 +31,7 @@ import {
+   updateTombstone,
+   loadTombstonesFromStorage,
+ } from '../src/lib/deletionTombstone';
++import { getOutboxItem } from '../src/lib/indexedDbOutbox';
+ 
+ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
+   console.log('================================================================');
+@@ -3846,16 +3847,23 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
+ 
+         // Simulasikan tombstone yang tertunda dari sesi sebelumnya
+         const tomb = recordSessionDeletion(userId, taskId, sessId, remoteId);
+-        updateTombstone(tomb.id, { status: 'cleanup_failed', retryCount: 1 });
++        updateTombstone(tomb.id, { status: 'cleanup_failed', retryCount: 1, lastAttemptAt: new Date().toISOString() });
+ 
+         // Simulasikan restart aplikasi dengan memanggil processPendingDeletionCleanups
+         const deletedIds: string[] = [];
+-        const processResult = await processPendingDeletionCleanups({
++        const cleanupOptions = {
+           token: 'mock-token',
+           userId,
+-          deleteEventFn: async (_tok, id) => {
+-            deletedIds.push(id);
+-          },
++          deleteEventFn: async (_tok: string, id: string) => { deletedIds.push(id); },
++          claimCleanupFn: async (candidate: any) => ({ claimed: true as const, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
++          syncStateFn: async () => true,
++        };
++        const backoffResult = await processPendingDeletionCleanups({ ...cleanupOptions, now: Date.now() });
++        assert.strictEqual(backoffResult.totalProcessed, 0, 'Retry belum boleh berjalan sebelum backoff berakhir');
++        assert.strictEqual(deletedIds.length, 0);
++        const processResult = await processPendingDeletionCleanups({
++          ...cleanupOptions,
++          now: Date.now() + 60_000,
+         });
+ 
+         assert.strictEqual(processResult.totalProcessed, 1);
+@@ -4107,6 +4115,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
+           token: 'mock-token',
+           tombstone: tomb,
+           deleteEventFn: mockDelete,
++          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
++          syncStateFn: async () => true,
+         });
+         assert.strictEqual(res1.success, true);
+         assert.strictEqual(deleteCount, 1);
+@@ -4116,9 +4126,11 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
+           token: 'mock-token',
+           tombstone: res1.tombstone,
+           deleteEventFn: mockDelete,
++          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
++          syncStateFn: async () => true,
+         });
+         assert.strictEqual(res2.success, true);
+-        // Karena sudah cleaned, deleteEventFn tetap aman dipanggil atau selesai tanpa error
++        assert.strictEqual(deleteCount, 1, 'Event cleaned tidak boleh dikirim DELETE ulang');
+         console.log('    ✅ [PASS] Scenario L: Cleanup berulang kali terbukti aman dan idempoten.');
+       }
+ 
+@@ -4135,6 +4147,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
+             err.status = 404;
+             throw err;
+           },
++          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
++          syncStateFn: async () => true,
+         });
+         assert.strictEqual(res404.success, true, 'Status 404 harus dianggap berhasil terhapus');
+         assert.strictEqual(res404.tombstone.status, 'cleaned');
+@@ -4148,6 +4162,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
+             err.status = 410;
+             throw err;
+           },
++          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
++          syncStateFn: async () => true,
+         });
+         assert.strictEqual(res410.success, true, 'Status 410 harus dianggap berhasil terhapus');
+         assert.strictEqual(res410.tombstone.status, 'cleaned');
+@@ -4155,6 +4171,144 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
+         console.log('    ✅ [PASS] Scenario M: Semantik 404 dan 410 ditangani secara tepat sebagai cleaned.');
+       }
+ 
++      // [Test 51] Cleanup production path: concurrency, retry, stale identity, and persistence confirmation
++      console.log('  [Test 51] Cleanup idempotency, retry, identity, and persistence confirmation');
++      {
++        const makeHarness = (initial: any) => {
++          const authoritative = new Map<string, any>([[initial.id, { ...initial }]]);
++          let syncAllowed = true;
++          const claimCleanupFn = async (candidate: any) => {
++            const state = authoritative.get(candidate.id);
++            if (!state || state.googleCalendarEventId !== candidate.googleCalendarEventId) {
++              return { claimed: false as const, reason: 'stale_remote_id' as const };
++            }
++            if (state.status === 'cleaned') return { claimed: false as const, reason: 'cleaned' as const };
++            if (state.status === 'cleaning') return { claimed: false as const, reason: 'busy' as const };
++            const retryCount = (state.retryCount || 0) + 1;
++            const lastAttemptAt = new Date().toISOString();
++            authoritative.set(candidate.id, { ...state, status: 'cleaning', retryCount, lastAttemptAt });
++            return { claimed: true as const, retryCount, lastAttemptAt };
++          };
++          const syncStateFn = async (_userId: string, candidate: any) => {
++            if (!syncAllowed) return false;
++            authoritative.set(candidate.id, { ...authoritative.get(candidate.id), ...candidate });
++            return true;
++          };
++          return {
++            authoritative,
++            claimCleanupFn,
++            syncStateFn,
++            failSync: () => { syncAllowed = false; },
++          };
++        };
++
++        clearAllTombstones();
++        const concurrentTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-51', 'gcal-51');
++        const h1 = makeHarness(concurrentTomb);
++        let deleteCount = 0;
++        let releaseDelete!: () => void;
++        const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
++        const deleteEventFn = async () => { deleteCount++; await deleteGate; };
++        const cleanupOptions = { token: 'mock-token', tombstone: concurrentTomb, deleteEventFn, claimCleanupFn: h1.claimCleanupFn, syncStateFn: h1.syncStateFn };
++        const first = compensateRemoteDeletion(cleanupOptions);
++        const second = compensateRemoteDeletion(cleanupOptions);
++        assert.strictEqual(first, second, 'Pemanggilan serentak pada tab yang sama harus berbagi promise in-flight');
++        await new Promise((resolve) => setTimeout(resolve, 0));
++        assert.strictEqual(deleteCount, 1, 'DELETE serentak harus dibatasi menjadi satu');
++        releaseDelete();
++        const [firstResult, secondResult] = await Promise.all([first, second]);
++        assert.strictEqual(firstResult.success, true);
++        assert.strictEqual(secondResult.success, true);
++        assert.strictEqual(firstResult.tombstone.status, 'cleaned');
++
++        const retryTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-network', 'gcal-network');
++        const h2 = makeHarness(retryTomb);
++        let attempts = 0;
++        const failed = await compensateRemoteDeletion({
++          token: 'mock-token', tombstone: retryTomb,
++          deleteEventFn: async () => { attempts++; throw new Error('network disconnected'); },
++          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
++        });
++        assert.strictEqual(failed.success, false);
++        assert.strictEqual(failed.tombstone.status, 'cleanup_failed');
++        assert.strictEqual(failed.tombstone.retryCount, 1);
++        const retried = await compensateRemoteDeletion({
++          token: 'mock-token', tombstone: failed.tombstone,
++          deleteEventFn: async () => { attempts++; },
++          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
++        });
++        assert.strictEqual(retried.success, true);
++        assert.strictEqual(retried.tombstone.retryCount, 2, 'Retry harus mengambil counter terbaru dan menaikkannya sekali');
++        assert.strictEqual(attempts, 2);
++
++        const noTokenTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-no-token', 'gcal-no-token');
++        let noTokenDeletes = 0;
++        const noToken = await compensateRemoteDeletion({
++          token: '', tombstone: noTokenTomb, deleteEventFn: async () => { noTokenDeletes++; },
++          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
++        });
++        assert.strictEqual(noToken.success, false);
++        assert.strictEqual(noTokenDeletes, 0, 'Tanpa token tidak boleh mengirim DELETE');
++
++        const expiredTokenTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-expired', 'gcal-expired');
++        const hExpired = makeHarness(expiredTokenTomb);
++        const expiredToken = await compensateRemoteDeletion({
++          token: 'expired-token', tombstone: expiredTokenTomb,
++          deleteEventFn: async () => { const err: any = new Error('Unauthorized'); err.status = 401; throw err; },
++          claimCleanupFn: hExpired.claimCleanupFn, syncStateFn: hExpired.syncStateFn,
++        });
++        assert.strictEqual(expiredToken.success, false);
++        assert.strictEqual(expiredToken.tombstone.status, 'cleanup_failed');
++        assert.ok(expiredToken.tombstone.lastError?.includes('AUTHENTICATION'));
++
++        const cleanedTomb = { ...retryTomb, status: 'cleaned' as const };
++        updateTombstone(cleanedTomb.id, cleanedTomb);
++        const cleaned = await compensateRemoteDeletion({
++          token: 'mock-token', tombstone: cleanedTomb, deleteEventFn: async () => { attempts++; },
++          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
++        });
++        assert.strictEqual(cleaned.success, true);
++        assert.strictEqual(attempts, 2, 'Tombstone cleaned tidak boleh di-DELETE kembali');
++
++        const busyTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-busy', 'gcal-busy');
++        const hBusy = makeHarness({ ...busyTomb, status: 'cleaning', lastAttemptAt: new Date().toISOString() });
++        let busyDeletes = 0;
++        const busy = await compensateRemoteDeletion({
++          token: 'mock-token', tombstone: { ...busyTomb, status: 'cleaning', lastAttemptAt: new Date().toISOString() },
++          deleteEventFn: async () => { busyDeletes++; },
++          claimCleanupFn: hBusy.claimCleanupFn, syncStateFn: hBusy.syncStateFn,
++        });
++        assert.strictEqual(busy.success, false);
++        assert.strictEqual(busyDeletes, 0, 'Status cleaning yang aktif harus menolak klaim kedua');
++
++        const changedTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-changed', 'gcal-old');
++        const hChanged = makeHarness(changedTomb);
++        updateTombstone(changedTomb.id, { googleCalendarEventId: 'gcal-new', status: 'pending_cleanup' });
++        let staleDeletes = 0;
++        const stale = await compensateRemoteDeletion({
++          token: 'mock-token', tombstone: changedTomb, deleteEventFn: async () => { staleDeletes++; },
++          claimCleanupFn: hChanged.claimCleanupFn, syncStateFn: hChanged.syncStateFn,
++        });
++        assert.strictEqual(stale.success, false);
++        assert.strictEqual(staleDeletes, 0, 'Snapshot lama tidak boleh menghapus remote ID yang lebih baru');
++
++        const persistTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-persist', 'gcal-persist');
++        const hPersist = makeHarness(persistTomb);
++        hPersist.failSync();
++        const persistenceFailure = await compensateRemoteDeletion({
++          token: 'mock-token', tombstone: persistTomb, deleteEventFn: async () => {},
++          claimCleanupFn: hPersist.claimCleanupFn, syncStateFn: hPersist.syncStateFn,
++        });
++        assert.strictEqual(persistenceFailure.success, false, 'Kegagalan konfirmasi Firestore tidak boleh dianggap cleaned');
++        assert.strictEqual(persistenceFailure.tombstone.status, 'cleaning');
++        const retainedIntent = await getOutboxItem(persistTomb.id);
++        assert.ok(retainedIntent, 'Outbox intent harus dipertahankan saat Firestore gagal');
++        assert.strictEqual(retainedIntent?.status, 'cleaned');
++        assert.strictEqual(retainedIntent?.syncStatus, 'pending_sync');
++
++        console.log('    ✅ [PASS] Cleanup produksi: concurrent dedupe, retry counter, no-token/401, cleaned/busy guard, stale ID, dan kegagalan konfirmasi Firestore.');
++      }
++
+       // [Test 50 - Skenario N] React functional state updater yang tertunda atau dipanggil ulang
+       console.log('  [Test 50 - Skenario N] React Functional State Updater Deterministik & Pure');
+       {

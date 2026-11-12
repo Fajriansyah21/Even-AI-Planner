@@ -12,9 +12,14 @@ import {
   DurableDeletionIntent,
   clearIndexedDbOutbox,
   getAllOutboxItems,
+  getOutboxItem,
   migrateLocalStorageToIndexedDb,
 } from './indexedDbOutbox';
-import { syncOutboxToFirestore, reconcileRemoteTombstonesToLocal } from './firestoreTombstoneRepo';
+import {
+  claimAuthoritativeRemoteCleanup,
+  syncOutboxToFirestore,
+  reconcileRemoteTombstonesToLocal,
+} from './firestoreTombstoneRepo';
 import { auth } from './firebase';
 
 export type TombstoneCleanupStatus =
@@ -41,6 +46,8 @@ const STORAGE_KEY = 'even_deletion_tombstones_v1';
 
 // In-memory cache for fast, synchronous lookups within the same session
 const inMemoryTombstones = new Map<string, DeletionTombstone>();
+const cleanupInFlight = new Map<string, Promise<{ success: boolean; tombstone: DeletionTombstone }>>();
+const CLEANUP_LEASE_MS = 5 * 60 * 1000;
 
 let firestoreSyncEnabled = true;
 
@@ -511,6 +518,23 @@ export async function initDurableTombstones(userId?: string): Promise<void> {
     try {
       await reconcileRemoteTombstonesToLocal(userId);
       await syncOutboxToFirestore({ userId });
+      // Reconciliation may discover a new remote ID for a tombstone already
+      // cached as cleaned in this tab. Refresh memory from the reconciled outbox.
+      const reconciledItems = await getAllOutboxItems(userId);
+      for (const item of reconciledItems) {
+        inMemoryTombstones.set(item.id, {
+          id: item.id,
+          userId: item.userId,
+          taskId: item.taskId,
+          sessionId: item.sessionId === 'all' ? undefined : item.sessionId,
+          googleCalendarEventId: item.googleCalendarEventId,
+          deletedAt: item.deletedAt,
+          status: item.status,
+          retryCount: item.retryCount,
+          lastError: item.lastError,
+          lastAttemptAt: item.lastAttemptAt,
+        });
+      }
     } catch (err) {
       console.warn('Background Firestore tombstone sync notice:', err);
     }
@@ -522,55 +546,237 @@ export interface CompensateRemoteDeletionOptions {
   tombstone: DeletionTombstone;
   deleteEventFn?: (accessToken: string, googleEventId: string, signal?: AbortSignal) => Promise<void>;
   signal?: AbortSignal;
+  claimCleanupFn?: (tombstone: DeletionTombstone) => Promise<
+    { claimed: true; retryCount: number; lastAttemptAt: string } |
+    { claimed: false; reason: 'missing' | 'cleaned' | 'busy' | 'stale_remote_id' | 'not_retryable' }
+  >;
+  syncStateFn?: (userId: string, tombstone: DeletionTombstone) => Promise<boolean>;
 }
 
 /**
  * Executes remote event compensation (DELETE) for a tombstoned session.
  * Idempotent: Handles 404/410 by marking as cleaned.
  */
-export async function compensateRemoteDeletion(
+export function compensateRemoteDeletion(
+  options: CompensateRemoteDeletionOptions
+): Promise<{ success: boolean; tombstone: DeletionTombstone }> {
+  const active = cleanupInFlight.get(options.tombstone.id);
+  if (active) return active;
+
+  const operation = runRemoteDeletionCompensation(options).finally(() => {
+    if (cleanupInFlight.get(options.tombstone.id) === operation) {
+      cleanupInFlight.delete(options.tombstone.id);
+    }
+  });
+  cleanupInFlight.set(options.tombstone.id, operation);
+  return operation;
+}
+
+async function runRemoteDeletionCompensation(
   options: CompensateRemoteDeletionOptions
 ): Promise<{ success: boolean; tombstone: DeletionTombstone }> {
   const { token, tombstone, deleteEventFn = deleteGoogleCalendarEvent, signal } = options;
-
-  if (!tombstone.googleCalendarEventId) {
-    // No remote ID to delete, consider already cleaned
-    const updated = updateTombstone(tombstone.id, { status: 'cleaned' }) || tombstone;
-    return { success: true, tombstone: updated };
+  let current = inMemoryTombstones.get(tombstone.id) || tombstone;
+  if (!current.googleCalendarEventId) {
+    return { success: current.status === 'cleaned', tombstone: current };
+  }
+  if (!token?.trim() || signal?.aborted) return { success: false, tombstone: current };
+  if (current.googleCalendarEventId !== tombstone.googleCalendarEventId) {
+    return { success: false, tombstone: current };
+  }
+  if (current.status === 'cleaned' && (current.userId === 'user-default' || options.claimCleanupFn)) {
+    return { success: true, tombstone: current };
   }
 
-  updateTombstone(tombstone.id, {
-    status: 'cleaning',
-    lastAttemptAt: new Date().toISOString(),
-  });
+  const userId = current.userId;
+  let retryCount = current.retryCount || 0;
+  let lastAttemptAt = new Date().toISOString();
 
   try {
-    await deleteEventFn(token, tombstone.googleCalendarEventId, signal);
-    const updated = updateTombstone(tombstone.id, {
-      status: 'cleaned',
-      lastError: undefined,
-    }) || tombstone;
-    return { success: true, tombstone: updated };
-  } catch (err: any) {
-    // Check if error represents 404 (Not Found) or 410 (Gone) -> already deleted remotely
-    const status = err?.status || err?.classification?.status;
-    if (status === 404 || status === 410) {
-      const updated = updateTombstone(tombstone.id, {
-        status: 'cleaned',
-        lastError: undefined,
-      }) || tombstone;
-      return { success: true, tombstone: updated };
+    if (userId !== 'user-default' && !options.claimCleanupFn) {
+      // Reconcile first so a new remote ID or cleaned state from another device
+      // cannot be overwritten by a stale local outbox snapshot.
+      await reconcileRemoteTombstonesToLocal(userId);
+      const reconciled = await getOutboxItem(current.id);
+      if (reconciled?.syncStatus === 'synced') {
+        current = {
+          id: reconciled.id,
+          userId: reconciled.userId,
+          taskId: reconciled.taskId,
+          sessionId: reconciled.sessionId === 'all' ? undefined : reconciled.sessionId,
+          googleCalendarEventId: reconciled.googleCalendarEventId,
+          deletedAt: reconciled.deletedAt,
+          status: reconciled.status,
+          retryCount: reconciled.retryCount,
+          lastError: reconciled.lastError,
+          lastAttemptAt: reconciled.lastAttemptAt,
+        };
+        inMemoryTombstones.set(current.id, current);
+        if (current.googleCalendarEventId !== tombstone.googleCalendarEventId) {
+          return { success: false, tombstone: current };
+        }
+        if (current.status === 'cleaned') return { success: true, tombstone: current };
+      }
+      // Ensure the durable local intent has reached Firestore before taking a remote action.
+      await syncOutboxToFirestore({ userId });
     }
 
-    const updated = updateTombstone(tombstone.id, {
-      status: 'cleanup_failed',
-      retryCount: (tombstone.retryCount || 0) + 1,
-      lastError: err?.message || 'Remote DELETE failed',
-      lastAttemptAt: new Date().toISOString(),
-    }) || tombstone;
+    if (options.claimCleanupFn) {
+      const claim = await options.claimCleanupFn(current);
+      if (!claim.claimed) {
+        const latest = inMemoryTombstones.get(current.id) || current;
+        return { success: claim.reason === 'cleaned', tombstone: latest };
+      }
+      retryCount = claim.retryCount;
+      lastAttemptAt = claim.lastAttemptAt;
+    } else if (userId !== 'user-default') {
+      const intent: DurableDeletionIntent = {
+        id: current.id,
+        userId,
+        taskId: current.taskId,
+        sessionId: current.sessionId || 'all',
+        entityType: current.sessionId && current.sessionId !== 'all' ? 'session' : 'task',
+        googleCalendarEventId: current.googleCalendarEventId,
+        deletedAt: current.deletedAt,
+        status: current.status,
+        syncStatus: 'synced',
+        syncAttempts: 0,
+        retryCount,
+        lastError: current.lastError,
+        lastAttemptAt: current.lastAttemptAt,
+        updatedAt: new Date().toISOString(),
+      };
+      const claim = await claimAuthoritativeRemoteCleanup(intent, { leaseMs: CLEANUP_LEASE_MS });
+      if (!claim.claimed) {
+        const latest = inMemoryTombstones.get(current.id) || current;
+        return { success: claim.reason === 'cleaned', tombstone: latest };
+      }
+      retryCount = claim.tombstone.retryCount;
+      lastAttemptAt = claim.tombstone.lastAttemptAt || lastAttemptAt;
+    } else {
+      if (current.status === 'cleaning') {
+        const lastAttempt = current.lastAttemptAt ? Date.parse(current.lastAttemptAt) : NaN;
+        if (Number.isFinite(lastAttempt) && Date.now() - lastAttempt < CLEANUP_LEASE_MS) {
+          return { success: false, tombstone: current };
+        }
+      } else if (current.status !== 'pending_cleanup' && current.status !== 'cleanup_failed') {
+        return { success: false, tombstone: current };
+      }
+      retryCount += 1;
+    }
 
-    return { success: false, tombstone: updated };
+    // Persist the claimed state in IndexedDB before issuing DELETE.
+    const claimedTombstone: DeletionTombstone = {
+      ...current,
+      status: 'cleaning',
+      retryCount,
+      lastAttemptAt,
+      lastError: undefined,
+    };
+    await saveToOutbox(toDurableIntent(claimedTombstone, 'synced'));
+    const latestBeforeDelete = inMemoryTombstones.get(current.id) || current;
+    if (latestBeforeDelete.googleCalendarEventId !== current.googleCalendarEventId) {
+      return { success: false, tombstone: latestBeforeDelete };
+    }
+    if (latestBeforeDelete.status === 'cleaned') {
+      return { success: true, tombstone: latestBeforeDelete };
+    }
+    inMemoryTombstones.set(current.id, claimedTombstone);
+    saveTombstonesToStorage();
+
+    try {
+      await deleteEventFn(token, current.googleCalendarEventId, signal);
+    } catch (err: any) {
+      const status = err?.status || err?.classification?.status;
+      if (status !== 404 && status !== 410) {
+        return await finishCleanupAttempt(options, claimedTombstone, {
+          status: 'cleanup_failed',
+          lastError: describeCleanupFailure(err),
+          lastAttemptAt,
+        });
+      }
+    }
+
+    return await finishCleanupAttempt(options, claimedTombstone, {
+      status: 'cleaned',
+      lastError: undefined,
+      lastAttemptAt,
+    });
+  } catch (err: any) {
+    const latest = inMemoryTombstones.get(current.id) || current;
+    return { success: false, tombstone: latest };
   }
+}
+
+function describeCleanupFailure(err: any): string {
+  const status = err?.status || err?.classification?.status || 0;
+  const code = err?.code || err?.classification?.code;
+  const category = status === 401
+    ? 'AUTHENTICATION'
+    : status === 403
+      ? 'PERMISSION'
+      : status === 0
+        ? 'NETWORK_OR_ABORT'
+        : status >= 500 || status === 429
+          ? 'TRANSIENT_SERVICE'
+          : 'REMOTE_FAILURE';
+  const detail = err?.message || 'Remote DELETE failed';
+  return `[${category}${code ? `/${code}` : ''}${status ? ` HTTP ${status}` : ''}] ${detail}`;
+}
+
+function toDurableIntent(
+  tombstone: DeletionTombstone,
+  syncStatus: DurableDeletionIntent['syncStatus']
+): DurableDeletionIntent {
+  return {
+    id: tombstone.id,
+    userId: tombstone.userId,
+    taskId: tombstone.taskId,
+    sessionId: tombstone.sessionId || 'all',
+    entityType: tombstone.sessionId && tombstone.sessionId !== 'all' ? 'session' : 'task',
+    googleCalendarEventId: tombstone.googleCalendarEventId,
+    deletedAt: tombstone.deletedAt,
+    status: tombstone.status,
+    syncStatus,
+    syncAttempts: 0,
+    retryCount: tombstone.retryCount || 0,
+    lastError: tombstone.lastError,
+    lastAttemptAt: tombstone.lastAttemptAt,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function finishCleanupAttempt(
+  options: CompensateRemoteDeletionOptions,
+  claimedTombstone: DeletionTombstone,
+  patch: Pick<DeletionTombstone, 'status' | 'lastError' | 'lastAttemptAt'>
+): Promise<{ success: boolean; tombstone: DeletionTombstone }> {
+  const current = inMemoryTombstones.get(claimedTombstone.id) || claimedTombstone;
+  if (current.googleCalendarEventId !== claimedTombstone.googleCalendarEventId) {
+    return { success: false, tombstone: current };
+  }
+  if (current.status === 'cleaned') return { success: true, tombstone: current };
+
+  const next = { ...current, ...patch };
+  await saveToOutbox(toDurableIntent(next, 'pending_sync'));
+  let confirmed = options.syncStateFn
+    ? await options.syncStateFn(next.userId, next)
+    : next.userId === 'user-default';
+
+  if (!options.syncStateFn && next.userId !== 'user-default') {
+    const sync = await syncOutboxToFirestore({ userId: next.userId });
+    const outbox = await getOutboxItem(next.id);
+    confirmed = sync.failedCount === 0 && outbox?.syncStatus === 'synced' && outbox.status === next.status;
+  }
+
+  if (!confirmed) return { success: false, tombstone: current };
+  const latest = inMemoryTombstones.get(next.id) || current;
+  if (latest.googleCalendarEventId !== claimedTombstone.googleCalendarEventId) {
+    return { success: false, tombstone: latest };
+  }
+  inMemoryTombstones.set(next.id, next);
+  saveTombstonesToStorage();
+  return { success: patch.status === 'cleaned', tombstone: next };
 }
 
 export interface ProcessPendingCleanupsOptions {
@@ -578,6 +784,9 @@ export interface ProcessPendingCleanupsOptions {
   userId?: string;
   deleteEventFn?: (accessToken: string, googleEventId: string, signal?: AbortSignal) => Promise<void>;
   signal?: AbortSignal;
+  claimCleanupFn?: CompensateRemoteDeletionOptions['claimCleanupFn'];
+  syncStateFn?: CompensateRemoteDeletionOptions['syncStateFn'];
+  now?: number;
 }
 
 /**
@@ -592,12 +801,17 @@ export async function processPendingDeletionCleanups(
   failedCount: number;
 }> {
   const { token, userId, deleteEventFn, signal } = options;
+  if (userId && userId !== 'user-default' && !options.claimCleanupFn) {
+    await initDurableTombstones(userId);
+  }
   const tombstones = getTombstones(userId);
 
+  const now = options.now ?? Date.now();
   const pending = tombstones.filter(
     (t) =>
-      (t.status === 'pending_cleanup' || t.status === 'cleanup_failed') &&
-      Boolean(t.googleCalendarEventId)
+      (t.status === 'pending_cleanup' || t.status === 'cleanup_failed' || t.status === 'cleaning') &&
+      Boolean(t.googleCalendarEventId) &&
+      isCleanupDue(t, now)
   );
 
   let cleanedCount = 0;
@@ -610,6 +824,8 @@ export async function processPendingDeletionCleanups(
       tombstone: t,
       deleteEventFn,
       signal,
+      claimCleanupFn: options.claimCleanupFn,
+      syncStateFn: options.syncStateFn,
     });
     if (res.success) {
       cleanedCount++;
@@ -623,6 +839,21 @@ export async function processPendingDeletionCleanups(
     cleanedCount,
     failedCount,
   };
+}
+
+function cleanupRetryDelayMs(retryCount: number): number {
+  const attemptExponent = Math.max(0, Math.min(16, (retryCount || 0) - 1));
+  return Math.min(6 * 60 * 60 * 1000, 5_000 * 2 ** attemptExponent);
+}
+
+function isCleanupDue(tombstone: DeletionTombstone, now: number): boolean {
+  if (!tombstone.lastAttemptAt) return true;
+  const lastAttempt = Date.parse(tombstone.lastAttemptAt);
+  if (!Number.isFinite(lastAttempt)) return true;
+  const delay = tombstone.status === 'cleaning'
+    ? CLEANUP_LEASE_MS
+    : cleanupRetryDelayMs(tombstone.retryCount);
+  return now - lastAttempt >= delay;
 }
 
 // Automatically load tombstones on module initialization

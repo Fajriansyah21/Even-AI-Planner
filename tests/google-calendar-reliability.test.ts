@@ -31,6 +31,7 @@ import {
   updateTombstone,
   loadTombstonesFromStorage,
 } from '../src/lib/deletionTombstone';
+import { getOutboxItem } from '../src/lib/indexedDbOutbox';
 
 export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
   console.log('================================================================');
@@ -3846,16 +3847,23 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
 
         // Simulasikan tombstone yang tertunda dari sesi sebelumnya
         const tomb = recordSessionDeletion(userId, taskId, sessId, remoteId);
-        updateTombstone(tomb.id, { status: 'cleanup_failed', retryCount: 1 });
+        updateTombstone(tomb.id, { status: 'cleanup_failed', retryCount: 1, lastAttemptAt: new Date().toISOString() });
 
         // Simulasikan restart aplikasi dengan memanggil processPendingDeletionCleanups
         const deletedIds: string[] = [];
-        const processResult = await processPendingDeletionCleanups({
+        const cleanupOptions = {
           token: 'mock-token',
           userId,
-          deleteEventFn: async (_tok, id) => {
-            deletedIds.push(id);
-          },
+          deleteEventFn: async (_tok: string, id: string) => { deletedIds.push(id); },
+          claimCleanupFn: async (candidate: any) => ({ claimed: true as const, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          syncStateFn: async () => true,
+        };
+        const backoffResult = await processPendingDeletionCleanups({ ...cleanupOptions, now: Date.now() });
+        assert.strictEqual(backoffResult.totalProcessed, 0, 'Retry belum boleh berjalan sebelum backoff berakhir');
+        assert.strictEqual(deletedIds.length, 0);
+        const processResult = await processPendingDeletionCleanups({
+          ...cleanupOptions,
+          now: Date.now() + 60_000,
         });
 
         assert.strictEqual(processResult.totalProcessed, 1);
@@ -4107,6 +4115,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
           token: 'mock-token',
           tombstone: tomb,
           deleteEventFn: mockDelete,
+          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          syncStateFn: async () => true,
         });
         assert.strictEqual(res1.success, true);
         assert.strictEqual(deleteCount, 1);
@@ -4116,9 +4126,11 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
           token: 'mock-token',
           tombstone: res1.tombstone,
           deleteEventFn: mockDelete,
+          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          syncStateFn: async () => true,
         });
         assert.strictEqual(res2.success, true);
-        // Karena sudah cleaned, deleteEventFn tetap aman dipanggil atau selesai tanpa error
+        assert.strictEqual(deleteCount, 1, 'Event cleaned tidak boleh dikirim DELETE ulang');
         console.log('    ✅ [PASS] Scenario L: Cleanup berulang kali terbukti aman dan idempoten.');
       }
 
@@ -4135,6 +4147,8 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
             err.status = 404;
             throw err;
           },
+          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          syncStateFn: async () => true,
         });
         assert.strictEqual(res404.success, true, 'Status 404 harus dianggap berhasil terhapus');
         assert.strictEqual(res404.tombstone.status, 'cleaned');
@@ -4148,11 +4162,151 @@ export async function runGoogleCalendarReliabilitySuite(): Promise<void> {
             err.status = 410;
             throw err;
           },
+          claimCleanupFn: async (candidate) => ({ claimed: true, retryCount: candidate.retryCount + 1, lastAttemptAt: new Date().toISOString() }),
+          syncStateFn: async () => true,
         });
         assert.strictEqual(res410.success, true, 'Status 410 harus dianggap berhasil terhapus');
         assert.strictEqual(res410.tombstone.status, 'cleaned');
 
         console.log('    ✅ [PASS] Scenario M: Semantik 404 dan 410 ditangani secara tepat sebagai cleaned.');
+      }
+
+      // [Test 51] Cleanup production path: concurrency, retry, stale identity, and persistence confirmation
+      console.log('  [Test 51] Cleanup idempotency, retry, identity, and persistence confirmation');
+      {
+        const makeHarness = (initial: any) => {
+          const authoritative = new Map<string, any>([[initial.id, { ...initial }]]);
+          let syncAllowed = true;
+          const claimCleanupFn = async (candidate: any) => {
+            const state = authoritative.get(candidate.id);
+            if (!state || state.googleCalendarEventId !== candidate.googleCalendarEventId) {
+              return { claimed: false as const, reason: 'stale_remote_id' as const };
+            }
+            if (state.status === 'cleaned') return { claimed: false as const, reason: 'cleaned' as const };
+            if (state.status === 'cleaning') return { claimed: false as const, reason: 'busy' as const };
+            const retryCount = (state.retryCount || 0) + 1;
+            const lastAttemptAt = new Date().toISOString();
+            authoritative.set(candidate.id, { ...state, status: 'cleaning', retryCount, lastAttemptAt });
+            return { claimed: true as const, retryCount, lastAttemptAt };
+          };
+          const syncStateFn = async (_userId: string, candidate: any) => {
+            if (!syncAllowed) return false;
+            authoritative.set(candidate.id, { ...authoritative.get(candidate.id), ...candidate });
+            return true;
+          };
+          return {
+            authoritative,
+            claimCleanupFn,
+            syncStateFn,
+            failSync: () => { syncAllowed = false; },
+          };
+        };
+
+        clearAllTombstones();
+        const concurrentTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-51', 'gcal-51');
+        const h1 = makeHarness(concurrentTomb);
+        let deleteCount = 0;
+        let releaseDelete!: () => void;
+        const deleteGate = new Promise<void>((resolve) => { releaseDelete = resolve; });
+        const deleteEventFn = async () => { deleteCount++; await deleteGate; };
+        const cleanupOptions = { token: 'mock-token', tombstone: concurrentTomb, deleteEventFn, claimCleanupFn: h1.claimCleanupFn, syncStateFn: h1.syncStateFn };
+        const first = compensateRemoteDeletion(cleanupOptions);
+        const second = compensateRemoteDeletion(cleanupOptions);
+        assert.strictEqual(first, second, 'Pemanggilan serentak pada tab yang sama harus berbagi promise in-flight');
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.strictEqual(deleteCount, 1, 'DELETE serentak harus dibatasi menjadi satu');
+        releaseDelete();
+        const [firstResult, secondResult] = await Promise.all([first, second]);
+        assert.strictEqual(firstResult.success, true);
+        assert.strictEqual(secondResult.success, true);
+        assert.strictEqual(firstResult.tombstone.status, 'cleaned');
+
+        const retryTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-network', 'gcal-network');
+        const h2 = makeHarness(retryTomb);
+        let attempts = 0;
+        const failed = await compensateRemoteDeletion({
+          token: 'mock-token', tombstone: retryTomb,
+          deleteEventFn: async () => { attempts++; throw new Error('network disconnected'); },
+          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
+        });
+        assert.strictEqual(failed.success, false);
+        assert.strictEqual(failed.tombstone.status, 'cleanup_failed');
+        assert.strictEqual(failed.tombstone.retryCount, 1);
+        const retried = await compensateRemoteDeletion({
+          token: 'mock-token', tombstone: failed.tombstone,
+          deleteEventFn: async () => { attempts++; },
+          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
+        });
+        assert.strictEqual(retried.success, true);
+        assert.strictEqual(retried.tombstone.retryCount, 2, 'Retry harus mengambil counter terbaru dan menaikkannya sekali');
+        assert.strictEqual(attempts, 2);
+
+        const noTokenTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-no-token', 'gcal-no-token');
+        let noTokenDeletes = 0;
+        const noToken = await compensateRemoteDeletion({
+          token: '', tombstone: noTokenTomb, deleteEventFn: async () => { noTokenDeletes++; },
+          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
+        });
+        assert.strictEqual(noToken.success, false);
+        assert.strictEqual(noTokenDeletes, 0, 'Tanpa token tidak boleh mengirim DELETE');
+
+        const expiredTokenTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-expired', 'gcal-expired');
+        const hExpired = makeHarness(expiredTokenTomb);
+        const expiredToken = await compensateRemoteDeletion({
+          token: 'expired-token', tombstone: expiredTokenTomb,
+          deleteEventFn: async () => { const err: any = new Error('Unauthorized'); err.status = 401; throw err; },
+          claimCleanupFn: hExpired.claimCleanupFn, syncStateFn: hExpired.syncStateFn,
+        });
+        assert.strictEqual(expiredToken.success, false);
+        assert.strictEqual(expiredToken.tombstone.status, 'cleanup_failed');
+        assert.ok(expiredToken.tombstone.lastError?.includes('AUTHENTICATION'));
+
+        const cleanedTomb = { ...retryTomb, status: 'cleaned' as const };
+        updateTombstone(cleanedTomb.id, cleanedTomb);
+        const cleaned = await compensateRemoteDeletion({
+          token: 'mock-token', tombstone: cleanedTomb, deleteEventFn: async () => { attempts++; },
+          claimCleanupFn: h2.claimCleanupFn, syncStateFn: h2.syncStateFn,
+        });
+        assert.strictEqual(cleaned.success, true);
+        assert.strictEqual(attempts, 2, 'Tombstone cleaned tidak boleh di-DELETE kembali');
+
+        const busyTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-busy', 'gcal-busy');
+        const hBusy = makeHarness({ ...busyTomb, status: 'cleaning', lastAttemptAt: new Date().toISOString() });
+        let busyDeletes = 0;
+        const busy = await compensateRemoteDeletion({
+          token: 'mock-token', tombstone: { ...busyTomb, status: 'cleaning', lastAttemptAt: new Date().toISOString() },
+          deleteEventFn: async () => { busyDeletes++; },
+          claimCleanupFn: hBusy.claimCleanupFn, syncStateFn: hBusy.syncStateFn,
+        });
+        assert.strictEqual(busy.success, false);
+        assert.strictEqual(busyDeletes, 0, 'Status cleaning yang aktif harus menolak klaim kedua');
+
+        const changedTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-changed', 'gcal-old');
+        const hChanged = makeHarness(changedTomb);
+        updateTombstone(changedTomb.id, { googleCalendarEventId: 'gcal-new', status: 'pending_cleanup' });
+        let staleDeletes = 0;
+        const stale = await compensateRemoteDeletion({
+          token: 'mock-token', tombstone: changedTomb, deleteEventFn: async () => { staleDeletes++; },
+          claimCleanupFn: hChanged.claimCleanupFn, syncStateFn: hChanged.syncStateFn,
+        });
+        assert.strictEqual(stale.success, false);
+        assert.strictEqual(staleDeletes, 0, 'Snapshot lama tidak boleh menghapus remote ID yang lebih baru');
+
+        const persistTomb = recordSessionDeletion('user-cleanup-51', 'task-51', 'sess-persist', 'gcal-persist');
+        const hPersist = makeHarness(persistTomb);
+        hPersist.failSync();
+        const persistenceFailure = await compensateRemoteDeletion({
+          token: 'mock-token', tombstone: persistTomb, deleteEventFn: async () => {},
+          claimCleanupFn: hPersist.claimCleanupFn, syncStateFn: hPersist.syncStateFn,
+        });
+        assert.strictEqual(persistenceFailure.success, false, 'Kegagalan konfirmasi Firestore tidak boleh dianggap cleaned');
+        assert.strictEqual(persistenceFailure.tombstone.status, 'cleaning');
+        const retainedIntent = await getOutboxItem(persistTomb.id);
+        assert.ok(retainedIntent, 'Outbox intent harus dipertahankan saat Firestore gagal');
+        assert.strictEqual(retainedIntent?.status, 'cleaned');
+        assert.strictEqual(retainedIntent?.syncStatus, 'pending_sync');
+
+        console.log('    ✅ [PASS] Cleanup produksi: concurrent dedupe, retry counter, no-token/401, cleaned/busy guard, stale ID, dan kegagalan konfirmasi Firestore.');
       }
 
       // [Test 50 - Skenario N] React functional state updater yang tertunda atau dipanggil ulang

@@ -282,14 +282,14 @@ export async function getAllOutboxItems(userId?: string): Promise<DurableDeletio
 }
 
 /**
- * Retrieves all outbox items that require synchronization to Firestore.
+ * Retrieves all outbox items that require synchronization or retry.
  */
 export async function getPendingSyncOutboxItems(userId?: string): Promise<DurableDeletionIntent[]> {
   const idb = getIndexedDbInstance();
   if (!idb) {
     if (memoryFallbackExplicitlyAllowed) {
       return Array.from(inMemoryStore.values()).filter(
-        (item) => item.syncStatus === 'pending_sync' && (!userId || item.userId === userId)
+        (item) => (item.syncStatus === 'pending_sync' || item.syncStatus === 'sync_failed') && (!userId || item.userId === userId)
       );
     }
     throw new Error('IndexedDB tidak tersedia di environment ini');
@@ -308,26 +308,18 @@ export async function getPendingSyncOutboxItems(userId?: string): Promise<Durabl
     const store = tx.objectStore(OUTBOX_STORE);
     let req: IDBRequest<any>;
     if (userId) {
-      if (typeof IDBKeyRange !== 'undefined') {
-        const index = store.index('by_user_syncStatus');
-        req = index.getAll(IDBKeyRange.only([userId, 'pending_sync']));
-      } else {
-        const index = store.index('by_userId');
-        req = index.getAll(userId);
-      }
+      req = store.index('by_userId').getAll(userId);
     } else {
-      const index = store.index('by_syncStatus');
-      req = index.getAll('pending_sync');
+      req = store.getAll();
     }
 
     req.onsuccess = () => {
       db.close();
       const list: DurableDeletionIntent[] = req.result || [];
-      if (userId && typeof IDBKeyRange === 'undefined') {
-        resolve(list.filter((i) => i.syncStatus === 'pending_sync'));
-      } else {
-        resolve(list);
-      }
+      resolve(list.filter((i) =>
+        (i.syncStatus === 'pending_sync' || i.syncStatus === 'sync_failed') &&
+        (!userId || i.userId === userId)
+      ));
     };
 
     req.onerror = () => {

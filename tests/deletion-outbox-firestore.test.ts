@@ -37,6 +37,7 @@ import {
   buildFirestoreTombstoneDocId,
   validateUserOwnership,
   saveAuthoritativeTombstone,
+  claimAuthoritativeRemoteCleanup,
   getAuthoritativeTombstones,
   syncOutboxToFirestore,
   reconcileRemoteTombstonesToLocal,
@@ -529,6 +530,104 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       pass('Test 7: Firestore runTransaction memastikan concurrency atomik dan monotonic merge');
     }
 
+    // [Test 7B] Actual cleanup claim function is atomic and remote-ID bound
+    {
+      (auth as any).currentUser = { uid: 'user-claim-7b' };
+      const userId = 'user-claim-7b';
+      const taskId = 'task-claim-7b';
+      const sessionId = 'sess-claim-7b';
+      const docId = buildFirestoreTombstoneDocId(taskId, sessionId);
+      const path = `users/${userId}/deletion_tombstones/${docId}`;
+      const now = new Date('2026-11-12T10:00:00.000Z');
+      const store = new Map<string, any>([[path, {
+        id: docId,
+        compositeKey: buildOutboxKey(userId, taskId, sessionId),
+        userId, taskId, sessionId, entityType: 'session',
+        googleCalendarEventId: 'gcal-claim-7b',
+        deletedAt: '2026-11-12T09:00:00.000Z',
+        status: 'pending_cleanup', retryCount: 8,
+        lastAttemptAt: null, lastError: null,
+        updatedAt: now.toISOString(),
+      }]]);
+      let transactionQueue = Promise.resolve();
+      const atomicRunTransaction = async (_db: any, updateFn: (tx: any) => Promise<any>) => {
+        let release!: () => void;
+        const previous = transactionQueue;
+        transactionQueue = new Promise<void>((resolve) => { release = resolve; });
+        await previous;
+        try {
+          return await updateFn({
+            get: async (ref: any) => ({
+              exists: () => store.has(ref.path),
+              data: () => store.get(ref.path),
+            }),
+            set: (ref: any, data: any) => store.set(ref.path, data),
+          });
+        } finally {
+          release();
+        }
+      };
+      const intent: DurableDeletionIntent = {
+        id: buildOutboxKey(userId, taskId, sessionId), userId, taskId, sessionId,
+        entityType: 'session', googleCalendarEventId: 'gcal-claim-7b',
+        deletedAt: '2026-11-12T09:00:00.000Z', status: 'pending_cleanup',
+        syncStatus: 'synced', syncAttempts: 0, retryCount: 0,
+        updatedAt: now.toISOString(),
+      };
+      const claimOptions = { now, customRunTransaction: atomicRunTransaction as any };
+      const [claimA, claimB] = await Promise.all([
+        claimAuthoritativeRemoteCleanup(intent, claimOptions),
+        claimAuthoritativeRemoteCleanup(intent, claimOptions),
+      ]);
+      const claims = [claimA, claimB].filter((result) => result.claimed);
+      assert.strictEqual(claims.length, 1, 'Hanya satu transaksi boleh memperoleh claim cleanup');
+      assert.strictEqual((claims[0] as any).tombstone.retryCount, 9, 'Retry count harus memakai nilai Firestore terbaru');
+      assert.ok([claimA, claimB].some((result) => !result.claimed && result.reason === 'busy'));
+      assert.deepStrictEqual(
+        Object.keys(store.get(path)!).sort(),
+        ['compositeKey', 'userId', 'taskId', 'sessionId', 'entityType', 'googleCalendarEventId', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'lastAttemptAt', 'error'].sort(),
+        'Payload produksi harus sesuai schema Firestore Rules Step 3 tanpa field tambahan'
+      );
+
+      const staleId = await claimAuthoritativeRemoteCleanup({
+        ...intent, googleCalendarEventId: 'gcal-old',
+      }, claimOptions);
+      assert.deepStrictEqual(staleId, { claimed: false, reason: 'stale_remote_id' });
+
+      const currentDoc = store.get(path)!;
+      store.set(path, { ...currentDoc, status: 'cleaning', lastAttemptAt: now.toISOString() });
+      const activeLease = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
+      assert.deepStrictEqual(activeLease, { claimed: false, reason: 'busy' });
+
+      store.set(path, {
+        ...currentDoc, status: 'cleaning', retryCount: 9,
+        lastAttemptAt: '2026-11-12T08:00:00.000Z',
+      });
+      const reclaimedLease = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
+      assert.strictEqual(reclaimedLease.claimed, true, 'Lease cleaning yang kedaluwarsa harus dapat dipulihkan');
+      assert.strictEqual((reclaimedLease as any).tombstone.retryCount, 10);
+
+      store.set(path, { ...currentDoc, status: 'cleaned' });
+      const alreadyCleaned = await claimAuthoritativeRemoteCleanup(intent, claimOptions);
+      assert.deepStrictEqual(alreadyCleaned, { claimed: false, reason: 'cleaned' });
+
+      store.set(path, {
+        ...currentDoc, googleCalendarEventId: 'gcal-new-current', status: 'cleaned',
+        updatedAt: '2026-11-12T10:10:00.000Z',
+      });
+      const staleOutbox: DurableDeletionIntent = {
+        ...intent, googleCalendarEventId: 'gcal-stale-old', status: 'pending_cleanup',
+        updatedAt: '2026-11-12T10:05:00.000Z',
+      };
+      const mergeResult = await saveAuthoritativeTombstone(staleOutbox, {
+        customRunTransaction: atomicRunTransaction as any,
+      });
+      assert.strictEqual(mergeResult.googleCalendarEventId, 'gcal-new-current');
+      assert.strictEqual(mergeResult.status, 'cleaned', 'Outbox stale tidak boleh menghidupkan kembali tombstone cleaned');
+
+      pass('Test 7B: claim aktual serial, memakai retry Firestore terbaru, menolak ID stale, dan memulihkan/menolak lease sesuai status');
+    }
+
     // [Test 8] Firestore Read Failure inside transaction rejects and retains outbox
     {
       (auth as any).currentUser = { uid: 'user-err-8' };
@@ -676,10 +775,11 @@ export async function runDeletionOutboxAndFirestoreSuite() {
       const itemAfterFail = await getOutboxItem(key);
       assert.ok(itemAfterFail, 'Item outbox harus tetap ada saat sync gagal');
       assert.strictEqual(itemAfterFail?.syncStatus, 'sync_failed');
+      const retryItems = await getPendingSyncOutboxItems(userId);
+      assert.ok(retryItems.some((item) => item.id === key), 'sync_failed harus tetap masuk antrean retry');
 
       // 2. Retry succeeds
       simulateFailure = false;
-      await saveToOutbox({ ...itemAfterFail, syncStatus: 'pending_sync' });
       const successRes = await syncOutboxToFirestore({ userId, saveAuthoritativeFn: mockSave });
       assert.strictEqual(successRes.syncedCount, 1);
 
@@ -795,11 +895,20 @@ export async function runDeletionOutboxAndFirestoreSuite() {
         },
         recordDurableFn: async () => {
           callLog.push('1_recordTaskDeletionDurable');
-          return [];
+          return [{
+            id: 'user-ui-14:task-ui-success-14:sess-succ-1',
+            userId: 'user-ui-14', taskId: 'task-ui-success-14', sessionId: 'sess-succ-1',
+            googleCalendarEventId: 'gcal-succ-1', deletedAt: new Date().toISOString(),
+            status: 'pending_cleanup', retryCount: 0,
+          }];
         },
         deleteRemoteEventFn: async (_token, eventId) => {
           callLog.push(`3_deleteRemoteEvent_${eventId}`);
           remoteDeletedIds.push(eventId);
+        },
+        compensateRemoteDeletionFn: async ({ token, tombstone, deleteEventFn }) => {
+          await deleteEventFn!(token, tombstone.googleCalendarEventId!);
+          return { success: true, tombstone };
         },
         deleteFirestoreDocFn: async (docRef) => {
           callLog.push(`4_deleteFirestoreDoc_${docRef.path || 'doc'}`);
@@ -854,11 +963,20 @@ export async function runDeletionOutboxAndFirestoreSuite() {
           await new Promise((r) => setTimeout(r, 40));
           durableResolved = true;
           callLog.push('recordDurable_done');
-          return [];
+          return [{
+            id: 'user-slow-14b:task-slow-14b:sess-slow-1',
+            userId: 'user-slow-14b', taskId: 'task-slow-14b', sessionId: 'sess-slow-1',
+            googleCalendarEventId: 'gcal-slow-1', deletedAt: new Date().toISOString(),
+            status: 'pending_cleanup', retryCount: 0,
+          }];
         },
         deleteRemoteEventFn: async () => {
           assert.strictEqual(durableResolved, true, 'deleteRemoteEvent TIDAK BOLEH dipanggil sebelum durable write selesai');
           callLog.push('deleteRemoteEvent');
+        },
+        compensateRemoteDeletionFn: async ({ tombstone, deleteEventFn, token }) => {
+          await deleteEventFn!(token, tombstone.googleCalendarEventId!);
+          return { success: true, tombstone };
         },
         deleteFirestoreDocFn: async () => {
           assert.strictEqual(durableResolved, true, 'deleteFirestoreDoc TIDAK BOLEH dipanggil sebelum durable write selesai');

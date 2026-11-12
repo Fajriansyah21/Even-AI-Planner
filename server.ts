@@ -308,7 +308,7 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
       };
 
       // 1. Time constraint type & occurrences determination:
-      if (baselinePlan.targetOccurrences && baselinePlan.targetOccurrences.length > 1) {
+      if (baselinePlan.targetOccurrences && baselinePlan.targetOccurrences.length > 0) {
         sanitizedPlan.timeConstraintType = 'fixed_event';
         sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
         sanitizedPlan.targetDays = baselinePlan.targetDays;
@@ -316,28 +316,15 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.requestedEndAt = baselinePlan.targetOccurrences[0].requestedEndAt;
         sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
         sanitizedPlan.allowSplit = false;
-      } else if (rawPlan.targetOccurrences && Array.isArray(rawPlan.targetOccurrences) && rawPlan.targetOccurrences.length > 1) {
-        sanitizedPlan.timeConstraintType = 'fixed_event';
-        sanitizedPlan.targetOccurrences = rawPlan.targetOccurrences;
-        sanitizedPlan.requestedStartAt = rawPlan.targetOccurrences[0].requestedStartAt;
-        sanitizedPlan.requestedEndAt = rawPlan.targetOccurrences[0].requestedEndAt;
-        sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes || rawPlan.estimatedDurationMinutes;
-        sanitizedPlan.allowSplit = false;
       } else if (baselinePlan.timeConstraintType === 'fixed_event') {
         sanitizedPlan.timeConstraintType = 'fixed_event';
-        // Only overwrite requestedStartAt with baseline if baseline explicitly recognized a day target or AI omitted it
-        if (baselinePlan.hasExplicitDayTarget || !rawPlan.requestedStartAt) {
-          sanitizedPlan.requestedStartAt = baselinePlan.requestedStartAt;
-          sanitizedPlan.requestedEndAt = baselinePlan.requestedEndAt;
-        } else {
-          sanitizedPlan.requestedStartAt = rawPlan.requestedStartAt;
-          sanitizedPlan.requestedEndAt = rawPlan.requestedEndAt;
-        }
+        // Jam tetap yang diparse dari instruksi pengguna adalah sumber kebenaran.
+        // Jangan biarkan waktu buatan Gemini (mis. 05.00 untuk permintaan malam) menggantikannya.
+        sanitizedPlan.requestedStartAt = baselinePlan.requestedStartAt;
+        sanitizedPlan.requestedEndAt = baselinePlan.requestedEndAt;
+        delete sanitizedPlan.targetOccurrences;
         sanitizedPlan.estimatedDurationMinutes = baselinePlan.estimatedDurationMinutes;
         sanitizedPlan.allowSplit = false;
-        if (baselinePlan.targetOccurrences) {
-          sanitizedPlan.targetOccurrences = baselinePlan.targetOccurrences;
-        }
         if (baselinePlan.targetDays) {
           sanitizedPlan.targetDays = baselinePlan.targetDays;
         }
@@ -347,11 +334,13 @@ PENTING - ATURAN PENAFSIRAN WAKTU BAHASA INDONESIA:
         sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
         delete sanitizedPlan.requestedStartAt;
         delete sanitizedPlan.requestedEndAt;
+        delete sanitizedPlan.targetOccurrences;
       } else {
         sanitizedPlan.timeConstraintType = 'deadline_only';
         delete sanitizedPlan.requestedStartAt;
         delete sanitizedPlan.requestedEndAt;
         delete sanitizedPlan.preferredWindow;
+        delete sanitizedPlan.targetOccurrences;
         sanitizedPlan.preferredTimeOfDay = baselinePlan.preferredTimeOfDay;
       }
 

@@ -14,8 +14,8 @@ import {
 import { persistScheduledTask } from './taskPersistence';
 import {
   isSessionDeleted,
-  recordSessionDeletion,
-  updateTombstone,
+  recordSessionDeletionDurable,
+  compensateRemoteDeletion,
 } from './deletionTombstone';
 
 export interface ExecuteSchedulePushParams {
@@ -37,6 +37,8 @@ export interface ExecuteSchedulePushParams {
     googleEventId: string,
     signal?: AbortSignal
   ) => Promise<void>;
+  cleanupClaimFn?: Parameters<typeof compensateRemoteDeletion>[0]['claimCleanupFn'];
+  cleanupSyncStateFn?: Parameters<typeof compensateRemoteDeletion>[0]['syncStateFn'];
   saveToStorage?: (task: Task, userId: string) => Promise<void>;
   isTaskUpdate?: boolean;
   description?: string;
@@ -244,26 +246,15 @@ export async function executeSchedulePush(
         guard?.clearSessionState(sess.id, task.id, userId || 'user-default');
 
         // Rekam deletion tombstone dengan Google Calendar Event ID yang baru didapat
-        const tombstone = recordSessionDeletion(userId, task.id, sess.id, created.id);
-
-        // Jalankan Remote Event Compensation (DELETE) segera
-        const activeDeleteFn = params.deleteEventFn || deleteGoogleCalendarEvent;
-        try {
-          await activeDeleteFn(token, created.id);
-          updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
-        } catch (cleanupErr: any) {
-          const status = cleanupErr?.status || cleanupErr?.classification?.status;
-          if (status === 404 || status === 410) {
-            updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
-          } else {
-            updateTombstone(tombstone.id, {
-              status: 'cleanup_failed',
-              lastError: cleanupErr?.message || 'Remote DELETE compensation failed',
-              retryCount: (tombstone.retryCount || 0) + 1,
-              lastAttemptAt: new Date().toISOString(),
-            });
-          }
-        }
+        const tombstone = await recordSessionDeletionDurable(userId, task.id, sess.id, created.id);
+        await compensateRemoteDeletion({
+          token,
+          tombstone,
+          deleteEventFn: params.deleteEventFn || deleteGoogleCalendarEvent,
+          signal: pushTicket.signal,
+          claimCleanupFn: params.cleanupClaimFn,
+          syncStateFn: params.cleanupSyncStateFn,
+        });
 
         // Sesi TIDAK dimasukkan ke updatedSessions atau newCalendarEvents (NO RESURRECTION)
         continue;
@@ -447,6 +438,8 @@ export interface ReconcileTaskSessionsParams {
     googleEventId: string,
     signal?: AbortSignal
   ) => Promise<void>;
+  cleanupClaimFn?: Parameters<typeof compensateRemoteDeletion>[0]['claimCleanupFn'];
+  cleanupSyncStateFn?: Parameters<typeof compensateRemoteDeletion>[0]['syncStateFn'];
   saveToStorage?: (task: Task, userId: string) => Promise<void>;
 }
 
@@ -603,23 +596,16 @@ export async function reconcileTaskSessionsWithRemote(
       // User Deletion Intent Wins (Skenario D & M):
       // Jika pengguna telah menghapus sesi ini, jangan pernah menghidupkan kembali ke aplikasi!
       if (isSessionDeleted(userId, task.id, sess.id)) {
-        const tombstone = recordSessionDeletion(userId, task.id, sess.id, recon.remoteEventId);
-        const activeDeleteFn = params.deleteEventFn || deleteGoogleCalendarEvent;
-        activeDeleteFn(token, recon.remoteEventId, activeSignal)
-          .then(() => updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined }))
-          .catch((cleanupErr: any) => {
-            const status = cleanupErr?.status || cleanupErr?.classification?.status;
-            if (status === 404 || status === 410) {
-              updateTombstone(tombstone.id, { status: 'cleaned', lastError: undefined });
-            } else {
-              updateTombstone(tombstone.id, {
-                status: 'cleanup_failed',
-                lastError: cleanupErr?.message || 'Remote compensation failed',
-                retryCount: (tombstone.retryCount || 0) + 1,
-                lastAttemptAt: new Date().toISOString(),
-              });
-            }
-          });
+        recordSessionDeletionDurable(userId, task.id, sess.id, recon.remoteEventId)
+          .then((tombstone) => compensateRemoteDeletion({
+            token,
+            tombstone,
+            deleteEventFn: params.deleteEventFn || deleteGoogleCalendarEvent,
+            signal: activeSignal,
+            claimCleanupFn: params.cleanupClaimFn,
+            syncStateFn: params.cleanupSyncStateFn,
+          }))
+          .catch((err) => console.warn('Durable remote cleanup intent was retained for retry:', err));
         return null;
       }
 
