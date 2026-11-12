@@ -351,7 +351,7 @@ export async function runFirestoreRulesSuite() {
       })
     );
 
-    console.log('\n  🎉 SELURUH 10 KASUS PENGUJIAN RUNTIME FIRESTORE RULES EMULATOR SUKSES (PASS)!');
+    console.log('\n  🎉 SELURUH 14 KASUS PENGUJIAN RUNTIME FIRESTORE RULES EMULATOR SUKSES (PASS)!');
     return { status: 'PASS' };
   } finally {
     if (testEnv) {
@@ -360,22 +360,44 @@ export async function runFirestoreRulesSuite() {
   }
 }
 
+/**
+ * Pure evaluation function for runner exit codes to prevent false-PASS outcomes.
+ *
+ * Rules:
+ * 1. res?.status === 'PASS' -> exit code 0
+ * 2. res?.status === 'NOT VERIFIED':
+ *    - if isStaticOnly === true -> exit code 0 (logs static audit passed)
+ *    - if isStaticOnly === false -> exit code 2 (strictly not verified)
+ * 3. Unknown status, undefined, null, or empty result -> exit code 1
+ */
+export function determineRunnerExitCode(res: any, isStaticOnly: boolean): number {
+  if (res?.status === 'PASS') {
+    return 0;
+  }
+
+  if (res?.status === 'NOT VERIFIED') {
+    if (isStaticOnly) {
+      console.log('\n  ℹ️  Eksekusi --static-only selesai: Static syntax audit lolos.');
+      return 0;
+    }
+    console.error('\n  ⚠️  EKSEKUSI GAGAL (EXIT CODE 2): Runtime Emulator Test berstatus NOT VERIFIED.');
+    console.error('      Sebelum menandai checkpoint sebagai VERIFIED, pengujian runtime wajib dijalankan dengan JRE aktif.');
+    return 2;
+  }
+
+  console.error(
+    `\n❌ EKSEKUSI GAGAL (EXIT CODE 1): Status hasil pengujian tidak valid, kosong, atau tidak dikenal: ${JSON.stringify(res?.status ?? res)}`
+  );
+  return 1;
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const isStaticOnly = process.argv.includes('--static-only');
 
   runFirestoreRulesSuite()
     .then((res) => {
-      if (res?.status === 'NOT VERIFIED') {
-        if (isStaticOnly) {
-          console.log('\n  ℹ️  Eksekusi --static-only selesai: Static syntax audit lolos.');
-          process.exit(0);
-        } else {
-          console.error('\n  ⚠️  EKSEKUSI GAGAL (EXIT CODE 2): Runtime Emulator Test berstatus NOT VERIFIED.');
-          console.error('      Sebelum menandai checkpoint sebagai VERIFIED, pengujian runtime wajib dijalankan dengan JRE aktif.');
-          process.exit(2);
-        }
-      }
-      process.exit(0);
+      const exitCode = determineRunnerExitCode(res, isStaticOnly);
+      process.exit(exitCode);
     })
     .catch((err) => {
       console.error('\n❌ FIREBASE RULES TEST FAILURE (EXIT CODE 1):', err);
