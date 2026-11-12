@@ -419,10 +419,10 @@ const isDirectExecution =
 if (isDirectExecution) {
   executeFirestoreRulesRunner()
     .then((exitCode) => {
-      process.exit(exitCode);
+      process.exitCode = exitCode;
     })
     .catch((err) => {
       console.error('\n❌ UNEXPECTED RUNNER FAILURE (EXIT CODE 1):', err);
-      process.exit(1);
+      process.exitCode = 1;
     });
 }
