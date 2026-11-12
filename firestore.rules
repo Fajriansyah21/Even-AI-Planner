@@ -101,6 +101,8 @@ service cloud.firestore {
         allow get, list: if isOwner(userId);
 
         allow create: if isOwner(userId) && isValidId(tombstoneId)
+          && incoming().keys().hasOnly(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error'])
+          && incoming().keys().hasAll(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt'])
           && incoming().userId == userId
           && incoming().taskId is string && incoming().taskId.size() > 0 && incoming().taskId.size() <= 256
           && incoming().sessionId is string && incoming().sessionId.size() > 0 && incoming().sessionId.size() <= 256
@@ -109,9 +111,14 @@ service cloud.firestore {
           && incoming().deletedAt is string && incoming().deletedAt.size() <= 64
           && incoming().status in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed']
           && incoming().retryCount is number && incoming().retryCount >= 0
-          && incoming().updatedAt is string;
+          && incoming().updatedAt is string && incoming().updatedAt.size() <= 64
+          && (!('googleCalendarEventId' in incoming()) || incoming().googleCalendarEventId == null || (incoming().googleCalendarEventId is string && incoming().googleCalendarEventId.size() > 0 && incoming().googleCalendarEventId.size() <= 256))
+          && (!('lastAttemptAt' in incoming()) || incoming().lastAttemptAt == null || (incoming().lastAttemptAt is string && incoming().lastAttemptAt.size() <= 64))
+          && (!('error' in incoming()) || incoming().error == null || (incoming().error is string && incoming().error.size() <= 500));
 
         allow update: if isOwner(userId) && isValidId(tombstoneId)
+          && incoming().keys().hasOnly(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt', 'googleCalendarEventId', 'lastAttemptAt', 'error'])
+          && incoming().keys().hasAll(['userId', 'taskId', 'sessionId', 'compositeKey', 'entityType', 'deletedAt', 'status', 'retryCount', 'updatedAt'])
           && incoming().userId == userId
           && incoming().taskId is string && incoming().taskId.size() > 0 && incoming().taskId.size() <= 256
           && incoming().sessionId is string && incoming().sessionId.size() > 0 && incoming().sessionId.size() <= 256
@@ -120,7 +127,10 @@ service cloud.firestore {
           && incoming().deletedAt is string && incoming().deletedAt.size() <= 64
           && incoming().status in ['pending_cleanup', 'cleaning', 'cleaned', 'cleanup_failed']
           && incoming().retryCount is number && incoming().retryCount >= 0
-          && incoming().updatedAt is string
+          && incoming().updatedAt is string && incoming().updatedAt.size() <= 64
+          && (!('googleCalendarEventId' in incoming()) || incoming().googleCalendarEventId == null || (incoming().googleCalendarEventId is string && incoming().googleCalendarEventId.size() > 0 && incoming().googleCalendarEventId.size() <= 256))
+          && (!('lastAttemptAt' in incoming()) || incoming().lastAttemptAt == null || (incoming().lastAttemptAt is string && incoming().lastAttemptAt.size() <= 64))
+          && (!('error' in incoming()) || incoming().error == null || (incoming().error is string && incoming().error.size() <= 500))
           // Immutability: identity and initial deletion timestamp cannot be changed or forged
           && incoming().userId == existing().userId
           && incoming().taskId == existing().taskId

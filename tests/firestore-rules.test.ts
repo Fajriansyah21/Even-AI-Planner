@@ -226,7 +226,7 @@ export async function runFirestoreRulesSuite() {
       })
     );
 
-    console.log('\n  🎉 SELURUH 10 KASUS PENGUJIAN FIRESTORE RULES EMULATOR SUKSES (PASS)!');
+    console.log('\n  🎉 SELURUH 10 KASUS PENGUJIAN RUNTIME FIRESTORE RULES EMULATOR SUKSES (PASS)!');
     return { status: 'PASS' };
   } finally {
     if (testEnv) {
@@ -236,15 +236,24 @@ export async function runFirestoreRulesSuite() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  const isStaticOnly = process.argv.includes('--static-only');
+
   runFirestoreRulesSuite()
     .then((res) => {
       if (res?.status === 'NOT VERIFIED') {
-        process.exit(0);
+        if (isStaticOnly) {
+          console.log('\n  ℹ️  Eksekusi --static-only selesai: Static syntax audit lolos.');
+          process.exit(0);
+        } else {
+          console.error('\n  ⚠️  EKSEKUSI GAGAL (EXIT CODE 2): Runtime Emulator Test berstatus NOT VERIFIED.');
+          console.error('      Sebelum menandai checkpoint sebagai VERIFIED, pengujian runtime wajib dijalankan dengan JRE aktif.');
+          process.exit(2);
+        }
       }
       process.exit(0);
     })
     .catch((err) => {
-      console.error('\n❌ FIREBASE RULES TEST FAILURE:', err);
+      console.error('\n❌ FIREBASE RULES TEST FAILURE (EXIT CODE 1):', err);
       process.exit(1);
     });
 }

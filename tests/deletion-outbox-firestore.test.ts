@@ -100,12 +100,23 @@ function createMockIdbFactory(options?: {
           },
           transaction(storeNames: string | string[], mode: 'readonly' | 'readwrite') {
             let txFailed = false;
+            let txAborted = false;
+            // Transaction-local uncommitted buffer to accurately model transactional rollback
+            const txBuffer = new Map<string, any>();
+            const txDeletes = new Set<string>();
+
             const tx: any = {
               mode,
               error: null,
               oncomplete: null,
               onerror: null,
               onabort: null,
+              abort() {
+                txAborted = true;
+                txBuffer.clear();
+                txDeletes.clear();
+                if (tx.onabort) tx.onabort(new Event('abort'));
+              },
               objectStore(targetStore: string) {
                 return {
                   put(item: any) {
@@ -120,12 +131,18 @@ function createMockIdbFactory(options?: {
                       tx.error = new Error('Disk I/O error writing to IndexedDB');
                       return;
                     }
-                    storeMap.set(item.id, JSON.parse(JSON.stringify(item)));
+                    txBuffer.set(item.id, JSON.parse(JSON.stringify(item)));
                   },
                   get(key: string) {
                     const req: any = { result: undefined, onsuccess: null, onerror: null };
                     setTimeout(() => {
-                      req.result = storeMap.get(key);
+                      if (txDeletes.has(key)) {
+                        req.result = undefined;
+                      } else if (txBuffer.has(key)) {
+                        req.result = txBuffer.get(key);
+                      } else {
+                        req.result = storeMap.get(key);
+                      }
                       if (req.onsuccess) req.onsuccess();
                     }, 2);
                     return req;
@@ -133,15 +150,20 @@ function createMockIdbFactory(options?: {
                   getAll(keyRange?: any) {
                     const req: any = { result: [], onsuccess: null, onerror: null };
                     setTimeout(() => {
-                      req.result = Array.from(storeMap.values());
+                      const merged = new Map(storeMap);
+                      for (const [k, v] of txBuffer.entries()) merged.set(k, v);
+                      for (const k of txDeletes) merged.delete(k);
+                      req.result = Array.from(merged.values());
                       if (req.onsuccess) req.onsuccess();
                     }, 2);
                     return req;
                   },
                   delete(key: string) {
-                    storeMap.delete(key);
+                    txBuffer.delete(key);
+                    txDeletes.add(key);
                   },
                   clear() {
+                    txBuffer.clear();
                     storeMap.clear();
                   },
                   index(indexName: string) {
@@ -149,7 +171,10 @@ function createMockIdbFactory(options?: {
                       getAll(queryVal?: any) {
                         const req: any = { result: [], onsuccess: null, onerror: null };
                         setTimeout(() => {
-                          const all = Array.from(storeMap.values());
+                          const merged = new Map(storeMap);
+                          for (const [k, v] of txBuffer.entries()) merged.set(k, v);
+                          for (const k of txDeletes) merged.delete(k);
+                          const all = Array.from(merged.values());
                           if (indexName === 'by_userId') {
                             req.result = all.filter((i) => i.userId === queryVal);
                           } else if (indexName === 'by_syncStatus') {
@@ -172,10 +197,25 @@ function createMockIdbFactory(options?: {
             };
 
             setTimeout(() => {
+              if (txAborted) {
+                // Aborted: uncommitted buffer is discarded
+                return;
+              }
               if (options?.failTransactions || txFailed) {
                 tx.error = tx.error || new Error('Disk quota exceeded in IndexedDB transaction');
+                // Rollback uncommitted changes in this transaction
+                txBuffer.clear();
+                txDeletes.clear();
                 if (tx.onerror) tx.onerror(new Event('error'));
+                if (tx.onabort) tx.onabort(new Event('abort'));
               } else {
+                // Commit uncommitted changes to persistent storage
+                for (const [k, v] of txBuffer.entries()) {
+                  storeMap.set(k, v);
+                }
+                for (const k of txDeletes) {
+                  storeMap.delete(k);
+                }
                 if (tx.oncomplete) tx.oncomplete(new Event('complete'));
               }
             }, options?.delayCompleteMs || 10);
@@ -762,12 +802,12 @@ export async function runDeletionOutboxAndFirestoreSuite() {
         '2_closeModal',
         '3_deleteRemoteEvent_gcal-succ-1',
         '4_deleteFirestoreDoc_users/user-ui-14/tasks/task-ui-success-14',
-      ], 'Urutan eksekusi harus strictly sequential');
+      ], 'Urutan inisiasi operasi harus terurut: durable outbox -> UI update -> background remote DELETE dispatch -> Firestore deleteDoc');
       assert.strictEqual(currentTasks.length, 0, 'Task sukses dihapus dari React state');
       assert.strictEqual(remoteDeletedIds[0], 'gcal-succ-1');
       assert.strictEqual(toastCalledWith?.type, 'info');
 
-      pass('Test 14: [Temuan 2 - Skenario A] executeTaskDeletion aktual mengeksekusi urutan secara strictly sequential');
+      pass('Test 14: [Temuan 2 - Skenario A] executeTaskDeletion aktual: urutan inisiasi terbukti terurut (durable -> UI -> dispatch remote delete -> await firestore delete)');
     }
 
     // [Test 14B] TEMUAN 2 (Scenario C): Actual executeTaskDeletion - Slow durable write in-flight protection
