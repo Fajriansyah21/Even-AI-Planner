@@ -19,6 +19,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { pathToFileURL } from 'url';
 import assert from 'node:assert';
 import {
   initializeTestEnvironment,
@@ -391,16 +392,37 @@ export function determineRunnerExitCode(res: any, isStaticOnly: boolean): number
   return 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const isStaticOnly = process.argv.includes('--static-only');
+/**
+ * Production runner pipeline for executing the Firestore rules test suite.
+ * Handles suite execution, catches promise rejections, determines exit code,
+ * and returns the exit code deterministically.
+ */
+export async function executeFirestoreRulesRunner(
+  suiteFn: () => Promise<any> = runFirestoreRulesSuite,
+  argv: string[] = process.argv
+): Promise<number> {
+  const isStaticOnly = argv.includes('--static-only');
+  try {
+    const res = await suiteFn();
+    const exitCode = determineRunnerExitCode(res, isStaticOnly);
+    return exitCode;
+  } catch (err) {
+    console.error('\n❌ FIREBASE RULES TEST FAILURE (EXIT CODE 1):', err);
+    return 1;
+  }
+}
 
-  runFirestoreRulesSuite()
-    .then((res) => {
-      const exitCode = determineRunnerExitCode(res, isStaticOnly);
+const isDirectExecution =
+  Boolean(process.argv[1]) &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isDirectExecution) {
+  executeFirestoreRulesRunner()
+    .then((exitCode) => {
       process.exit(exitCode);
     })
     .catch((err) => {
-      console.error('\n❌ FIREBASE RULES TEST FAILURE (EXIT CODE 1):', err);
+      console.error('\n❌ UNEXPECTED RUNNER FAILURE (EXIT CODE 1):', err);
       process.exit(1);
     });
 }
